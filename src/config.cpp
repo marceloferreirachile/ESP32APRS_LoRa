@@ -13,6 +13,7 @@
 #include <ArduinoJson.h>
 //#include <StreamUtils.h>
 #include "AFSK.h"
+#include "brand.h"
 #include <esp_task_wdt.h>
 
 extern fs::LITTLEFSFS LITTLEFS;
@@ -1277,6 +1278,13 @@ bool loadConfiguration(const char *filename, Configuration &config)
             strlcpy(config.ntp_host, "pool.ntp.org", sizeof(config.ntp_host));
         if (strstr(config.aprs_host, "nakhonthai") != NULL)
             strlcpy(config.aprs_host, "rotate.aprs2.net", sizeof(config.aprs_host));
+        // status text left by nakhonthai's firmware (his GitHub link) -> AR-LORA text per function
+        if (strstr(config.igate_status, "github.com/nakhonthai") != NULL)
+            strlcpy(config.igate_status, BRAND_STATUS_IGATE, sizeof(config.igate_status));
+        if (strstr(config.digi_status, "github.com/nakhonthai") != NULL)
+            strlcpy(config.digi_status, BRAND_STATUS_DIGI, sizeof(config.digi_status));
+        if (strstr(config.trk_status, "github.com/nakhonthai") != NULL)
+            strlcpy(config.trk_status, BRAND_STATUS_TRK, sizeof(config.trk_status));
         if (strstr(config.ntp_host, "pool.ntp.org") != NULL && config.timeZone == 7)
             config.timeZone = -3; // Thai default UTC+7 carried over -> Argentina
 #endif
