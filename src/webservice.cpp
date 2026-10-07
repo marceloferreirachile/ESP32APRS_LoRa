@@ -11301,7 +11301,7 @@ static const char *ABOUT_TEMPLATE =
 	"<table style=\"height:100%;\">"
 	"<th colspan=\"2\"><span><b>Developer/Support Information</b></span></th>\n"
 	"<tr><td align=\"right\"><b>Author: </b></td><td align=\"left\">Marcelo Ferreira (fork/mods)</td></tr>"
-	"<tr><td align=\"right\"><b>Callsign: </b></td><td align=\"left\">LU6JMF-10</td></tr>"
+	"<tr><td align=\"right\"><b>Callsign: </b></td><td align=\"left\">LU6JMF</td></tr>"
 	"<tr><td align=\"right\"><b>Country: </b></td><td align=\"left\">Concepcion del Uruguay, Entre Rios, Argentina</td></tr>\n"
 	"<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"" BRAND_REPO_URL "\" target=\"_blank\">github.com/" BRAND_PUBLIC_REPO "</a></td></tr>"
 	"<tr><td align=\"right\"><b>Original: </b></td><td align=\"left\">Mr.Somkiat Nakhonthai (HS5TQA) - <a href=\"https://github.com/nakhonthai\" target=\"_blank\">github.com/nakhonthai</a></td></tr>\n"
