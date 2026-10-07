@@ -20,6 +20,7 @@
 
 //void kiss_csma(AX25Ctx *ctx, uint8_t *buf, size_t len);
 int kiss_wrapper(uint8_t *pkg);
+int kiss_wrapper(uint8_t *pkg, uint8_t *buf, size_t len); // LU6JMF: 2.1.5 core API (raw AX.25 frame -> KISS)
 void kiss_serial(uint8_t sbyte);
 
 #endif

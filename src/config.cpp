@@ -88,20 +88,23 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["txAudioGain"] = config.tx_audio_gain;
     doc["txPreemphasis"] = config.tx_preemphasis;
     doc["txPreemphasisTilt"] = config.tx_preemphasis_tilt;
-    // doc["rfFreq"] = config.rf_freq;
-    // doc["rfOffset"] = config.rf_freq_offset;
-    // doc["rfBW"] = config.rf_bw;
-    // doc["rfSF"] = config.rf_sf;
-    // doc["rfCR"] = config.rf_cr;
-    // doc["rfSync"] = config.rf_sync;
-    // doc["rfPwr"] = config.rf_power;
-    // doc["rfPream"] = config.rf_preamable;
-    // doc["rfLNA"] = config.rf_lna;
-    // doc["rfMode"] = config.rf_mode;
-    // doc["rfAX25"] = config.rf_ax25;
-    // doc["rfBR"] = config.rf_br;
-    // doc["rfShaping"] = config.rf_shaping;
-    // doc["rfEncoding"] = config.rf_encoding;
+#ifdef RADIO_LORA
+    // LU6JMF - LoRa radio (same keys as nakhonthai ESP32APRS_LoRa -> configs move between them)
+    doc["rfFreq"] = config.rf_freq;
+    doc["rfOffset"] = config.rf_freq_offset;
+    doc["rfBW"] = config.rf_bw;
+    doc["rfSF"] = config.rf_sf;
+    doc["rfCR"] = config.rf_cr;
+    doc["rfSync"] = config.rf_sync;
+    doc["rfPream"] = config.rf_preamable;
+    doc["rfLNA"] = config.rf_lna;
+    doc["rfMode"] = config.rf_mode;
+    doc["rfAX25"] = config.rf_ax25;
+    doc["rfBR"] = config.rf_br;
+    doc["rfShaping"] = config.rf_shaping;
+    doc["rfEncoding"] = config.rf_encoding;
+    doc["rfRxBoost"] = config.rf_rx_boost;
+#endif
 
     // IGate group
     doc["igateEn"] = config.igate_en;
@@ -389,18 +392,20 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["adcOffset"] = config.adc_dc_offset;
     doc["rfBaudrate"] = config.rf_baudrate;
 
-    // doc["rfRST"] = config.rf_reset_gpio;
-    // doc["rfDIO0"] = config.rf_dio0_gpio;
-    // doc["rfDIO1"] = config.rf_dio1_gpio;
-    // doc["rfDIO2"] = config.rf_dio2_gpio;
-    // doc["rfNSS"] = config.rf_nss_gpio;
-    // doc["rfSCK"] = config.rf_sclk_gpio;
-    // doc["rfMISO"] = config.rf_miso_gpio;
-    // doc["rfMOSI"] = config.rf_mosi_gpio;
-    // doc["rfTxAct"] = config.rf_tx_active;
-    // doc["rfRxAct"] = config.rf_rx_active;
-    // doc["rfRSTAct"] = config.rf_reset_active;
-    // doc["rfNSSAct"] = config.rf_nss_active;
+#ifdef RADIO_LORA
+    doc["rfRST"] = config.rf_reset_gpio;
+    doc["rfDIO0"] = config.rf_dio0_gpio;
+    doc["rfDIO1"] = config.rf_dio1_gpio;
+    doc["rfDIO2"] = config.rf_dio2_gpio;
+    doc["rfNSS"] = config.rf_nss_gpio;
+    doc["rfSCK"] = config.rf_sclk_gpio;
+    doc["rfMISO"] = config.rf_miso_gpio;
+    doc["rfMOSI"] = config.rf_mosi_gpio;
+    doc["rfTxAct"] = config.rf_tx_active;
+    doc["rfRxAct"] = config.rf_rx_active;
+    doc["rfRSTAct"] = config.rf_reset_active;
+    doc["rfNSSAct"] = config.rf_nss_active;
+#endif
     // MOD I2C group
     doc["i2cEn"] = config.i2c_enable;
     doc["i2cSDA"] = config.i2c_sda_pin;
@@ -697,20 +702,29 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.tx_audio_gain = doc["txAudioGain"] | 100;
         config.tx_preemphasis = doc["txPreemphasis"] | false;
         config.tx_preemphasis_tilt = doc["txPreemphasisTilt"] | 20;
-        // config.rf_freq = doc["rfFreq"];
-        // config.rf_freq_offset = doc["rfOffset"];
-        // config.rf_bw = doc["rfBW"];
-        // config.rf_sf = doc["rfSF"];
-        // config.rf_cr = doc["rfCR"];
-        // config.rf_sync = doc["rfSync"];
-        // config.rf_power = doc["rfPwr"];
-        // config.rf_preamable = doc["rfPream"];
-        // config.rf_lna = doc["rfLNA"];
-        // config.rf_mode = doc["rfMode"];
-        // config.rf_ax25 = doc["rfAX25"];
-        // config.rf_br = doc["rfBR"];
-        // config.rf_shaping = doc["rfShaping"];
-        // config.rf_encoding = doc["rfEncoding"];
+#ifdef RADIO_LORA
+        // missing keys (config made by another firmware) fall back to the LoRa APRS standard
+        config.rf_freq = doc["rfFreq"] | 433.775f;
+        config.rf_freq_offset = doc["rfOffset"] | 0;
+        config.rf_bw = doc["rfBW"] | 125.0f;
+        config.rf_sf = doc["rfSF"] | 12;
+        config.rf_cr = doc["rfCR"] | 5;
+        config.rf_sync = doc["rfSync"] | 0x12;
+        config.rf_power = doc["rfPwr"] | 20;
+        config.rf_preamable = doc["rfPream"] | 8;
+        config.rf_lna = doc["rfLNA"] | 1;
+        config.rf_mode = doc["rfMode"] | RF_MODE_LoRa;
+        config.rf_ax25 = doc["rfAX25"] | false;
+        config.rf_br = doc["rfBR"] | 9.7f;
+        config.rf_shaping = doc["rfShaping"] | 0x02;
+        config.rf_encoding = doc["rfEncoding"] | 0x00;
+        config.rf_rx_boost = doc["rfRxBoost"] | true;
+#endif
+#ifdef RADIO_LORA
+        // a config written by the audio firmware has SA868 type codes here
+        if (config.rf_type < RF_SX1231 || config.rf_type > RF_SX1282)
+            config.rf_type = RF_SX1262;
+#endif
 
         // IGate group
         config.igate_en = doc["igateEn"];
@@ -965,18 +979,23 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.adc_atten = doc["adcAtten"];
         config.adc_dc_offset = doc["adcOffset"];          
 
-        // config.rf_reset_gpio = doc["rfRST"];
-        // config.rf_dio0_gpio = doc["rfDIO0"];
-        // config.rf_dio1_gpio = doc["rfDIO1"];
-        // config.rf_dio2_gpio = doc["rfDIO2"];
-        // config.rf_nss_gpio = doc["rfNSS"];
-        // config.rf_sclk_gpio = doc["rfSCK"];
-        // config.rf_miso_gpio = doc["rfMISO"];
-        // config.rf_mosi_gpio = doc["rfMOSI"];
-        // config.rf_tx_active = doc["rfTxAct"];
-        // config.rf_rx_active = doc["rfRxAct"];
-        // config.rf_reset_active = doc["rfRSTAct"];
-        // config.rf_nss_active = doc["rfNSSAct"];
+#ifdef RADIO_LORA
+        if (doc["rfNSS"].is<int>()) // keep the board defaults if the file has no LoRa pins
+        {
+            config.rf_reset_gpio = doc["rfRST"];
+            config.rf_dio0_gpio = doc["rfDIO0"];
+            config.rf_dio1_gpio = doc["rfDIO1"];
+            config.rf_dio2_gpio = doc["rfDIO2"] | -1;
+            config.rf_nss_gpio = doc["rfNSS"];
+            config.rf_sclk_gpio = doc["rfSCK"];
+            config.rf_miso_gpio = doc["rfMISO"];
+            config.rf_mosi_gpio = doc["rfMOSI"];
+            config.rf_tx_active = doc["rfTxAct"] | true;
+            config.rf_rx_active = doc["rfRxAct"] | true;
+            config.rf_reset_active = doc["rfRSTAct"] | false;
+            config.rf_nss_active = doc["rfNSSAct"] | false;
+        }
+#endif
         // MOD I2C group
         config.i2c_enable = doc["i2cEn"];
         config.i2c_sda_pin = doc["i2cSDA"];

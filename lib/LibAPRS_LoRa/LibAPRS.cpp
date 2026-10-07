@@ -89,6 +89,10 @@ static unsigned long b91val[4] = {23601572L, 259358L, 2851L, 32L};
 static long valtable[] = {1193046471L, 119304647L, 11930465L, 1988411L, 198841L, 19884L, 1988L, 199L, 20L, 2L};
 
 bool received = false;
+// LU6JMF 2.1.5 core hooks (implemented in lora_compat.cpp)
+static int16_t lastTxState = 0;
+extern void loraTxDone(int16_t state);
+
 bool eInterrupt = true;
 bool noisyInterrupt = false;
 
@@ -427,8 +431,17 @@ void taskADDFifo1(void *pvParameters)
 #endif
 
 // void APRS_sendTNC2Pkt(String raw)
-void APRS_sendTNC2Pkt(uint8_t *raw, size_t length)
+// LU6JMF 2.1.5 core: returns false (frame NOT taken, caller keeps it queued)
+// while a previous frame is still waiting/transmitting. The original version
+// called ax25_sendBuf() unconditionally, whose fifo_flush() silently destroyed
+// a frame that had not been transmitted yet.
+bool APRS_sendTNC2Pkt(const uint8_t *raw_in, size_t length)
 {
+    if (ax25_stateTx)
+        return false;
+    if (raw_in == NULL || length == 0 || length > 300)
+        return false;
+    uint8_t *raw = (uint8_t *)raw_in;
     if (config.rf_ax25)
     {
         ax25frame *frame = (ax25frame *)calloc(1, sizeof(ax25frame));
@@ -472,6 +485,7 @@ void APRS_sendTNC2Pkt(uint8_t *raw, size_t length)
             ax25_sendBuf(raw, length);
         }
     }
+    return true;
 }
 
 int APRS_getTNC2Pkt(uint8_t *raw, String info)
@@ -522,6 +536,15 @@ bool APRS_init(Configuration *cfg)
 
     // SX126x,SX128x
     // setDio0Action->setDio1Action->getIRQ
+    // LU6JMF: re-init (watchdog recovery / RADIO page save) - release the previous
+    // radio first: stop its interrupt, then free it (was leaked on every re-init).
+    if (radioHal != NULL)
+    {
+        radioHal->clearDio0Action();
+        IRadioHal *old = radioHal;
+        radioHal = NULL;
+        delete old;
+    }
     pinMode(config.rf_nss_gpio, OUTPUT);
     spi.begin(config.rf_sclk_gpio, config.rf_miso_gpio, config.rf_mosi_gpio);
     if (config.rf_en)
@@ -1552,7 +1575,7 @@ bool APRS_poll(void)
                                 // uint8_t syncWordTX[] = {0x1, 0xe, 0x91, 0x6f, 0x5f, 0x43, 0x5a, 0x95};
                                 uint8_t syncWordTX[] = {0xf5, 0xd4, 0xd9, 0x59, 0x7, 0xc2, 0x1, 0x3f};
                                 radioHal->setSyncWord(syncWordTX, 8);
-                                radioHal->transmit(txBufPtr, i);
+                                lastTxState = radioHal->transmit(txBufPtr, i);
                                 delay(100);
                                 free(txBufPtr);
 
@@ -1603,7 +1626,7 @@ bool APRS_poll(void)
                             }
                             uint8_t syncWordTX[] = {0x84, 0xB5, 0x12, 0xAD};
                             radioHal->setSyncWord(syncWordTX, 4);
-                            radioHal->transmit(txBufPtr, i);
+                            lastTxState = radioHal->transmit(txBufPtr, i);
                             delay(100);
                             free(txBufPtr);
 
@@ -1629,7 +1652,7 @@ bool APRS_poll(void)
                     }
                     else
                     {                        
-                        radioHal->transmit(byteArr, i);
+                        lastTxState = radioHal->transmit(byteArr, i);
                     }
                     free(byteArr);
                     ret = true;
@@ -1637,6 +1660,9 @@ bool APRS_poll(void)
                 LED_Status(0, 0, 0);
                 ax25_stateTx = false;
                 startRx();
+                // LU6JMF 2.1.5 core: authoritative "TX finished" signal for the
+                // scheduler (same role as the audio modem's pttOff/PTT OFF).
+                loraTxDone(lastTxState);
             }
             else
             {

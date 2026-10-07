@@ -23,6 +23,34 @@ extern unsigned long custom_tail;
 unsigned long slotTime = 200;
 uint8_t p = 63;
 
+// LU6JMF: 2.1.5 core API - wrap a raw AX.25 frame (no FCS) into a KISS data frame
+int kiss_wrapper(uint8_t *pkg, uint8_t *buf, size_t len)
+{
+    uint8_t *ptr = pkg;
+    *ptr++ = FEND;
+    *ptr++ = 0x00;
+    for (unsigned i = 0; i < len; i++)
+    {
+        uint8_t b = buf[i];
+        if (b == FEND)
+        {
+            *ptr++ = FESC;
+            *ptr++ = TFEND;
+        }
+        else if (b == FESC)
+        {
+            *ptr++ = FESC;
+            *ptr++ = TFESC;
+        }
+        else
+        {
+            *ptr++ = b;
+        }
+    }
+    *ptr++ = FEND;
+    return ptr - pkg;
+}
+
 int kiss_wrapper(uint8_t *pkg)
 {
     uint8_t *ptr = pkg;

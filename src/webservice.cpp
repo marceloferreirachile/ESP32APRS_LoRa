@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <memory>
 #include "webservice.h"
+#include "brand.h"
 // LU6JMF - Marcelo Ferreira: PRIME account system, ported from TX-SCHEDULER-TEST.
 #include "prime.h"
 // LU6JMF - Marcelo Ferreira: motor de templates (fase 6), template embutido no
@@ -331,11 +332,11 @@ void setMainPage(AsyncWebServerRequest *request)
 			// AR-APRS visual identity - fixed brand name/version, independent
 			// of the configurable network hostname (matches the "black"
 			// palette/branding already used in the newer TX-SCHEDULER engine).
-			tpl.replace("{{TITLE}}", "<title>AR-APRS - Argentina APRS System</title>\n");
+			tpl.replace("{{TITLE}}", "<title>" BRAND_SHORT " - " BRAND_LONG "</title>\n");
 
 			snprintf(temp_buffer, sizeof(temp_buffer),
-					 "<h1 style=\"margin-bottom:2px;\">AR-APRS</h1>\n"
-					 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">Argentina APRS System &middot; V%s%s</div>\n",
+					 "<h1 style=\"margin-bottom:2px;\">" BRAND_SHORT "</h1>\n"
+					 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">" BRAND_LONG " &middot; V%s%s</div>\n",
 					 VERSION, VERSION_BUILD);
 			tpl.replace("{{H1}}", temp_buffer);
 
@@ -387,7 +388,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	// LU6JMF - Marcelo Ferreira:
 	// AR-APRS visual identity - fixed brand name/version, independent of the
 	// configurable network hostname.
-	webString->print("<title>AR-APRS - Argentina APRS System</title>\n");
+	webString->print("<title>" BRAND_SHORT " - " BRAND_LONG "</title>\n");
 
 	webString->print("<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\" />\n");
 	webString->print("<script src=\"/jquery-3.7.1.js\"></script>\n");
@@ -594,9 +595,9 @@ webString->print("function printLastHeard(data) {\n");
 	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\">ESP32IGate Firmware V" + String(VERSION) + "</div>\n");
 	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
 	// LU6JMF - Marcelo Ferreira: AR-APRS header, version generated from build data.
-	webString->print("<h1 style=\"margin-bottom:2px;\">AR-APRS</h1>\n");
+	webString->print("<h1 style=\"margin-bottom:2px;\">" BRAND_SHORT "</h1>\n");
 	snprintf(temp_buffer, sizeof(temp_buffer),
-			 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">Argentina APRS System &middot; V%s%s</div>\n",
+			 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">" BRAND_LONG " &middot; V%s%s</div>\n",
 			 VERSION, VERSION_BUILD);
 	webString->print(temp_buffer);
 	webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\" style=\"color:#d7d7d7;\">[LOG OUT]</a></div>\n");
@@ -639,7 +640,7 @@ webString->print("function printLastHeard(data) {\n");
 	webString->print("<br />\n");
 	webString->print("<div class=\"footer\">\n");
 	// LU6JMF - Marcelo Ferreira: AR-APRS signature.
-	webString->print("AR-APRS &middot; Argentina APRS System &middot; 2027<br />\n");
+	webString->print(BRAND_SHORT " &middot; " BRAND_LONG " &middot; 2027<br />\n");
 	webString->print("LU6JMF &mdash; Marcelo Ferreira\n");
 	webString->print("<br />\n");
 	webString->print("</div>\n");
@@ -10751,7 +10752,7 @@ void handle_test(AsyncWebServerRequest *request)
 }
 // Remote version file published by copy_firmware.py, checked against the
 // running VERSION/VERSION_BUILD to let the "about" page report new releases.
-#define VERSION_CHECK_URL "https://raw.githubusercontent.com/marceloferreirachile/ESP32APRS_Audio/master/version.json"
+#define VERSION_CHECK_URL "https://raw.githubusercontent.com/" BRAND_PUBLIC_REPO "/master/version.json"
 
 void handle_check_version(AsyncWebServerRequest *request)
 {
@@ -10831,7 +10832,7 @@ static const char *ABOUT_TEMPLATE =
 	"<tr><td align=\"right\"><b>Author: </b></td><td align=\"left\">Marcelo Ferreira (fork/mods)</td></tr>"
 	"<tr><td align=\"right\"><b>Callsign: </b></td><td align=\"left\">LU6JMF-10</td></tr>"
 	"<tr><td align=\"right\"><b>Country: </b></td><td align=\"left\">Concepcion del Uruguay, Entre Rios, Argentina</td></tr>\n"
-	"<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio\" target=\"_blank\">github.com/marceloferreirachile/ESP32APRS_Audio</a></td></tr>"
+	"<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"" BRAND_REPO_URL "\" target=\"_blank\">github.com/" BRAND_PUBLIC_REPO "</a></td></tr>"
 	"<tr><td align=\"right\"><b>Original: </b></td><td align=\"left\">Mr.Somkiat Nakhonthai (HS5TQA) - <a href=\"https://github.com/nakhonthai\" target=\"_blank\">github.com/nakhonthai</a></td></tr>\n"
 	"<tr><td align=\"right\"><b>License: </b></td><td align=\"left\">GNU GPL v3. Source code of this exact version available on request, free of charge, for at least 3 years: <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a> (include the version number)</td></tr>\n"
 	"<tr><td align=\"right\"><b>WhatsApp: </b></td><td align=\"left\"><a href=\"https://wa.me/5493442311119\" target=\"_blank\">wa.me/5493442311119</a></td></tr>"
@@ -10843,7 +10844,7 @@ static const char *ABOUT_TEMPLATE =
 	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\">v2.0-lu6jmf (custom mods on top of V1.8a)</td></tr>\n"
 	"<tr><td align=\"right\" style=\"vertical-align:top;\"><b>Changes: </b></td><td align=\"left\" style=\"white-space:normal;\">\n"
 	"See README / git log in the repository for full change history, or "
-	"<a href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio/releases\" target=\"_blank\">"
+	"<a href=\"" BRAND_REPO_URL "/releases\" target=\"_blank\">"
 	"the Releases page</a> for per-version notes."
 	"</td></tr>\n"
 	"</table><br />\n"
@@ -10882,7 +10883,7 @@ static const char *ABOUT_TEMPLATE =
 	"<th colspan=\"2\"><span><b>Manual Firmware Update</b></span></th>\n"
 	"<tr><td align=\"right\"><b>File:</b></td><td align=\"left\"><input id=\"file\" name=\"update\" type=\"file\" onchange='sub(this)' /></td></tr>\n"
 	"<tr><td align=\"right\"><b>Progress:</b></td><td><div id='prgbar'><div id='bar' style=\"width: 0px;\"><label id='prg'></label></div></div></td></tr>\n"
-	"<tr><td align=\"right\"><b>Support Firmware:</b></td><td align=\"left\"><a target=\"_download\" href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio/releases\">https://github.com/marceloferreirachile/ESP32APRS_Audio/releases</a></td></tr>\n"
+	"<tr><td align=\"right\"><b>Support Firmware:</b></td><td align=\"left\"><a target=\"_download\" href=\"" BRAND_REPO_URL "/releases\">" BRAND_REPO_URL "/releases</a></td></tr>\n"
 	"<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\"><input type='submit' class=\"btn btn-danger\" id=\"update_sumbit\" value='Firmware UpLoad'></div></td></tr>\n"
 	"</table><br />\n"
 	"</form>\n"
@@ -10943,7 +10944,7 @@ static const char *ABOUT_TEMPLATE =
 	"success: function(d) {"
 	"document.getElementById('check_ver_btn').disabled = false;"
 	"if (d.update_available) {"
-	"var newUrl = 'https://github.com/marceloferreirachile/ESP32APRS_Audio/releases/download/' + d.latest_tag + '/' + d.latest_filename;"
+	"var newUrl = '" BRAND_REPO_URL "/releases/download/' + d.latest_tag + '/' + d.latest_filename;"
 	"var fwLink = document.getElementById('fw_file_link');"
 	"fwLink.href = newUrl;"
 	"fwLink.innerHTML = d.latest_filename;"
@@ -11119,7 +11120,7 @@ void handle_about(AsyncWebServerRequest *request)
 #ifndef NO_OTA
 	data["ota"] = true;
 	char ota_url_buf[200];
-	snprintf(ota_url_buf, sizeof(ota_url_buf), "https://github.com/marceloferreirachile/ESP32APRS_Audio/releases/download/v%s-%s/%s", VERSION, VERSION_BUILD, FirmwareOTA);
+	snprintf(ota_url_buf, sizeof(ota_url_buf), BRAND_REPO_URL "/releases/download/v%s-%s/%s", VERSION, VERSION_BUILD, FirmwareOTA);
 	data["otaUrl"] = ota_url_buf;
 	data["otaFile"] = FirmwareOTA;
 #endif
@@ -11317,7 +11318,7 @@ static const char *PRIME_TEMPLATE =
 	"<div style='width:100%;max-width:520px;margin:20px auto;'>"
 	"<table style='width:100%;table-layout:fixed;'>"
 	"<tr><th>"
-	"<span><b>AR-APRS PRIME</b></span>"
+	"<span><b>" BRAND_SHORT " PRIME</b></span>"
 	"</th></tr>"
 	"<tr><td style='text-align:center;padding:15px;white-space:normal;'>"
 	"<h2 style='margin:5px 0 8px;'>PRIME</h2>"
@@ -11362,7 +11363,7 @@ static const char *PRIME_TEMPLATE =
 	"function primeTick(){"
 	"if(document.hidden){return;}"
 	"var c=document.getElementById('contentmain');"
-	"if(!c||c.innerHTML.indexOf('AR-APRS PRIME')===-1){"
+	"if(!c||c.innerHTML.indexOf('" BRAND_SHORT " PRIME')===-1){"
 	"clearInterval(primeTimer);primeTimer=null;return;"
 	"}"
 	"$('#contentmain').load('/prime');"
@@ -11377,11 +11378,11 @@ static const char *PRIME_TEMPLATE =
 	"<div style='width:100%;max-width:520px;margin:20px auto;'>"
 	"<table style='width:100%;table-layout:fixed;'>"
 	"<tr><th colspan='2'>"
-	"<span><b>AR-APRS PRIME</b></span>"
+	"<span><b>" BRAND_SHORT " PRIME</b></span>"
 	"</th></tr>"
 	"<tr><td colspan='2' style='text-align:center;padding:15px;'>"
 	"<h2 style='margin:5px 0 8px;'>PRIME</h2>"
-	"<p style='margin:0;'>Exclusive features and services for AR-APRS users.</p>"
+	"<p style='margin:0;'>Exclusive features and services for " BRAND_SHORT " users.</p>"
 	"</td></tr>"
 	"<tr><td colspan='2' style='padding:15px;'>"
 	"<div id='primeLoginBox'>"
@@ -11696,7 +11697,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
         "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<meta http-equiv='refresh' content='5'>"
-        "<title>AR-APRS TX Debug</title>"
+        "<title>" BRAND_SHORT " TX Debug</title>"
         "<style>"
         "body{font-family:Arial,sans-serif;background:#111;color:#eee;"
         "max-width:1180px;margin:24px auto;padding:15px}"
@@ -11722,8 +11723,8 @@ void handle_txdebug(AsyncWebServerRequest *request)
         "body{margin:10px auto;padding:10px}"
         "}"
         "</style></head><body>"
-        "<h2>AR-APRS TX DEBUG</h2>"
-        "<small>Argentina APRS System | refresh 5s<br>LU6JMF &mdash; Marcelo Ferreira &middot; Creator</small>"
+        "<h2>" BRAND_SHORT " TX DEBUG</h2>"
+        "<small>" BRAND_LONG " | refresh 5s<br>LU6JMF &mdash; Marcelo Ferreira &middot; Creator</small>"
     );
 
     // 2.1.5: LAST RESTART banner at the top (easy to find; the page refreshes every 5 s so the

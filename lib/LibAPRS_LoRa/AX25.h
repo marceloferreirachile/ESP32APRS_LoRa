@@ -72,6 +72,7 @@ typedef struct AX25Msg {
     uint8_t  pid;
     uint8_t info[AX25_MAX_INFO_LEN];
     size_t len;
+    uint16_t mVrms;   // LU6JMF: kept for API compatibility with the 2.1.5 (audio) core; always 0 on LoRa
 } AX25Msg;
 
 typedef struct Hdlc
@@ -95,6 +96,8 @@ void ax25_sendRaw(AX25Ctx *ctx, void *_buf, size_t len);
 void ax25_init(AX25Ctx *ctx, ax25_callback_t hook);
 char ax25_encode(ax25frame &frame,char *raw,int size);
 void ax25_decode(AX25Ctx *ctx);
+// LU6JMF 2.1.5 core API (same as the audio firmware): parse a raw AX.25 frame (no FCS) into msg
+void ax25_decode(uint8_t *buf, size_t len, uint16_t mVrms, AX25Msg *msg);
 //void ax25sendFrame(AX25Ctx *ctx,ax25frame *pkg);
 int hdlcFrame(uint8_t *outbuf, size_t outbuf_len, AX25Ctx *ctx, ax25frame *pkg);
 uint8_t *ax25_putRaw(uint8_t *raw,AX25Ctx *ctx, uint8_t c);

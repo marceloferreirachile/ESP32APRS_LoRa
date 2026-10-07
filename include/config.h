@@ -116,9 +116,31 @@ typedef struct Config_Struct
 	int tone_tx;
 	uint8_t band;
 	uint8_t sql_level;
+#ifdef RADIO_LORA
+	int8_t rf_power;		// LoRa: TX power in dBm (audio build: SA868 high/low bool)
+#else
 	bool rf_power;
+#endif
 	uint8_t volume;
 	uint8_t mic;
+
+#ifdef RADIO_LORA
+	// LU6JMF - LoRa radio (ported from nakhonthai ESP32APRS_LoRa V0.9b, same names/meaning)
+	uint8_t rf_mode;		// RF_MODE_LoRa / G3RUH / GFSK / AIS
+	float rf_freq;			// MHz
+	int16_t rf_freq_offset;	// Hz, +-30000
+	float rf_bw;			// kHz (LoRa/GFSK bandwidth)
+	float rf_br;			// kbps (GFSK baud rate)
+	uint8_t rf_sf;
+	uint8_t rf_cr;
+	uint8_t rf_sync;		// LoRa APRS standard = 0x12 (18)
+	uint8_t rf_preamable;
+	uint8_t rf_lna;
+	bool rf_ax25;			// TX format: true = AX.25/HDLC (nakhonthai), false = "<\xFF\x01"+TNC2 (LoRa APRS standard)
+	uint8_t rf_shaping;
+	uint8_t rf_encoding;
+	bool rf_rx_boost;
+#endif
 	
 
 	// IGATE
@@ -340,6 +362,21 @@ typedef struct Config_Struct
 	int8_t dac_sel_gpio = 17;
 	uint8_t adc_atten = 0;
 	uint16_t adc_dc_offset;
+#ifdef RADIO_LORA
+	// LU6JMF - LoRa module SPI/control GPIO (rf_tx_gpio/rf_rx_gpio above = antenna switch, -1 = none)
+	int8_t rf_dio1_gpio = 3;
+	int8_t rf_reset_gpio = 5;
+	int8_t rf_dio0_gpio = 4;
+	int8_t rf_dio2_gpio = -1;
+	int8_t rf_nss_gpio = 8;
+	int8_t rf_sclk_gpio = 10;
+	int8_t rf_miso_gpio = 6;
+	int8_t rf_mosi_gpio = 7;
+	bool rf_tx_active = 1;
+	bool rf_rx_active = 1;
+	bool rf_reset_active = 0;
+	bool rf_nss_active = 0;
+#endif
 
 
 	bool i2c_enable;
