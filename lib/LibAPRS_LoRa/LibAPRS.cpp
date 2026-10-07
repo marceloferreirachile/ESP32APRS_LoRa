@@ -92,6 +92,7 @@ bool received = false;
 // LU6JMF 2.1.5 core hooks (implemented in lora_compat.cpp)
 static int16_t lastTxState = 0;
 extern void loraTxDone(int16_t state);
+extern void LED_Status(uint8_t r, uint8_t g, uint8_t b); // main.cpp
 
 bool eInterrupt = true;
 bool noisyInterrupt = false;
