@@ -4853,6 +4853,23 @@ void setup()
 
         display.setTextSize(1);
         display.setFont(&FreeSansBold9pt7b);
+#ifdef RADIO_LORA
+        // AR-LORA boot screen (128x64): brand top-left, "LoRa" box, short version
+        display.setCursor(0, 15);
+        display.print(BRAND_SHORT);
+        display.setCursor(68, 32);
+        display.print("LoRa");
+        display.drawYBitmap(0, 16, LOGO, 48, 48, WHITE);
+        display.drawRoundRect(52, 16, 75, 22, 3, WHITE);
+
+        display.setFont();
+        display.setTextColor(WHITE);
+
+        display.setCursor(55, 40);
+        display.printf("V%s", VERSION);
+        display.setCursor(86, 5);
+        display.print("LU6JMF");
+#else
         display.setCursor(0, 15);
         display.print("APRS");
         display.setCursor(60, 32);
@@ -4867,6 +4884,7 @@ void setup()
         display.printf("FW Ver %s%s", VERSION, VERSION_BUILD);
         display.setCursor(65, 5);
         display.print("Copy@2022");
+#endif
         display.display();
         LED_Status(255, 0, 0);
         delay(1000);
