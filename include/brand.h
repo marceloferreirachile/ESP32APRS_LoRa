@@ -27,4 +27,15 @@
 #endif
 
 #define BRAND_REPO_URL "https://github.com/" BRAND_PUBLIC_REPO
+
+// Default APRS status text per function (max 67 chars)
+#ifdef RADIO_LORA
+#define BRAND_STATUS_IGATE "AR-LORA iGate - " BRAND_LONG
+#define BRAND_STATUS_DIGI "AR-LORA Digi - " BRAND_LONG
+#define BRAND_STATUS_TRK "AR-LORA Tracker - " BRAND_LONG
+#else
+#define BRAND_STATUS_IGATE BRAND_UPSTREAM_URL
+#define BRAND_STATUS_DIGI BRAND_UPSTREAM_URL
+#define BRAND_STATUS_TRK BRAND_UPSTREAM_URL
+#endif
 #endif

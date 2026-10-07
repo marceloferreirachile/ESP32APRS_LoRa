@@ -1783,7 +1783,7 @@ void defaultConfig()
     memset(config.igate_phg, 0, sizeof(config.igate_phg));
     config.igate_path = 8;
     sprintf(config.igate_comment, "");
-    sprintf(config.igate_status, BRAND_UPSTREAM_URL);
+    strlcpy(config.igate_status, BRAND_STATUS_IGATE, sizeof(config.igate_status));
     config.igate_sts_interval = 1800;
 
     // DIGI REPEATER
@@ -1808,7 +1808,7 @@ void defaultConfig()
     sprintf(config.digi_symbol, "A#");
     memset(config.digi_phg, 0, sizeof(config.digi_phg));
     sprintf(config.digi_comment, "");
-    sprintf(config.digi_status, BRAND_UPSTREAM_URL);
+    strlcpy(config.digi_status, BRAND_STATUS_DIGI, sizeof(config.digi_status));
     config.digi_sts_interval = 1800;
 
     // Tracker
@@ -1848,7 +1848,7 @@ void defaultConfig()
     sprintf(config.trk_mycall, "NOCALL");
     sprintf(config.trk_comment, "");
     memset(config.trk_item, 0, sizeof(config.trk_item));
-    sprintf(config.trk_status, BRAND_UPSTREAM_URL);
+    strlcpy(config.trk_status, BRAND_STATUS_TRK, sizeof(config.trk_status));
     config.trk_sts_interval = 1800;
 
     // WX
