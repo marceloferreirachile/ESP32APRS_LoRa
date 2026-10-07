@@ -2514,6 +2514,7 @@ static const char *RADIO_LORA_TEMPLATE =
 	"<th colspan=\"2\"><span><b>LoRa Radio Status</b></span></th>\n"
 	"<tr><td align=\"right\"><b>Last packet RSSI / SNR:</b></td><td style=\"text-align: left;\">{{lastRssi}} dBm / {{lastSnr}} dB (freq. error {{lastFreqErr}} Hz)</td></tr>\n"
 	"<tr><td align=\"right\"><b>TX OK / TX error:</b></td><td style=\"text-align: left;\">{{txOk}} / {{txErr}} (last result code {{txLast}})</td></tr>\n"
+	"<tr><td align=\"right\"><b>Channel busy (listen before talk):</b></td><td style=\"text-align: left;\">{{txBusy}} <i>*frame waited for a free channel and went back to the queue</i></td></tr>\n"
 	"<tr><td align=\"right\"><b>RX frames dropped (ring full):</b></td><td style=\"text-align: left;\">{{rxDropped}}</td></tr>\n"
 	"<tr><td align=\"right\"><b>Radio re-inits (watchdog / config):</b></td><td style=\"text-align: left;\">{{recover}}</td></tr>\n"
 	"</table>\n";
@@ -2664,6 +2665,7 @@ static void handle_radio_lora(AsyncWebServerRequest *request)
 	data["lastFreqErr"] = buf;
 	data["txOk"] = loraGetTxOk();
 	data["txErr"] = loraGetTxErr();
+	data["txBusy"] = loraGetTxBusy();
 	data["txLast"] = loraGetLastTxState();
 	data["rxDropped"] = loraGetRxDropped();
 	data["recover"] = loraRecoverCount;

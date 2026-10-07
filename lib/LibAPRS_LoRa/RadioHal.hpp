@@ -15,7 +15,8 @@ public:
   virtual int16_t setCRC(uint8_t len,	uint16_t initial = 0x1D0F, uint16_t polynomial = 0x1021, bool inverted = true ) = 0;
   virtual int16_t setDataShaping(uint8_t sh) = 0;
   virtual void setDio0Action(void (*func)(void)) = 0;
-  virtual void clearDio0Action() = 0; // LU6JMF: detach the RX/TX-done interrupt before deleting the radio
+  virtual void clearDio0Action() = 0;
+  virtual int16_t scanChannel() = 0; // LU6JMF: LoRa CAD (listen before talk) // LU6JMF: detach the RX/TX-done interrupt before deleting the radio
   virtual int16_t startReceive(uint8_t len = 0, uint8_t mode = RADIOLIB_SX127X_RXCONTINUOUS) = 0;
   virtual int16_t transmit(uint8_t* data, size_t len, uint8_t addr = 0) = 0;
   virtual int16_t sleep() = 0;
@@ -76,6 +77,7 @@ public:
 
   void setDio0Action(void (*func)(void));
   void clearDio0Action() { radio->clearPacketReceivedAction(); }
+  int16_t scanChannel() { return radio->scanChannel(); }
 
   int16_t startReceive(uint8_t len = 0, uint8_t mode = RADIOLIB_SX127X_RXCONTINUOUS);
 

@@ -43,6 +43,13 @@ void Ax25TransmitCheck(void);
 void Ax25GetTxDiag(uint8_t *head, uint8_t *tail, bool *bufferFull, uint8_t *initStage);
 void Ax25TxAbort(bool keyed);
 
+// LoRa listen-before-talk: transmit() was not attempted because the channel stayed busy
+// (CAD) for 10 s. The core puts the frame back into the TX queue (main.cpp).
+#define LORA_TX_CHANNEL_BUSY (-32000)
+void loraRememberFrame(const uint8_t *raw, size_t len);
+const char *loraLastFrame(size_t *len);
+uint32_t loraGetTxBusy();
+
 // LoRa-only diagnostics (lora_compat.cpp)
 int16_t loraGetLastTxState();
 uint32_t loraGetTxOk();
