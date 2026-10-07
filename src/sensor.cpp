@@ -16,11 +16,7 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_Si7021.h>
 #include <Adafruit_CCS811.h>
-#include <Adafruit_INA219.h>
-#include <Adafruit_ADS1X15.h>
-#include <Adafruit_AHTX0.h>
 #include <SHTSensor.h>
-#include <MCP342x.h>
 #include <ModbusMaster.h>
 #include <TinyGPS++.h>
 #include <soc/gpio_struct.h>
@@ -31,20 +27,16 @@
 //#include "DS18B20.h" // Digital Thermometer, 12bit
 //#include "OneWireHub.h"
 
+extern TwoWire Wire1;
 extern Configuration config;
 extern WiFiClient aprsClient;
 extern ModbusMaster modbus;
-extern SemaphoreHandle_t i2c0_mutex;
-extern SemaphoreHandle_t i2c1_mutex;
-
-static inline bool i2c0_lock()  { return i2c0_mutex && xSemaphoreTake(i2c0_mutex, pdMS_TO_TICKS(500)) == pdTRUE; }
-static inline void i2c0_unlock(){ if (i2c0_mutex) xSemaphoreGive(i2c0_mutex); }
-static inline bool i2c1_lock()  { return i2c1_mutex && xSemaphoreTake(i2c1_mutex, pdMS_TO_TICKS(500)) == pdTRUE; }
-static inline void i2c1_unlock(){ if (i2c1_mutex) xSemaphoreGive(i2c1_mutex); }
+extern bool i2c_busy;
 extern TinyGPSPlus gps;
 extern double VBat;
+extern bool VBat_Flag;
 extern double TempNTC;
-#ifdef TTGO_T_Beam_S3_SUPREME_V3
+#ifdef TTGO_TWR
 #include <XPowersLib.h>
 extern XPowersAXP2101 PMU;
 #endif
@@ -53,11 +45,7 @@ Adafruit_BME280 *bme=NULL;    // I2C
 Adafruit_BMP280 *bmp280=NULL; // I2C
 Adafruit_Si7021 *Si7021=NULL;
 Adafruit_CCS811 *ccs=NULL;
-Adafruit_INA219 *ina219=NULL;
 SHTSensor *sht=NULL; // Supported sensors:SHTC1, SHTC3, SHTW1, SHTW2, SHT3x-DIS (I2C), SHT2x, SHT85, SHT3x-ARP, SHT4x
-MCP342x *mcp342x=NULL; // Supported MCP3421, MCP3422, MCP3424, MCP3425, MCP3426, MCP3427
-Adafruit_ADS1115 *ads=NULL;  /* Use this for the 16-bit version */
-Adafruit_AHTX0 *aht=NULL;    // I2C
 //OneWire *oneWire=NULL;
 //DallasTemperature *ds1820;
 
@@ -88,12 +76,8 @@ double getTempNTC(double Vout)
 {
     double average, kelvin, resistance, celsius;
     int i;
-#if defined(T_BEAM_S3_1W) //R2 to gnd
-    resistance = SERIESRESISTOR * (3300 - Vout) / Vout;
-#else
-    //NTC to gnd
+
     resistance = SERIESRESISTOR * Vout / (3300 - Vout);
-#endif
     log_d("ADC=%0.fmV R=%0.1f", Vout, resistance);
     // Convert to resistanceresistance = 4095 / average - 1;resistance = SERIESRESISTOR/resistance;
     /*
@@ -257,6 +241,7 @@ bool getCPU_TEMP(uint8_t port)
     }
     return true;
 }
+
 bool getBAT(uint8_t port)
 {
     // analogReadResolution(12);
@@ -266,8 +251,8 @@ bool getBAT(uint8_t port)
     {
         if (config.sensor[i].type == SENSOR_BAT_VOLTAGE)
         {
-            if (config.sensor[i].port == port){
-#ifdef TTGO_T_Beam_S3_SUPREME_V3
+            VBat_Flag=true;
+#ifdef TTGO_TWR
             VBat = (double)PMU.getBattVoltage() / 1000;
             sensorUpdate(i, VBat);
 #elif defined(HELTEC_HTIT_TRACKER)
@@ -289,20 +274,12 @@ bool getBAT(uint8_t port)
 #elif defined(APRS_LORA_HT)
             VBat = (double)analogReadMilliVolts(3) / 595.24F;
             sensorUpdate(i, VBat);
-#elif defined(T_BEAM_S3_1W)
-            // if(!VBat_Flag){
-            //     analogReadResolution(12);
-            //     analogSetAttenuation(ADC_11db);
-            //     VBat = (double)analogReadMilliVolts(4) / 333.289F;    
-            // }
-            sensorUpdate(i, VBat);        
 #elif defined(BUOY)
             analogReadResolution(12);
             analogSetAttenuation(ADC_11db);
             VBat = (double)analogReadMilliVolts(0) / 595.24F;
             sensorUpdate(i, VBat);
 #endif
-            }
         }
         else if (config.sensor[i].type == SENSOR_BAT_PERCENT)
         {
@@ -500,67 +477,35 @@ bool getBME_I2C(Adafruit_BME280 &node, uint8_t port)
 
 bool getBMP_I2C(Adafruit_BMP280 &node, uint8_t port)
 {
-    bool dataUpdated = false;
-
-    // ✅ Check sensor ID to verify BMP280 is connected
-    // uint8_t sensorID = node.sensorID();
-    // if (sensorID == 0 || sensorID == 0xFF) {
-    //     log_e("BMP280: Invalid sensor ID 0x%02X - sensor not connected!", sensorID);
-    //     return false;
-    // }
-
+    bool result;
     /* Default settings from datasheet. */
-    node.setSampling(Adafruit_BMP280::MODE_FORCED,
-                     Adafruit_BMP280::SAMPLING_X16,
-                     Adafruit_BMP280::SAMPLING_X16,
-                     Adafruit_BMP280::FILTER_OFF,
-                     Adafruit_BMP280::STANDBY_MS_1);
-
-    if (!node.takeForcedMeasurement()) {
-        log_e("BMP280: Failed to take forced measurement");
-        return false;
-    }
-
-    float pressure = node.readPressure();
-    float temperature = node.readTemperature();
-
-    // ✅ Validate readings
-    if (isnan(pressure) || isnan(temperature)) {
-        log_e("BMP280: Invalid readings - Pressure: %.2f, Temperature: %.2f", pressure, temperature);
-        return false;
-    }
-
-    // ✅ Check for reasonable value ranges
-    if (temperature < -40 || temperature > 85) {
-        log_e("BMP280: Temperature out of range: %.2f°C (valid: -40 to +85°C)", temperature);
-        return false;
-    }
-
-    if (pressure < 30000 || pressure > 110000) {
-        log_e("BMP280: Pressure out of range: %.2f Pa (valid: 30000 to 110000 Pa)", pressure);
-        return false;
-    }
-
-    // ✅ Update all enabled sensors for this port
-    for (int i = 0; i < SENSOR_NUMBER; i++)
+    node.setSampling(Adafruit_BMP280::MODE_FORCED,     /* Operating Mode. */
+                     Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                     Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                     Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                     Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+    result = node.takeForcedMeasurement();             // has no effect in normal mode
+    if (result)
     {
-        if(!config.sensor[i].enable) continue;
-
-        if (config.sensor[i].type == SENSOR_TEMPERATURE && config.sensor[i].port == port)
+        for (int i = 0; i < SENSOR_NUMBER; i++)
         {
-            sensorUpdate(i, temperature);
-            dataUpdated = true;
-            log_d("BMP280: Temperature = %.2f°C", temperature);
+            if(!config.sensor[i].enable) continue;
+            if (config.sensor[i].type == SENSOR_TEMPERATURE && config.sensor[i].port == port)
+            {
+                sensorUpdate(i, node.readTemperature()); // Temperature
+            }
+            // else if (config.sensor[i].type == SENSOR_ALTITUDE && config.sensor[i].port == port)
+            // {
+            //     sensorUpdate(i, node.readAltitude(1013.25)); // Altutude
+            // }
+            else if (config.sensor[i].type == SENSOR_PRESSURE && config.sensor[i].port == port)
+            {
+                sensorUpdate(i, node.readPressure() / 100.0F); // Pressure
+            }
         }
-        else if (config.sensor[i].type == SENSOR_PRESSURE && config.sensor[i].port == port)
-        {
-            sensorUpdate(i, pressure / 100.0F);
-            dataUpdated = true;
-            log_d("BMP280: Pressure = %.2f hPa", pressure / 100.0F);
-        }
+        return true;
     }
-
-    return dataUpdated;
+    return false;
 }
 
 bool getSI7021_I2C(Adafruit_Si7021 &node, uint8_t port)
@@ -602,79 +547,6 @@ bool getSHT_I2C(SHTSensor &node, uint8_t port)
     return false;
 }
 
-bool getAHT20_I2C(Adafruit_AHTX0 &node, uint8_t port)
-{
-     sensors_event_t humidity, temp;
-     node.getEvent(&humidity, &temp);// populate temp and humidity objects with fresh data
-    for (int i = 0; i < SENSOR_NUMBER; i++)
-    {
-        if(!config.sensor[i].enable) continue;
-        if (config.sensor[i].type == SENSOR_TEMPERATURE && config.sensor[i].port == port)
-        {
-            sensorUpdate(i, temp.temperature); // Temperature
-        }
-        else if (config.sensor[i].type == SENSOR_HUMIDITY && config.sensor[i].port == port)
-        {
-            sensorUpdate(i, humidity.relative_humidity); // Humidity
-        }
-    }
-    return true;
-}
-
-bool getMCP342x_I2C(MCP342x &node, int idx)
-{
-    uint8_t port = config.sensor[idx].address;
-    long value = 0;
-    MCP342x::Channel channel = MCP342x::channel1;
-    MCP342x::Config status;
-    if(port == 0){
-        channel = MCP342x::channel1; // Channel 1
-    }
-    else if(port == 1){
-        channel = MCP342x::channel2; // Channel 2
-    }
-    else if(port == 2){
-        channel = MCP342x::channel3; // Channel 3
-    }
-    else if(port == 3){
-        channel = MCP342x::channel4; // Channel 4
-    }
-    else{
-        log_e("MCP342x Invalid idx %d ,port %d",idx, port);
-        return false;   
-    }
-    uint8_t err = node.convertAndRead(channel, MCP342x::oneShot,
-        MCP342x::resolution18, MCP342x::gain1,
-        1000000, value, status);
-    //log_d("MCP342x idx: %i port: %i value: %d",idx,port, value);
-    if (!err)
-    {
-        if(!config.sensor[idx].enable) return false;
-        sensorUpdate(idx, (double)value); //update sensor value
-        return true;
-    }
-    return false;
-}
-
-bool getADS1115_I2C(Adafruit_ADS1115 &node, int idx)
-{
-    int16_t adc=0;
-    uint8_t port = config.sensor[idx].address;
-    long value = 0;
-    adc = node.readADC_SingleEnded(port);
-    if(adc>0){
-        if (config.sensor[idx].type == SENSOR_VOLTAGE)
-        {
-            sensorUpdate(idx, node.computeVolts(adc)); // Voltage
-        }else{
-            sensorUpdate(idx, (double)adc); //update sensor value
-        }
-        return true;
-    }
-
-    return false;
-}
-
 bool getCCS_I2C(Adafruit_CCS811 &node, uint8_t port)
 {
     if (!node.readData())
@@ -690,31 +562,6 @@ bool getCCS_I2C(Adafruit_CCS811 &node, uint8_t port)
             else if (config.sensor[i].type == SENSOR_TVOC && config.sensor[i].port == port)
             {
                 sensorUpdate(i, (double)node.getTVOC()); // TVOC
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
-bool getINA219_I2C(Adafruit_INA219 &node, uint8_t port)
-{
-    if (node.success())
-    {
-        for (int i = 0; i < SENSOR_NUMBER; i++)
-        {
-            if(!config.sensor[i].enable) continue;
-            if (config.sensor[i].type == SENSOR_VOLTAGE && config.sensor[i].port == port)
-            {
-                sensorUpdate(i, node.getBusVoltage_V()); // Voltage
-            }
-            else if (config.sensor[i].type == SENSOR_CURRENT && config.sensor[i].port == port)
-            {
-                sensorUpdate(i, node.getCurrent_mA()); // Current
-            }
-            else if (config.sensor[i].type == SENSOR_POWER && config.sensor[i].port == port)
-            {
-                sensorUpdate(i, node.getPower_mW()); // Power
             }
         }
         return true;
@@ -1035,7 +882,7 @@ bool getSensor(int cfgIdx)
     case PORT_M701:
         if (config.modbus_channel == 1)
         {
-            modbus.begin(config.sensor[cfgIdx].address, Serial);
+            modbus.begin(config.sensor[cfgIdx].address, Serial0);
         }
         else if (config.modbus_channel == 2)
         {
@@ -1057,7 +904,7 @@ bool getSensor(int cfgIdx)
     case PORT_M702:
         if (config.modbus_channel == 1)
         {
-            modbus.begin(config.sensor[cfgIdx].address, Serial);
+            modbus.begin(config.sensor[cfgIdx].address, Serial0);
         }
         else if (config.modbus_channel == 2)
         {
@@ -1079,7 +926,7 @@ bool getSensor(int cfgIdx)
     case PORT_PZEM:
         if (config.modbus_channel == 1)
         {
-            modbus.begin(config.sensor[cfgIdx].address, Serial);
+            modbus.begin(config.sensor[cfgIdx].address, Serial0);
         }
         else if (config.modbus_channel == 2)
         {
@@ -1143,115 +990,98 @@ bool getSensor(int cfgIdx)
             return true;
         break;
     case PORT_BME280_I2C0:
-        if (config.i2c_enable && i2c0_lock())
+        if (config.i2c_enable)
         {
-            bool r = bme != NULL && getBME_I2C(*bme, PORT_BME280_I2C0);
-            i2c0_unlock();
-            if (r) return true;
+            int i2c_timeout = 0;
+            while (i2c_busy)
+            {
+                delay(10);
+                if (++i2c_timeout > 50)
+                    break;
+            }
+            i2c_busy = true;
+            if (getBME_I2C(*bme, PORT_BME280_I2C0))
+            {
+                i2c_busy = false;
+                return true;
+            }
+            i2c_busy = false;
         }
         break;
     case PORT_BME280_I2C1:
-        if (config.i2c1_enable && i2c1_lock())
+        if (config.i2c1_enable)
         {
-            bool r = bme != NULL && getBME_I2C(*bme, PORT_BME280_I2C1);
-            i2c1_unlock();
-            if (r) return true;
+            if (getBME_I2C(*bme, PORT_BME280_I2C1))
+            {
+                return true;
+            }
         }
         break;
     case PORT_BMP280_I2C0:
-        if (config.i2c_enable && i2c0_lock())
+        if (config.i2c_enable)
         {
-            bool r = bmp280 != NULL && getBMP_I2C(*bmp280, port);
-            i2c0_unlock();
-            if (r) return true;
+            if (getBMP_I2C(*bmp280, port))
+                return true;
         }
         break;
     case PORT_BMP280_I2C1:
-        if (config.i2c1_enable && i2c1_lock())
+        if (config.i2c1_enable)
         {
-            bool r = bmp280 != NULL && getBMP_I2C(*bmp280, port);
-            i2c1_unlock();
-            if (r) return true;
+            if (getBMP_I2C(*bmp280, port))
+                return true;
         }
         break;
     case PORT_SI7021_I2C0:
-        if (config.i2c_enable && i2c0_lock())
+        if (config.i2c_enable)
         {
-            bool r = Si7021 != NULL && getSI7021_I2C(*Si7021, port);
-            i2c0_unlock();
-            if (r) return true;
+            if (getSI7021_I2C(*Si7021, port))
+                return true;
         }
         break;
     case PORT_SI7021_I2C1:
-        if (config.i2c1_enable && i2c1_lock())
+        if (config.i2c1_enable)
         {
-            bool r = Si7021 != NULL && getSI7021_I2C(*Si7021, port);
-            i2c1_unlock();
-            if (r) return true;
+            if (getSI7021_I2C(*Si7021, port))
+                return true;
         }
         break;
     case PORT_CCS811_I2C0:
-        if (config.i2c_enable && ccs != NULL && i2c0_lock())
+        if (config.i2c_enable)
         {
-            bool r = false;
             if (ccs->available())
             {
-                r = getCCS_I2C(*ccs, port);
+                //float temp = ccs->calculateTemperature();
+                //log_d("CCS811 temperature %0.2fC", temp);
+            //}
+                if (getCCS_I2C(*ccs, port))
+                    return true;
             }
-            else if (ccs->checkError())
+            else
             {
-                ccs->begin(config.sensor[cfgIdx].address, &Wire);
-                log_d("CCS811 Restart boot");
+                if (ccs->checkError())
+                {
+                    ccs->begin(config.sensor[cfgIdx].address, &Wire);
+                    log_d("CCS811 Restart boot");
+                }
             }
-            i2c0_unlock();
-            if (r) return true;
         }
         break;
     case PORT_CCS811_I2C1:
-        if (config.i2c1_enable && ccs != NULL && i2c1_lock())
+        if (config.i2c1_enable)
         {
-            bool r = ccs->available() && getCCS_I2C(*ccs, port);
-            i2c1_unlock();
-            if (r) return true;
-        }
-        break;
-        case PORT_INA219_I2C0:
-        if (config.i2c_enable && ina219 != NULL && i2c0_lock())
-        {
-            bool r = false;
-            if (ina219->success())
-                r = getINA219_I2C(*ina219, port);
-            else
+            if (ccs->available())
             {
-                ina219->begin(&Wire);
-                log_d("INA219 Restart boot");
+                if (getCCS_I2C(*ccs, port))
+                {
+                    return true;
+                }
             }
-            i2c0_unlock();
-            if (r) return true;
         }
         break;
-        #if SOC_I2C_NUM > 1
-        case PORT_INA219_I2C1:
-        if (config.i2c1_enable && ina219 != NULL && i2c1_lock())
-        {
-            bool r = false;
-            if (ina219->success())
-                r = getINA219_I2C(*ina219, port);
-            else
-            {
-                ina219->begin(&Wire1);
-                log_d("INA219 Restart boot");
-            }
-            i2c1_unlock();
-            if (r) return true;
-        }
-        break;
-        #endif     
     case PORT_SAT_NUM:
         if (config.gnss_enable)
         {
             getSAT();
-            return true;
         }
         else
         {
@@ -1262,7 +1092,6 @@ bool getSensor(int cfgIdx)
         if (config.gnss_enable)
         {
             getSAT();
-            return true;
         }
         else
         {
@@ -1270,95 +1099,40 @@ bool getSensor(int cfgIdx)
         }
         break;
     case PORT_SHT_I2C0:
-        if (config.i2c_enable && i2c0_lock())
+        if (config.i2c_enable)
         {
-            bool r = sht != NULL && getSHT_I2C(*sht, port);
-            i2c0_unlock();
-            if (r) return true;
+
+            if (getSHT_I2C(*sht, port))
+                return true;
         }
         break;
-        #if SOC_I2C_NUM > 1
     case PORT_SHT_I2C1:
-        if (config.i2c1_enable && i2c1_lock())
+        if (config.i2c_enable)
         {
-            bool r = sht != NULL && getSHT_I2C(*sht, port);
-            i2c1_unlock();
-            if (r) return true;
+            if (getSHT_I2C(*sht, port))
+                return true;
         }
         break;
-        #endif
-    case PORT_AHT20_I2C0:
-        if (config.i2c_enable && i2c0_lock())
-        {
-            bool r = aht != NULL && getAHT20_I2C(*aht, port);
-            i2c0_unlock();
-            if (r) return true;
-        }
-        break;
-        #if SOC_I2C_NUM > 1
-    case PORT_AHT20_I2C1:
-        if (config.i2c1_enable && i2c1_lock())
-        {
-            bool r = aht != NULL && getAHT20_I2C(*aht, port);
-            i2c1_unlock();
-            if (r) return true;
-        }
-        break;
-        #endif 
-    case PORT_MCP342x_I2C0:
-        if (config.i2c_enable && i2c0_lock())
-        {
-            bool r = mcp342x != NULL && getMCP342x_I2C(*mcp342x, cfgIdx);
-            i2c0_unlock();
-            if (r) return true;
-        }
-        break;
-
-    case PORT_ADS1115_I2C0:
-        if (config.i2c_enable && i2c0_lock())
-        {
-            bool r = ads != NULL && getADS1115_I2C(*ads, cfgIdx);
-            i2c0_unlock();
-            if (r) return true;
-        }
-        break;
-
-        // #if SOC_I2C_NUM > 1
-        // case PORT_MCP342x_I2C1:
-        // if (config.i2c1_enable)
-        // {
-
-        //     if (getMCP342x_I2C(*mcp342x, port))
-        //         return true;
-        // }
-        // break;  
-        // #endif
     case PORT_BATTERY:
-        getBAT(port);
-        return true;
+        getBAT(0);
         break;
     case PORT_CPU_TEMP:
         getCPU_TEMP(port);
         break;
     case PORT_CNT_0:
         getCNT0(port);
-        return true;
         break;
     case PORT_CNT_1:
         getCNT1(port);
-        return true;
         break;
     case PORT_LOGIC:
         getLOGIC(port);
-        return true;
         break; 
     case PORT_DS1820:
         if(config.onewire_enable){
             getDS1820(port);
-            return true;
         }
-        break; 
-          
+        break;       
     default:
         log_d("Sensor Not config");
         break;
@@ -1397,7 +1171,7 @@ void sensorInit(bool resetAll)
             sen[i].counter = 0;
             sen[i].sum = 0;
             sen[i].timeAvg = 0;
-            sen[i].timeTick = millis() + (10 * 1000);
+            sen[i].timeTick = 0;
         }
         sen[i].visable = false;
         sen[i].timeSample = 0;
@@ -1420,93 +1194,114 @@ void sensorInit(bool resetAll)
             attachInterrupt(config.sensor[i].address, pulse_ch1, RISING);
             break;
         case PORT_BME280_I2C0:
-            if (config.i2c_enable && i2c0_lock())
+            if (config.i2c_enable)
             {
-                if (bme == NULL) {
-                    bme = new Adafruit_BME280();
-                    if (!bme->begin(config.sensor[i].address, &Wire)) // 0x76=118,0x77=119
-                    {
-                        log_d("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
-                        log_d("SensorID was: 0x%0X", bme->sensorID());
-                        log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
-                        log_d("ID of 0x56-0x58 represents a BMP 280,");
-                        log_d("ID of 0x60 represents a BME 280.");
-                        log_d("ID of 0x61 represents a BME 680.");
-                    }
+                int i2c_timeout = 0;
+                while (i2c_busy)
+                {
+                    delay(10);
+                    if (++i2c_timeout > 50)
+                        break;
                 }
-                i2c0_unlock();
+                i2c_busy = true;
+                if (bme != NULL)
+                    break;
+                bme = new Adafruit_BME280();
+                if (!bme->begin(config.sensor[i].address, &Wire)) // 0x76=118,0x77=119
+                {
+                    log_d("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
+                    log_d("SensorID was: 0x%0X", bme->sensorID()); // log_d(bme.sensorID(),16);
+                    log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
+                    log_d("ID of 0x56-0x58 represents a BMP 280,");
+                    log_d("ID of 0x60 represents a BME 280.");
+                    log_d("ID of 0x61 represents a BME 680.");
+                }
+                i2c_busy = false;
+            }
+            else
+            {
+                log_d("Not enable I2C0 port");
             }
             break;
-            #if SOC_I2C_NUM > 1
         case PORT_BME280_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
+            if (config.i2c1_enable)
             {
-                if (bme == NULL) {
-                    bme = new Adafruit_BME280();
-                    if (!bme->begin(config.sensor[i].address, &Wire1))
-                    {
-                        log_d("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
-                        log_d("SensorID was: 0x%0X", bme->sensorID());
-                        log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
-                        log_d("ID of 0x56-0x58 represents a BMP 280,");
-                        log_d("ID of 0x60 represents a BME 280.");
-                        log_d("ID of 0x61 represents a BME 680.");
-                    }
+                if (bme != NULL)
+                    break;
+                bme = new Adafruit_BME280();
+                if (!bme->begin(config.sensor[i].address, &Wire1)) // 0x76=118,0x77=119
+                {
+                    log_d("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
+                    log_d("SensorID was: 0x%0X", bme->sensorID()); // log_d(bme.sensorID(),16);
+                    log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
+                    log_d("ID of 0x56-0x58 represents a BMP 280,");
+                    log_d("ID of 0x60 represents a BME 280.");
+                    log_d("ID of 0x61 represents a BME 680.");
                 }
-                i2c1_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C1 port");
             }
             break;
-            #endif
         case PORT_BMP280_I2C0:
-            if (config.i2c_enable && i2c0_lock())
+            if (config.i2c_enable)
             {
-                if (bmp280 == NULL) {
-                    bmp280 = new Adafruit_BMP280(&Wire);
-                    if (!bmp280->begin(config.sensor[i].address))
-                    {
-                        log_d("Could not find a valid BMP280 sensor, check wiring, address, sensor ID!");
-                        log_d("SensorID was: 0x%0X", bmp280->sensorID());
-                        log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
-                        log_d("ID of 0x56-0x58 represents a BMP 280,");
-                        log_d("ID of 0x60 represents a BME 280.");
-                        log_d("ID of 0x61 represents a BME 680.");
-                    }
+                if (bmp280 != NULL)
+                    break;
+                bmp280 = new Adafruit_BMP280(&Wire);
+                if (!bmp280->begin(config.sensor[i].address)) // 0x76=118,0x77=119
+                {
+                    log_d("Could not find a valid BMP280 sensor, check wiring, address, sensor ID!");
+                    log_d("SensorID was: 0x%0X", bmp280->sensorID()); // log_d(bme.sensorID(),16);
+                    log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
+                    log_d("ID of 0x56-0x58 represents a BMP 280,");
+                    log_d("ID of 0x60 represents a BME 280.");
+                    log_d("ID of 0x61 represents a BME 680.");
                 }
-                i2c0_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C0 port");
             }
             break;
-            #if SOC_I2C_NUM > 1
         case PORT_BMP280_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
+            if (config.i2c1_enable)
             {
-                if (bmp280 == NULL) {
-                    bmp280 = new Adafruit_BMP280(&Wire1);
-                    if (!bmp280->begin(config.sensor[i].address))
-                    {
-                        log_d("Could not find a valid BMP280 sensor, check wiring, address, sensor ID!");
-                        log_d("SensorID was: 0x%0X", bmp280->sensorID());
-                        log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
-                        log_d("ID of 0x56-0x58 represents a BMP 280,");
-                        log_d("ID of 0x60 represents a BME 280.");
-                        log_d("ID of 0x61 represents a BME 680.");
-                    }
+                if (bmp280 != NULL)
+                    break;
+                bmp280 = new Adafruit_BMP280(&Wire1);
+                if (!bmp280->begin(config.sensor[i].address)) // 0x76=118,0x77=119
+                {
+                    log_d("Could not find a valid BMP280 sensor, check wiring, address, sensor ID!");
+                    log_d("SensorID was: 0x%0X", bmp280->sensorID()); // log_d(bme.sensorID(),16);
+                    log_d("ID of 0xFF probably means a bad address, a BMP 180 or BMP 085");
+                    log_d("ID of 0x56-0x58 represents a BMP 280,");
+                    log_d("ID of 0x60 represents a BME 280.");
+                    log_d("ID of 0x61 represents a BME 680.");
                 }
-                i2c1_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C1 port");
             }
             break;
-            #endif
         case PORT_SI7021_I2C0:
-            if (config.i2c_enable && i2c0_lock())
+            if (config.i2c_enable)
             {
-                if (Si7021 == NULL) {
-                    Si7021 = new Adafruit_Si7021(&Wire);
-                    if (!Si7021->begin())
-                        log_d("Could not find a valid SI7021 sensor, check wiring, address, sensor ID!");
+                if (Si7021 != NULL)
+                    break;
+                Si7021 = new Adafruit_Si7021(&Wire);
+                if (!Si7021->begin())
+                {
+                    log_d("Could not find a valid SI7021 sensor, check wiring, address, sensor ID!");
                 }
-                i2c0_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C0 port");
             }
             break;
-            #if SOC_I2C_NUM > 1
         case PORT_SI7021_I2C1:
             if (config.i2c1_enable)
             {
@@ -1523,170 +1318,83 @@ void sensorInit(bool resetAll)
                 log_d("Not enable I2C1 port");
             }
             break;
-            #endif
         case PORT_CCS811_I2C0:
-            if (config.i2c_enable && i2c0_lock())
+            if (config.i2c_enable)
             {
-                if (ccs == NULL) {
-                    ccs = new Adafruit_CCS811();
-                    if (ccs->begin(config.sensor[i].address, &Wire))
-                        ccs->setTempOffset(0);
-                    else
-                        log_d("Could not find a valid CCS811 sensor, check wiring, address, sensor ID!");
+                int i2c_timeout = 0;
+                while (i2c_busy)
+                {
+                    delay(10);
+                    if (++i2c_timeout > 50)
+                        break;
                 }
-                i2c0_unlock();
+                i2c_busy = true;
+                if (ccs != NULL)
+                    break;
+                ccs = new Adafruit_CCS811();
+                if (ccs->begin(config.sensor[i].address, &Wire))
+                {
+                    ccs->setTempOffset(0);
+                }
+                else
+                {
+                    log_d("Could not find a valid CCS811 sensor, check wiring, address, sensor ID!");
+                }
+                i2c_busy = false;
+            }
+            else
+            {
+                log_d("Not enable I2C0 port");
             }
             break;
-            #if SOC_I2C_NUM > 1
         case PORT_CCS811_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
+            if (config.i2c1_enable)
             {
-                if (ccs == NULL) {
-                    ccs = new Adafruit_CCS811();
-                    if (ccs->begin(config.sensor[i].address, &Wire1))
-                        ccs->setTempOffset(0);
-                    else
-                        log_d("Could not find a valid CCS811 sensor, check wiring 1, address, sensor ID!");
+                if (ccs != NULL)
+                    break;
+                ccs = new Adafruit_CCS811();
+                if (ccs->begin(config.sensor[i].address, &Wire1))
+                {
+                    ccs->setTempOffset(0);
                 }
-                i2c1_unlock();
+                else
+                {
+                    log_d("Could not find a valid CCS811 sensor, check wiring 1, address, sensor ID!");
+                }
+            }
+            else
+            {
+                log_d("Not enable I2C1 port");
             }
             break;
-            #endif
-            case PORT_INA219_I2C0:
-            if (config.i2c_enable && i2c0_lock())
-            {
-                if (ina219 == NULL) {
-                    ina219 = new Adafruit_INA219();
-                    if (ina219->begin(&Wire))
-                        ina219->setCalibration_32V_2A();
-                    else
-                        log_d("Could not find a valid INA219 sensor, check wiring, address, sensor ID!");
-                }
-                i2c0_unlock();
-            }
-            break;
-            #if SOC_I2C_NUM > 1
-        case PORT_INA219_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
-            {
-                if (ina219 == NULL) {
-                    ina219 = new Adafruit_INA219();
-                    if (ina219->begin(&Wire1))
-                        ina219->setCalibration_32V_2A();
-                    else
-                        log_d("Could not find a valid INA219 sensor, check wiring, address, sensor ID!");
-                }
-                i2c1_unlock();
-            }
-            break;
-            #endif
         case PORT_SHT_I2C0:
-            if (config.i2c_enable && i2c0_lock())
+            if (config.i2c_enable)
             {
-                if (sht == NULL) {
-                    sht = new SHTSensor();
-                    if (!sht->init(Wire))
-                        log_d("Could not find a valid SHTxx sensor, check wiring, address, sensor ID!");
+                sht = new SHTSensor();
+                if (!sht->init(Wire))
+                {
+                    log_d("Could not find a valid SHTxx sensor, check wiring, address, sensor ID!");
                 }
-                i2c0_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C0 port");
             }
             break;
-            #if SOC_I2C_NUM > 1
         case PORT_SHT_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
+            if (config.i2c1_enable)
             {
-                if (sht == NULL) {
-                    sht = new SHTSensor();
-                    if (!sht->init(Wire1))
-                        log_d("Could not find a valid SHTxx sensor, check wiring, address, sensor ID!");
+                sht = new SHTSensor();
+                if (!sht->init(Wire1))
+                {
+                    log_d("Could not find a valid SHTxx sensor, check wiring, address, sensor ID!");
                 }
-                i2c1_unlock();
+            }
+            else
+            {
+                log_d("Not enable I2C1 port");
             }
             break;
-            #endif
-        case PORT_AHT20_I2C0:
-            if (config.i2c_enable && i2c0_lock())
-            {
-                if (aht == NULL) {
-                    aht = new Adafruit_AHTX0();
-                    if (!aht->begin(&Wire))
-                        log_d("Could not find a valid AHT20 sensor, check wiring, address, sensor ID!");
-                }
-                i2c0_unlock();
-            }
-            break;
-            #if SOC_I2C_NUM > 1
-        case PORT_AHT20_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
-            {
-                if (aht == NULL) {
-                    aht = new Adafruit_AHTX0();
-                    if (!aht->begin(&Wire1))
-                        log_d("Could not find a valid AHT20 sensor, check wiring, address, sensor ID!");
-                }
-                i2c1_unlock();
-            }
-            break;
-            #endif
-        case PORT_MCP342x_I2C0:
-            if (config.i2c_enable && i2c0_lock())
-            {
-                if (mcp342x == NULL) {
-                    mcp342x = new MCP342x(0x68); // 0x68=104,0x69=105
-                    MCP342x::generalCallReset();
-                    delay(1); // MC342x needs 300us to settle, wait 1ms
-                    Wire.requestFrom(0x68, (uint8_t)1);
-                    if (!Wire.available())
-                        log_d("Could not find a valid MCP342x sensor, check wiring, address 0x68, sensor ID!");
-                }
-                i2c0_unlock();
-            }
-            break;
-        case PORT_ADS1115_I2C0:
-            if (config.i2c_enable && i2c0_lock())
-            {
-                if (ads == NULL) {
-                    ads = new Adafruit_ADS1115();
-                    ads->begin(72, &Wire); // 0x48=72,0x49=73,0x4A=74,0x4B=75
-                    ads->setGain(GAIN_TWO);
-                }
-                i2c0_unlock();
-            }
-            break;
-         #if SOC_I2C_NUM > 1
-         case PORT_ADS1115_I2C1:
-            if (config.i2c1_enable && i2c1_lock())
-            {
-                if (ads == NULL) {
-                    ads = new Adafruit_ADS1115();
-                    ads->begin(0x72, &Wire1); // 0x48=72,0x49=73,0x4A=74,0x4B=75
-                    ads->setGain(GAIN_ONE);
-                }
-                i2c1_unlock();
-            }
-            break;
-         #endif
-        //     #if SOC_I2C_NUM > 1
-        // case PORT_MCP342x_I2C1:
-        //     if (config.i2c1_enable)
-        //     {
-        //         mcp342x = new MCP342x(0x68); // 0x68=104,0x69=105
-        //           // Reset devices
-        //         MCP342x::generalCallReset();
-        //         delay(1); // MC342x needs 300us to settle, wait 1ms
-        //         // Check device present
-        //         Wire1.requestFrom(0x68, (uint8_t)1);
-        //         if (!Wire1.available()) {
-        //         {
-        //             log_d("Could not find a valid MCP342x sensor, check wiring, address 0x68, sensor ID!");
-        //         }
-        //     }
-        //     else
-        //     {
-        //         log_d("Not enable I2C1 port");
-        //     }
-        //     break;
-        //     #endif
         case PORT_DS1820:
             // if(oneWire!=NULL)
             // {
@@ -1720,17 +1428,23 @@ void taskSensor(void *pvParameters)
 
     if (config.i2c_enable)
     {
-        if (i2c0_lock()) {
-            Wire.begin(config.i2c_sda_pin, config.i2c_sck_pin, config.i2c_freq);
-            i2c0_unlock();
+        int i2c_timeout = 0;
+        while (i2c_busy)
+        {
+            delay(10);
+            if (++i2c_timeout > 50)
+                break;
         }
+        i2c_busy = true;
+        Wire.begin(config.i2c_sda_pin, config.i2c_sck_pin, config.i2c_freq);
+        // ccs = new Adafruit_CCS811();
+        // ccs->begin(90, &Wire); // 0x5A=90
+        i2c_busy = false;
     }
-    #if SOC_I2C_NUM > 1
     if (config.i2c1_enable)
     {
         Wire1.begin(config.i2c1_sda_pin, config.i2c1_sck_pin, config.i2c1_freq);
     }
-    #endif
 
     if(config.onewire_enable)
     {
@@ -1754,7 +1468,7 @@ void taskSensor(void *pvParameters)
             if (config.sensor[i].enable)
             {
                 if (tick > sen[i].timeTick)
-                {   
+                {
                     if(getSensor(i)){
                         sen[i].timeTick = millis() + ((unsigned long)config.sensor[i].samplerate * 1000);
                     }else{
@@ -1771,4 +1485,42 @@ void taskSensor(void *pvParameters)
             dispSensor();
         }
     }
+}
+
+// Critical memory leak fix: cleanup dynamically allocated sensor objects
+void cleanupSensors()
+{
+    log_d("Cleaning up sensor objects to free memory");
+
+    if (bme != NULL) {
+        delete bme;
+        bme = NULL;
+        log_d("BME280 sensor object deleted");
+    }
+
+    if (bmp280 != NULL) {
+        delete bmp280;
+        bmp280 = NULL;
+        log_d("BMP280 sensor object deleted");
+    }
+
+    if (Si7021 != NULL) {
+        delete Si7021;
+        Si7021 = NULL;
+        log_d("Si7021 sensor object deleted");
+    }
+
+    if (ccs != NULL) {
+        delete ccs;
+        ccs = NULL;
+        log_d("CCS811 sensor object deleted");
+    }
+
+    if (sht != NULL) {
+        delete sht;
+        sht = NULL;
+        log_d("SHT sensor object deleted");
+    }
+
+    log_d("Sensor cleanup completed - freed memory");
 }

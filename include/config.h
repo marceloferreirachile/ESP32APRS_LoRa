@@ -15,18 +15,18 @@
 #include "sensor.h"
 
 #define COMMENT_SIZE 25
-#define STATUS_SIZE 50
+#define STATUS_SIZE 68 // increased from 50 to allow the widely-used 67-char safe limit for APRS status/bulletin text (avoids silent truncation) - Sep/2026
 
 #define WX_SENSOR_NUM 26
 
 #define ACTIVATE_OFF 0				// Packet is disable all packet
-#define ACTIVATE_TRACKER (1 << 0)	// packet is an object
+#define ACTIVATE_TRACKER (1 << 0)		// packet is an object
 #define ACTIVATE_IGATE (1 << 1)		// packet is an item
 #define ACTIVATE_DIGI (1 << 2)		// packet is a message
-#define ACTIVATE_WX (1 << 3)		// packet is WX data
-#define ACTIVATE_TELEMETRY (1 << 4) // packet is telemetry
+#define ACTIVATE_WX (1 << 3)			// packet is WX data
+#define ACTIVATE_TELEMETRY (1 << 4)	// packet is telemetry
 #define ACTIVATE_QUERY (1 << 5)		// packet is a query
-#define ACTIVATE_STATUS (1 << 6)	// packet is status
+#define ACTIVATE_STATUS (1 << 6)		// packet is status
 #define ACTIVATE_WIFI (1 << 7)		// packet is wifi
 
 
@@ -38,35 +38,32 @@
 
 // #include "HardwareSerial.h"
 // #include "EEPROM.h"
-#define RF_SX1231 1
-#define RF_SX1233 2
-#define RF_SX1261 3
-#define RF_SX1262 4
-#define RF_SX1268 5
-#define RF_SX1272 6
-#define RF_SX1273 7
-#define RF_SX1276 8
-#define RF_SX1278 9
-#define RF_SX1279 10
-#define RF_SX1280 11
-#define RF_SX1281 12
-#define RF_SX1282 13
+#define RF_SX1231	1
+#define RF_SX1233	2
+#define RF_SX1261	3
+#define RF_SX1262	4
+#define RF_SX1268	5
+#define RF_SX1272	6
+#define RF_SX1273	7
+#define RF_SX1276	8
+#define RF_SX1278	9
+#define RF_SX1279	10
+#define RF_SX1280	11
+#define RF_SX1281	12
+#define RF_SX1282	13
 
-#define RF_SX123x 21
-#define RF_SX126x 22
-#define RF_SX127x 23
-#define RF_SX128x 24
+#define RF_SX123x	21
+#define RF_SX126x	22
+#define RF_SX127x	23
+#define RF_SX128x	24
 
-#define RF_MODE_OFF 0
-#define RF_MODE_LoRa 1
-#define RF_MODE_G3RUH 2
-#define RF_MODE_AIS 3
-#define RF_MODE_GFSK 4
-#define RF_MODE_DPRS 5
+#define RF_MODE_OFF		0
+#define RF_MODE_LoRa 	1
+#define RF_MODE_G3RUH 	2
+#define RF_MODE_AIS 	3
+#define RF_MODE_GFSK	4
+#define RF_MODE_DPRS	5
 
-#define MODE_A 0
-#define MODE_B 1
-#define MODE_C 2
 
 typedef struct wifi_struct
 {
@@ -80,6 +77,8 @@ typedef struct Config_Struct
 	float timeZone;
 	bool synctime;
 	bool title;
+
+	uint8_t cpuFreq;
 
 	// WiFi/BT/RF
 	uint8_t wifi_mode; // WIFI_AP,WIFI_STA,WIFI_AP_STA,WIFI_OFF
@@ -95,59 +94,32 @@ typedef struct Config_Struct
 	char wifi_ap_ssid[32];
 	char wifi_ap_pass[63];
 
-#ifdef BLUETOOTH
-	//--Blue Tooth
-	bool bt_slave;
-	bool bt_master;
-	uint8_t bt_mode;
-	char bt_name[20];
-	uint32_t bt_pin;
-	uint8_t bt_power;
-#if !defined(CONFIG_IDF_TARGET_ESP32)
-	char bt_uuid[37];
-	char bt_uuid_rx[37];
-	char bt_uuid_tx[37];
-#endif
-#endif
+		//--Blue Tooth
+		bool bt_slave;
+		bool bt_master;
+		uint8_t bt_mode;
+		char bt_uuid[37];
+		char bt_uuid_rx[37];
+		char bt_uuid_tx[37];
+		char bt_name[20];
+		uint32_t bt_pin;
+		uint8_t bt_power;
 
 	//--RF Module
 	bool rf_en;
 	uint8_t rf_type;
-	uint8_t rf_mode;
-	float rf_freq;
-	int16_t rf_freq_offset; //+-30,000Hz
-	float rf_bw;			// Band Width for LoRa/GFSK
-	float rf_br;			// Baud Rate for GFSK
-	uint8_t rf_sf;
-	uint8_t rf_cr;
-	uint8_t rf_sync;
-	int8_t rf_power;
-	uint8_t rf_preamable;
-	uint8_t rf_lna;
-	bool rf_ax25;
-	uint8_t rf_shaping;
-	uint8_t rf_encoding;
-	bool rf_rx_boost;
-
-#ifdef RF2
-	bool rf1_en;
-	uint8_t rf1_type;
-	uint8_t rf1_mode;
-	float rf1_freq;
-	int16_t rf1_freq_offset; //+-30,000Hz
-	float rf1_bw;			 // Band Width for LoRa/GFSK
-	float rf1_br;			 // Baud Rate for GFSK
-	uint8_t rf1_sf;
-	uint8_t rf1_cr;
-	uint8_t rf1_sync;
-	int8_t rf1_power;
-	uint8_t rf1_preamable;
-	uint8_t rf1_lna;
-	bool rf1_ax25;
-	uint8_t rf1_shaping;
-	uint8_t rf1_encoding;
-	bool rf1_rx_boost;
-#endif
+	float freq_rx;
+	float freq_tx;
+	int offset_rx;
+	int offset_tx;
+	int tone_rx;
+	int tone_tx;
+	uint8_t band;
+	uint8_t sql_level;
+	bool rf_power;
+	uint8_t volume;
+	uint8_t mic;
+	
 
 	// IGATE
 	bool igate_en;
@@ -158,13 +130,13 @@ typedef struct Config_Struct
 	uint16_t rf2inetFilter;
 	uint16_t inet2rfFilter;
 	//--APRS-IS
-	uint8_t igate_ssid;
+	uint8_t aprs_ssid;
 	uint16_t aprs_port;
-	char igate_mycall[10];
-	char igate_host[20];
-	//char igate_passcode[6];
-	char igate_moniCall[10];
-	char igate_filter[30];
+	char aprs_mycall[10];
+	char aprs_host[20];
+	char aprs_passcode[6];
+	char aprs_moniCall[10];
+	char aprs_filter[30];
 	//--Position
 	bool igate_bcn;
 	bool igate_gps;
@@ -195,8 +167,8 @@ typedef struct Config_Struct
 	uint16_t digiFilter;
 	//--Position
 	bool digi_bcn;
-	// bool digi_compress = false;
-	// bool digi_altitude = false;
+	//bool digi_compress = false;
+	//bool digi_altitude = false;
 	bool digi_gps;
 	float digi_lat;
 	float digi_lon;
@@ -208,7 +180,7 @@ typedef struct Config_Struct
 	uint16_t digi_sts_interval;
 	char digi_status[STATUS_SIZE];
 
-	// TRACKER
+// TRACKER
 	bool trk_en;
 	bool trk_loc2rf;
 	bool trk_loc2inet;
@@ -227,8 +199,6 @@ typedef struct Config_Struct
 	bool trk_altitude = false;
 	bool trk_log = false;
 	bool trk_rssi = false;
-	bool trk_snr = false;
-	bool trk_freqerr = false;
 	bool trk_sat = false;
 	bool trk_dx = false;
 	uint16_t trk_hspeed = 120;
@@ -259,8 +229,8 @@ typedef struct Config_Struct
 	float wx_lon;
 	float wx_alt;
 	uint16_t wx_interval;
-	// int8_t wx_channel = 0;
-	// uint8_t wx_type[32]; //Sensor number 32
+	//int8_t wx_channel = 0;
+	//uint8_t wx_type[32]; //Sensor number 32
 	uint32_t wx_flage;
 	char wx_object[10];
 	char wx_comment[COMMENT_SIZE];
@@ -277,25 +247,25 @@ typedef struct Config_Struct
 	char tlm0_PARM[13][10];
 	char tlm0_UNIT[13][8];
 	float tlm0_EQNS[5][3];
-	uint8_t tlm0_BITS_Active;
+	uint8_t tlm0_BITS_Active;	
 	char tlm0_comment[COMMENT_SIZE];
 	uint8_t tml0_data_channel[13];
 
 	// Telemetry 1
-	// bool tlm1_en;
-	// bool tlm1_2rf;
-	// bool tlm1_2inet;
-	// uint8_t tlm1_ssid;
-	// char tlm1_mycall[10];
-	// uint8_t tlm1_path;
-	// uint16_t tlm1_data_interval;
-	// uint16_t tlm1_info_interval;
-	// char tlm1_PARM[13][10];
-	// char tlm1_UNIT[13][8];
-	// float tlm1_EQNS[5][3];
-	// uint8_t tlm1_BITS_Active;
-	// char tlm1_comment[COMMENT_SIZE];
-	// uint8_t tml1_data_channel[13];
+	bool tlm1_en;
+	bool tlm1_2rf;
+	bool tlm1_2inet;
+	uint8_t tlm1_ssid;
+	char tlm1_mycall[10];
+	uint8_t tlm1_path;
+	uint16_t tlm1_data_interval;
+	uint16_t tlm1_info_interval;
+	char tlm1_PARM[13][10];
+	char tlm1_UNIT[13][8];
+	float tlm1_EQNS[5][3];
+	uint8_t tlm1_BITS_Active;	
+	char tlm1_comment[COMMENT_SIZE];
+	uint8_t tml1_data_channel[13];
 
 	// OLED DISPLAY
 	bool oled_enable;
@@ -315,11 +285,17 @@ typedef struct Config_Struct
 	bool dispINET;
 
 	// AFSK,TNC
-	// bool audio_hpf;
-	// bool audio_bpf;
-	// uint8_t preamble;
-	// uint8_t modem_type;
+	bool audio_hpf;
+	bool audio_lpf;
+	uint8_t preamble;
+	uint8_t modem_type;
+	uint8_t fx25_mode;
 	uint16_t tx_timeslot;
+
+	// TX audio calibration (v2.1.3.1-audiotest)
+	uint8_t tx_audio_gain = 100;		// TX audio level, 0-100%. 100 = legacy fixed gain (exact same output as before this feature existed)
+	bool tx_preemphasis = false;		// TX pre-emphasis tilt, for radios whose mic input applies de-emphasis (not needed on "flat"/discriminator inputs)
+	uint8_t tx_preemphasis_tilt = 20;	// How much to attenuate the mark(1200Hz)/low tone relative to space(2200Hz)/high tone, in %, when tx_preemphasis is enabled
 	char ntp_host[20];
 
 	// VPN wiregurad
@@ -341,54 +317,40 @@ typedef struct Config_Struct
 	// GNSS
 	bool gnss_enable;
 	int8_t gnss_pps_gpio = -1;
-	int8_t gnss_channel = 0;
+	int8_t gnss_channel = 0;	
 	uint16_t gnss_tcp_port;
 	char gnss_tcp_host[20];
 	char gnss_at_command[30];
 
-	int8_t rf_tx_gpio = -1; // LORA ANTENNA TX ENABLE
-	int8_t rf_rx_gpio = -1;
-	int8_t rf_dio1_gpio = 3;
-	int8_t rf_reset_gpio = 5;
-	int8_t rf_dio0_gpio = 4;
-	int8_t rf_dio2_gpio = -1;
-	int8_t rf_nss_gpio = 8;
-	int8_t rf_sclk_gpio = 10;
-	int8_t rf_miso_gpio = 6;
-	int8_t rf_mosi_gpio = 7;
-	bool rf_tx_active = 1;
-	bool rf_rx_active = 1;
-	bool rf_reset_active = 0;
-	bool rf_nss_active = 0;
+	// RF Module GPIO
+	unsigned long rf_baudrate;
+	int8_t rf_tx_gpio = 13;
+	int8_t rf_rx_gpio = 14;
+	int8_t rf_sql_gpio = 33;
+	int8_t rf_pd_gpio = 27;
+	int8_t rf_pwr_gpio = 12;
+	int8_t rf_ptt_gpio = 32;
+	bool rf_sql_active = 0;
+	bool rf_pd_active = 1;
+	bool rf_pwr_active = 0;
+	bool rf_ptt_active = 0;
+	int8_t adc_gpio = 1;
+	int8_t dac_gpio = 18;
+	int8_t adc_sel_gpio = -1;
+	int8_t dac_sel_gpio = 17;
+	uint8_t adc_atten = 0;
+	uint16_t adc_dc_offset;
 
-#ifdef RF2
-	int8_t rf1_tx_gpio = -1; // LORA ANTENNA TX ENABLE
-	int8_t rf1_rx_gpio = -1;
-	int8_t rf1_dio1_gpio = 3;
-	int8_t rf1_reset_gpio = 5;
-	int8_t rf1_dio0_gpio = 4;
-	int8_t rf1_dio2_gpio = -1;
-	int8_t rf1_nss_gpio = 8;
-	int8_t rf1_sclk_gpio = 10;
-	int8_t rf1_miso_gpio = 6;
-	int8_t rf1_mosi_gpio = 7;
-	bool rf1_tx_active = 1;
-	bool rf1_rx_active = 1;
-	bool rf1_reset_active = 0;
-	bool rf1_nss_active = 0;
-#endif
 
 	bool i2c_enable;
 	int8_t i2c_sda_pin = -1;
 	int8_t i2c_sck_pin = -1;
 	int8_t i2c_rst_pin = -1;
 	uint32_t i2c_freq = 400000;
-	// #if SOC_I2C_NUM > 1
 	bool i2c1_enable;
 	int8_t i2c1_sda_pin = -1;
 	int8_t i2c1_sck_pin = -1;
 	uint32_t i2c1_freq = 100000;
-	// #endif
 
 	bool onewire_enable = false;
 	int8_t onewire_gpio = -1;
@@ -429,21 +391,25 @@ typedef struct Config_Struct
 	int8_t ext_tnc_channel = 0;
 	int8_t ext_tnc_mode = 0;
 
-	// Sleep mode
-	bool pwr_en;
-	uint8_t pwr_mode;
-	uint16_t pwr_sleep_interval; // sec
-	uint16_t pwr_stanby_delay;	 // sec
-	uint8_t pwr_sleep_activate;
-	int8_t pwr_gpio = -1;
-	bool pwr_active = 1;
+	// TCP KISS Server - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+	bool tcp_kiss_enable = false;
+	uint16_t tcp_kiss_port1 = 8001;
+	uint16_t tcp_kiss_port2 = 8002;
+
+	// Sleep mode - most fields removed (Set/2026, LU6JMF): the "Power Save
+	// Mode" UI toggle never actually did anything - nothing in the firmware
+	// read pwr_en/pwr_mode/pwr_sleep_interval/pwr_sleep_activate/pwr_gpio/
+	// pwr_active to put the device to sleep, so those were cut to save space.
+	// pwr_stanby_delay is kept - it's genuinely used everywhere (StandByTick,
+	// OLED display timeout), unrelated to the dead sleep feature.
+	uint16_t pwr_stanby_delay = 30; //sec
 	bool disp_flip;
 	uint8_t disp_brightness;
 
-	uint16_t log = 0;
+	uint16_t log=0;
 
 	SensorInfo sensor[SENSOR_NUMBER];
-
+	
 	bool trk_tlm_avg[5];
 	uint8_t trk_tlm_sensor[5];
 	uint8_t trk_tlm_precision[5];
@@ -472,7 +438,6 @@ typedef struct Config_Struct
 	bool wx_sensor_avg[WX_SENSOR_NUM];
 	uint8_t wx_sensor_ch[WX_SENSOR_NUM];
 
-	#ifdef PPPOS
 	bool ppp_enable = false;
 	char ppp_apn[32];
 	char ppp_pin[8];
@@ -493,7 +458,6 @@ typedef struct Config_Struct
 	uint8_t ppp_flow_ctrl = 0;
 	bool ppp_gnss = false;
 	bool ppp_napt = true;
-	#endif
 
 	// MQTT Config
 #ifdef MQTT	
@@ -513,7 +477,7 @@ typedef struct Config_Struct
 	uint8_t digi_tlm_interval;
 	uint8_t igate_tlm_interval;
 	uint8_t wx_tlm_interval;
-	char host_name[32];
+	char host_name[32];	
 	uint16_t reset_timeout; // minute
 	bool at_cmd_mqtt;
 	bool at_cmd_msg;
@@ -530,6 +494,31 @@ typedef struct Config_Struct
 	char msg_key[33];
 	uint8_t msg_retry;
 	uint16_t msg_interval;
+
+	// Bulletins BLN1-BLN9 - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+	bool bln_en[9];
+	char bln_text[9][STATUS_SIZE];
+	uint16_t bln_interval[9]; // LU6JMF - Marcelo Ferreira: interval stored in minutes (Set/2026 - was seconds before)
+	uint16_t bln_limit[9]; // 0 = unlimited, send forever until disabled
+
+	// LU6JMF - Marcelo Ferreira:
+	// Common BLN1-BLN9 campaign controls (replaces the old bln_activefor
+	// deadline scheme). Both normal BLN and NEWS share the same resources.
+	uint8_t bln_duration[9];     // Active calendar lifetime: 24, 36, 48 or 72 hours
+	uint32_t bln_started_at[9];  // Unix epoch; 0 = no active/dated campaign
+	uint16_t bln_sent_total[9];  // Real transmissions in the current campaign
+	// --- v2.1-lu6jmf: Objects (Object1-Object4), MSG tab, below BLN ---
+	bool obj_en[4];
+	char obj_name[4][10]; // Item/Obj Name, 3-9 chars (same field/validation as igate_object)
+	double obj_lat[4];
+	double obj_lon[4];
+	char obj_symbol[4][3]; // table+symbol, same layout as igate_symbol
+	char obj_text[4][STATUS_SIZE];
+	uint8_t obj_mode[4]; // 0 = Fixed interval, 1 = Active-for duration
+	uint16_t obj_interval[4]; // seconds, Fixed mode: 900/1800/3600
+	uint16_t obj_limit[4]; // max sends, Fixed mode. 0 = unlimited
+	uint8_t obj_activefor[4]; // hours, Active-for-duration mode: 24/36/48/72
+	bool obj_permanent[4]; // Permanent/Never disable - ignores Interval AND the 72h cap entirely
 
 } Configuration;
 

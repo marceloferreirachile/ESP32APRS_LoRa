@@ -106,8 +106,6 @@ String ParseAPRS::deg2lon(double deg)
 	uint id = (uint)floor(deg);
 	uint im = (uint)((deg - (double)id) * 60);
 	uint imm = (uint)round((((deg - (double)id) * 60) - (double)im) * 100);
-	if (imm >= 100) { imm = 0; im++; }
-	if (im >= 60)   { im = 0;  id++; }
 	char dmm[10];
 	sprintf(dmm, "%03d%02d.%02d%c", id, im, imm, sign);
 	return String(dmm);
@@ -129,8 +127,6 @@ String ParseAPRS::deg2lat(double deg)
 	uint id = (uint)floor(deg);
 	uint im = (uint)((deg - (double)id) * 60);
 	uint imm = (uint)round((((deg - (double)id) * 60) - (double)im) * 100);
-	if (imm >= 100) { imm = 0; im++; }
-	if (im >= 60)   { im = 0;  id++; }
 	char dmm[10];
 	sprintf(dmm, "%02d%02d.%02d%c", id, im, imm, sign);
 	return String(dmm);
@@ -926,23 +922,20 @@ int ParseAPRS::parse_aprs_mice(struct pbuf_t *pb, const unsigned char *body, con
 			return 0;
 		}
 
-	log_d("\tpassed dstcall format check");
+	//log_d("\tpassed dstcall format check");
 
 	/* validate information field (longitude, course, speed and
 	 * symbol table and code are checked). Not bullet proof..
 	 *
 	 *   0          1          23            4          5          6              7
-	 * /^[\x26-\xcf][\x26-\x93][\x1c-\x7f]{2}[\x1c-\x7d][\x1c-\x7f][\x21-\x7b\x7d][\/\\A-Z0-9]/
-	 *
-	 * body[0] upper bound extended to 0xcf: longitude degrees 100-179 encode as d+28=128-207 (0x80-0xcf)
-	 * body[1] upper bound extended to 0x93: minutes with +60 bias encode up to 59+28+60=147 (0x93)
+	 * /^[\x26-\x7f][\x26-\x61][\x1c-\x7f]{2}[\x1c-\x7d][\x1c-\x7f][\x21-\x7b\x7d][\/\\A-Z0-9]/
 	 */
-	if (body[0] < 0x26 || body[0] > 0xcf)
+	if (body[0] < 0x26 || body[0] > 0x7f)
 	{
 		log_d("..bad infofield column 1");
 		return 0;
 	}
-	if (body[1] < 0x26 || body[1] > 0x93)
+	if (body[1] < 0x26 || body[1] > 0x61)
 	{
 		log_d("..bad infofield column 2");
 		return 0;
@@ -978,7 +971,7 @@ int ParseAPRS::parse_aprs_mice(struct pbuf_t *pb, const unsigned char *body, con
 		return 0;
 	}
 
-	log_d("\tpassed info format check");
+	//log_d("\tpassed info format check");
 
 	/* make a local copy, we're going to modify it */
 	strncpy(dstcall, d_start, 6);
@@ -1665,7 +1658,7 @@ int ParseAPRS::parse_aprs(struct pbuf_t *pb)
 			int len = (int)(body_end - body - 9);
 			if (len > 0)
 				parse_aprs_comment(pb, body + 9, (unsigned int)len);
-			log_d("MICE\n");
+			//log_d("MICE\n");
 			return rc;
 		}
 		return 0; // bad
@@ -1731,7 +1724,7 @@ int ParseAPRS::parse_aprs(struct pbuf_t *pb)
 			// Is it OK to declare it as position packet ?
 			rc = parse_aprs_nmea(pb, body, body_end);
 			parse_aprs_comment(pb, body + 10, (unsigned int)(body_end - body - 10));
-			log_d("\n");
+			//log_d("\n");
 			return rc;
 		}
 		return 0;

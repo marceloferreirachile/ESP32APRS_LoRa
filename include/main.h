@@ -11,26 +11,56 @@
 #ifndef MAIN_H
 #define MAIN_H
 
-// #define VERSION "0.8"
-// #define VERSION_BUILD 'f'
+//#define VERSION "1.7"
+//#define VERSION_BUILD 'e'
 
 #include <Arduino.h>
-// #include "ModbusMaster.h"
-// #include <SD.h>
-// #include <FS.h>
-// #include <SPIFFS.h>
-
 #include <AX25.h>
 #include "weather.h"
-// #include "EEPROM.h"
-
-#include "HardwareSerial.h"
 
 #include "config.h"
-// #if defined(TTGO_T_Beam_S3_SUPREME_V3)  || defined(HELTEC_V3_GPS) || defined(HELTEC_HTIT_TRACKER) || defined(APRS_LORA_HT) || defined(APRS_LORA_DONGLE) || defined(HT_CT62)|| defined(NAWS4)
+// #if defined(TTGO_T_Beam_S3_SUPREME_V3)  || defined(HELTEC_V3_GPS) || defined(HELTEC_HTIT_TRACKER) || defined(APRS_LORA_HT) || defined(APRS_LORA_DONGLE)
 // #else
 // #include "soc/rtc_wdt.h"
 // #endif
+
+//-------ESP32---------
+#if defined(CONFIG_IDF_TARGET_ESP32)
+#define ESP32
+#define USE_TDM
+#define USE_PDM
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+#define ESP32C3
+#define ESP32X
+#define USE_INT24_FROM_INT
+#define USE_TDM
+#define USE_PDM
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+#  define ESP32S2
+#  define ESP32X
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#  define ESP32S3
+#  define ESP32X
+#  define USE_TDM
+#  define USE_PDM
+#  define USE_PDM_RX
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+#  define ESP32C6
+#  define ESP32X
+#  define USE_TDM
+#  define USE_PDM
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#  define ESP32P4
+#  define ESP32X
+#  define USE_TDM
+#  define USE_PDM
+#  define USE_PDM_RX
+#endif
 
 #define WX
 
@@ -81,33 +111,39 @@
 #define FILTER_ENABLE_ALL (1 << 15)			// Packet is enable all packet
 
 #define RF_NONE 0
+#define RF_SA868_VHF 1 // G-NiceRF SA818,SA868 VHF band 134~174 MHz
+#define RF_SA868_UHF 2 // G-NiceRF SA818,SA868 UHF band 400~470 MHz
+#define RF_SA868_350 3 // G-NiceRF SA818,SA868 350 band frequency：320-400MHz
+#define RF_SR_1WV 4	   // SUNRISE SR110V,FRS-1WV VHF band 136~174 MHz
+#define RF_SR_1WU 5	   // SUNRISE SR110U,FRS-1WU UHF band 400~470 MHz
+#define RF_SR_1W350 6  // SUNRISE SR350P 350 band frequency：350-390MHz
+#define RF_SR_2WVS 7   // SUNRISE SR120V,SR_2WVS VHF band 136~174 MHz
+#define RF_SR_2WUS 8   // SUNRISE SR120U,SR_2WUS UHF band 400~470 MHz
 
-#ifdef MQTT
-#define MQTT_TOPIC_NONE 0
-#define MQTT_TOPIC_TNC (1 << 0)
-#define MQTT_TOPIC_WX (1 << 1)
-#define MQTT_TOPIC_SENSOR (1 << 2)
-#define MQTT_TOPIC_TELEMETRY (1 << 3)
-#define MQTT_TOPIC_STATUS (1 << 4)
-#define MQTT_TOPIC_IGATE (1 << 5)
-#define MQTT_TOPIC_DIGI (1 << 6)
-#define MQTT_TOPIC_TRACKER (1 << 7)
-#define MQTT_TOPIC_MESSAGE (1 << 8)
-#define MQTT_TOPIC_ALL 0xFFFF
-
-#define MQTT_SUBSCRIBE_NONE 0
-#define MQTT_SUBSCRIBE_CMD (1 << 0)
-#define MQTT_SUBSCRIBE_TNC (1 << 1)
-#define MQTT_SUBSCRIBE_MESSAGE (1 << 2)
-#define MQTT_SUBSCRIBE_ALL 0xFFFF
-#endif
-
-#define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */
+#define uS_TO_S_FACTOR 1000000  /* Conversion factor for micro seconds to seconds */
 
 #define TXCH_TCP 0
 #define TXCH_RF 1
 #define TXCH_DIGI 2
 #define TXCH_3PTY 3
+
+#define RF_CHANNEL	(1<<0)
+#define INET_CHANNEL	(1<<1)
+#define TNC_CHANNEL	(1<<2)
+
+#ifdef TTGO_TWR
+#define MIC_CTRL_PIN (17)
+
+#define BUTTON_PTT_PIN (3)
+#define BUTTON_DOWN_PIN (0)
+#define ENCODER_A_PIN (47)
+#define ENCODER_B_PIN (46)
+#define ENCODER_OK_PIN (21)
+#else
+#define ENCODER_A_PIN (-1)
+#define ENCODER_B_PIN (-1)
+#define ENCODER_OK_PIN (-1)
+#endif
 
 #if defined(HELTEC_HTIT_TRACKER)
 #define ST7735_LED_K_Pin 21
@@ -181,45 +217,28 @@
 // alias for unused altitude in Mic-E
 #define RADIOLIB_APRS_MIC_E_ALTITUDE_UNUSED -1000000
 
-/*!
-  \brief Transmit position using Mic-E encoding.
-  \param lat Geographical latitude, positive for north, negative for south.
-  \param lon Geographical longitude, positive for east, negative for west.
-  \param heading Heading in degrees.
-  \param speed Speed in knots.
-  \param type Mic-E message type - see \ref mic_e_message_types.
-  \param telem Pointer to telemetry array (either 2 or 5 bytes long). NULL when telemetry is not used.
-  \param telemLen Telemetry length, 2 or 5. 0 when telemetry is not used.
-  \param grid Maidenhead grid locator. NULL when not used.
-  \param status Status message to send. NULL when not used.
-  \param alt Altitude to send. RADIOLIB_APRS_MIC_E_ALTITUDE_UNUSED when not used.
-*/
-int16_t sendMicE(float lat, float lon, uint16_t heading, uint16_t speed, uint8_t type, uint8_t *telem = NULL, size_t telemLen = 0, char *grid = NULL, char *status = NULL, int32_t alt = RADIOLIB_APRS_MIC_E_ALTITUDE_UNUSED);
-
 #ifdef __cplusplus
-extern "C"
-{
+extern "C" {
 #endif
 
 #if defined(MBEDTLS_MD5_ALT)
 #include "md/esp_md.h"
 
-#define mbedtls_md5_init esp_md5_init
-#define mbedtls_md5_update_ret esp_md5_update
-#define mbedtls_md5_finish_ret esp_md5_finish
-#define mbedtls_md5_starts_ret esp_md5_starts
+#define mbedtls_md5_init                        esp_md5_init
+#define mbedtls_md5_update_ret                      esp_md5_update
+#define mbedtls_md5_finish_ret                      esp_md5_finish
+#define mbedtls_md5_starts_ret                      esp_md5_starts
 
-#define mbedtls_md5_free esp_md5_free
-#define mbedtls_md5_clone esp_md5_clone
-#define mbedtls_internal_md5_process esp_md5_process
+#define mbedtls_md5_free                        esp_md5_free
+#define mbedtls_md5_clone                       esp_md5_clone
+#define mbedtls_internal_md5_process            esp_md5_process
 
 #endif /* MBEDTLS_MD5_ALT */
-
 #ifdef __cplusplus
 }
 #endif
 
-#define ets_printf log_d
+#define ets_printf	log_d 
 
 typedef struct igateTLM_struct
 {
@@ -249,7 +268,8 @@ typedef struct
 	float freqErr;
 	char *raw;
 	size_t length;
-	// char raw[256];
+	size_t currentLength;
+	//char raw[256];
 } pkgListType;
 
 typedef struct statisticStruct
@@ -266,6 +286,7 @@ typedef struct statisticStruct
 	uint32_t inet2rf;
 	uint32_t txCount;
 	uint32_t rxCount;
+	uint32_t dupCount;
 } statusType;
 
 typedef struct digiTLM_struct
@@ -306,19 +327,57 @@ typedef struct Telemetry_struct
 	bool EQNS_FLAG;
 } TelemetryType;
 
+// -----------------------------------------------------------------------------
+// LU6JMF - Marcelo Ferreira
+// RF job metadata used by the central TX Scheduler.
+// Type identifies the producer; Priority controls future RF arbitration.
+// Ported from the TX-SCHEDULER-TEST project onto the v2.1.3.1 base.
+// -----------------------------------------------------------------------------
+enum Lu6jmfTxJobType : uint8_t
+{
+    LU6JMF_TXJOB_GENERIC = 0,
+    LU6JMF_TXJOB_ACK,
+    LU6JMF_TXJOB_MESSAGE,
+    LU6JMF_TXJOB_MSG_RETRY,
+    LU6JMF_TXJOB_DIGI,
+    LU6JMF_TXJOB_TRACKER,
+    LU6JMF_TXJOB_IGATE,
+    LU6JMF_TXJOB_DIGI_POSITION,
+    LU6JMF_TXJOB_WX,
+    LU6JMF_TXJOB_TLM,
+    LU6JMF_TXJOB_BULLETIN,
+    LU6JMF_TXJOB_NEWS,
+    LU6JMF_TXJOB_OBJECT,
+    LU6JMF_TXJOB_INET2RF,
+    LU6JMF_TXJOB_EXTERNAL
+};
+
+enum Lu6jmfTxPriority : uint8_t
+{
+    // LU6JMF - Marcelo Ferreira: bottom tier for noisy/low-value periodic
+    // traffic (e.g. TLM) that should wait behind everything else, including
+    // plain LOW. Never preempts anything; only CRITICAL may preempt it.
+    LU6JMF_TXPRIO_VERY_LOW = 0,
+    LU6JMF_TXPRIO_LOW,
+    LU6JMF_TXPRIO_NORMAL,
+    LU6JMF_TXPRIO_HIGH,
+    LU6JMF_TXPRIO_CRITICAL
+};
+
 typedef struct txQueue_struct
 {
 	bool Active;
 	uint8_t Channel;
+
+    // LU6JMF - Marcelo Ferreira: scheduler metadata.
+    uint8_t JobType;
+    uint8_t Priority;
+
 	long timeStamp;
 	int Delay;
 	size_t length;
-	char Info[300];
+	char Info[350];
 } txQueueType;
-
-#define RF_CHANNEL (1 << 0)
-#define INET_CHANNEL (1 << 1)
-#define TNC_CHANNEL (1 << 2)
 
 typedef struct txDispStruct
 {
@@ -329,19 +388,20 @@ typedef struct txDispStruct
 
 typedef struct pppStruct
 {
-	char manufacturer[20];
+	char manufacturer[30];
 	char model[20];
-	char imei[16];
-	char oper[20];
-	char imsi[16];
+	char imei[20];
+	char oper[20];	
+	char imsi[20];
 	uint32_t ip;
 	uint32_t dns;
 	uint32_t gateway;
-	uint32_t netmask;
+	uint32_t netmask;	
 	int rssi;
 } pppType;
 
-#if defined OLED || defined ST7735_160x80
+#ifdef OLED
+#ifndef TTGO_TWR
 const unsigned char LOGO[] PROGMEM =
 	{
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -373,6 +433,7 @@ const unsigned char LOGO[] PROGMEM =
 		0x03, 0x1F, 0x3F, 0x3F, 0x3F, 0x1F, 0x03, 0x03, 0x03, 0x03,
 		0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x1F,
 		0x3F, 0x3F, 0x3F, 0x1F, 0x03, 0x00, 0x00, 0x00};
+#endif		
 #endif
 
 const char PARM[] = {"PARM.RF->INET,INET->RF,DigiRpt,TX2RF,DropRx"};
@@ -381,29 +442,19 @@ const char EQNS[] = {"EQNS.0,1,0,0,1,0,0,1,0,0,1,0,0,1,0"};
 
 const float ctcss[] = {0, 67, 71.9, 74.4, 77, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100, 103.5, 107.2, 110.9, 114.8, 118.8, 123, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9, 186.2, 192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3};
 const float wifiPwr[12][2] = {{-4, -1}, {8, 2}, {20, 5}, {28, 7}, {34, 8.5}, {44, 11}, {52, 13}, {60, 15}, {68, 17}, {74, 18.5}, {76, 19}, {78, 19.5}};
-const char RF_TYPE[14][7] = {"NONE", "SX1231", "SX1233", "SX1261", "SX1262", "SX1268", "SX1272", "SX1273", "SX1276", "SX1278", "SX1279", "SX1280", "SX1281", "SX1282"};
+const char RF_TYPE[9][11] = {"NONE", "SA868_VHF", "SA868_UHF", "SA868_350", "SR110V_VHF", "SR110U_UHF", "SR350P", "SR120V_VHF", "SR120U_UHF"};
 const unsigned long baudrate[] = {2400, 4800, 9600, 19200, 2880, 38400, 57600, 76800, 115200, 230400, 460800, 576000, 921600};
-const char RF_MODE[5][11] = {"NONE", "LoRa", "GFSK_G3RUH", "AIS", "(G)FSK"};
 const char GNSS_PORT[5][6] = {"NONE", "UART0", "UART1", "UART2", "TCP"};
-const char TNC_PORT[5][6] = {"NONE", "UART0", "UART1", "UART2", "USB"};
+const char TNC_PORT[5][6] = {"NONE", "UART0", "UART1","UART2", "USB"};
 const char TNC_MODE[4][6] = {"NONE", "KISS", "TNC2", "YAESU"};
-const char WX_PORT[7][11] = {"NONE", "UART0_CSV", "UART1_CSV", "UART2_CSV", "MODBUS", "SENSOR", "TCP/UDP"};
-const char MODEM_TYPE[2][10] = {"AFSK_300", "AFSK_1200"};
-const char PWR_MODE[3][10] = {"MODE A", "MODE B", "MODE C"};
-const char ACTIVATE[8][10] = {"OFF", "TRACKER", "IGATE", "DIGI", "WX", "TELEMETRY", "QUERY", "STATUS"};
-// const char SENSOR_PORT[12][15] = {"UART0_CSV", "UART1_CSV", "ADC", "I2C_0","I2C_1","CNT_0","CNT_1","MODBUS","M701_Modbus","M702_Modbus","BME280_I2C0","BME280_I2C1"};
-const char WX_SENSOR[26][19] = {"Wind Course", "Wind Speed", "Wind Gust", "Temperature", "Rain 1hr", "Rain 24hr", "Rain Midnight", "Humidity", "Barometric", "Luminosity", "Snow", "Soil Temperature", "Soil Humidity", "Water Temperature", "Water TDS", "Water Level", "PM 2.5", "PM 10", "Co2", "CH2O", "TVOC", "UV", "SOUND", "VBAT", "IBAT", "VSOLAR"};
-const char MIC_E_MSG[8][10] = {"Emergency", "Priority", "Special", "Committed", "Returning", "InService", "En Route", "Off Duty"};
-const float BR1[] = {1.2, 2.4, 4.8, 9.6, 12.5, 19.2, 25, 38.4, 50, 57.6, 76.8, 100, 115.2, 150.0, 153.6, 200, 250, 300};
-const float BW1[] = {2.6, 3.1, 3.9, 5.2, 6.3, 7.8, 10.4, 12.5, 15.6, 20.8, 25, 31.3, 41.7, 50, 62.5, 83.3, 100, 125, 166.7, 200, 250};
-const float BR2[] = {4.8, 5.8, 7.3, 9.7, 11.7, 14.6, 19.5, 23.4, 29.3, 39.0, 46.9, 58.6, 78.2, 93.8, 117.3, 156.2, 187.2, 234.3, 312.0, 373.6, 467.0};
-const float BW2[] = {4.8, 5.8, 7.3, 9.7, 11.7, 14.6, 19.5, 23.4, 29.3, 39.0, 46.9, 58.6, 78.2, 93.8, 117.3, 156.2, 187.2, 232.3, 312.0, 373.6, 467.0};
-const float LORA_BW[] = {7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125, 250, 500};
-const char SHAPING[5][7] = {"NONE", "BT=0.3", "BT=0.5", "BT=0.7", "BT=1.0"};
-const char ENCODING[3][11] = {"NRZ", "MANCHESTER", "WHITENING"};
+const char WX_PORT[7][11] = {"NONE", "UART0_CSV", "UART1_CSV", "UART2_CSV", "MODBUS","SENSOR","TCP/UDP"};
+const char MODEM_TYPE[4][17] = {"AFSK_300", "AFSK_1200","AFSK_1200v23","GFSK9600(G3RUH)"};
+const char FX25_MODE[3][6] = {"NONE","RX","RX+TX"};
+const char WX_SENSOR[26][19]={"Wind Course","Wind Speed","Wind Gust","Temperature","Rain 1hr","Rain 24hr","Rain Midnight","Humidity","Barometric","Luminosity","Snow","Soil Temperature","Soil Humidity","Water Temperature","Water TDS","Water Level","PM 2.5","PM 10","Co2","CH2O","TVOC","UV","SOUND","VBAT","IBAT","VSOLAR"};
+const char MIC_E_MSG[9][10] = {"Emergency", "Priority", "Special", "Committed", "Returning", "InService", "En Route", "Off Duty", "UnUsed"};
 
 uint8_t checkSum(uint8_t *ptr, size_t count);
-// void saveEEPROM();
+//void saveEEPROM();
 void defaultConfig();
 String getValue(String data, char separator, int index);
 boolean isValidNumber(String str);
@@ -418,25 +469,136 @@ void sortPkgDesc(pkgListType a[], int size);
 //int processPacket(String &tnc2);
 int digiProcess(AX25Msg &Packet);
 void printTime();
-//int popTNC2Raw(int &ret);
-// int pushTNC2Raw(int raw);
-// int pkgListUpdate(char *call, char *raw, uint16_t type);
-int pkgList_Find(char *call, char *object, uint16_t type);
+int popTNC2Raw(int &ret);
+int pushTNC2Raw(int raw);
+//int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t audioLvl);
+int pkgList_Find(char *call,char *object, uint16_t type);
 int pkgList_Find(char *call, uint16_t type);
 int pkgList_Find(char *call);
 pkgListType getPkgList(int idx);
-
-// String myBeacon(String Path);
+//String myBeacon(String Path);
 int tlmList_Find(char *call);
 int tlmListOld();
 TelemetryType getTlmList(int idx);
-// void powerSave();
-// void powerWakeup();
-// bool powerStatus();
+//void powerSave();
+//void powerWakeup();
+//bool powerStatus();
 int packet2Raw(String &tnc2, AX25Msg &Packet);
 //bool waitResponse(String &data, String rsp = "\r\n", uint32_t timeout = 1000);
 //String sendIsAckMsg(String toCallSign, char *msgId);
-bool pkgTxPush(const char *info, size_t len, int dly, uint8_t Ch);
+bool pkgTxPush(const char *info, size_t len, int dly,uint8_t Ch);
+
+// LU6JMF - Marcelo Ferreira
+// Extended TX Scheduler entry point. Existing producers may continue using
+// pkgTxPush() and are classified as GENERIC / NORMAL until migrated.
+bool pkgTxPushJob(const char *info,
+                  size_t len,
+                  int dly,
+                  uint8_t Ch,
+                  uint8_t jobType,
+                  uint8_t priority);
+
+// -----------------------------------------------------------------------------
+// LU6JMF - Marcelo Ferreira
+// TX Scheduler diagnostics (ported from TX-SCHEDULER-TEST). Not yet exposed
+// on a web page here - kept available for a future /txdebug port.
+// -----------------------------------------------------------------------------
+struct Lu6jmfTxDebugEvent
+{
+    uint32_t timestamp;
+    uint32_t value;
+    uint8_t code;
+
+    // LU6JMF - Marcelo Ferreira
+    // Producer identity is independent from the event-specific value.
+    uint8_t jobType;
+};
+
+void lu6jmfTxDebugSnapshot(bool *busy,
+                           bool *pttSeen,
+                           bool *txNow,
+                           bool *pttOffPending,
+                           bool *dcdBusy,
+                           uint32_t *completed,
+                           uint32_t *rejected,
+                           uint32_t *lastCycle,
+                           uint32_t *lastWait,
+                           uint32_t *currentCycle,
+                           uint32_t *watchdogRecoveries);
+
+uint8_t lu6jmfTxDebugEvents(Lu6jmfTxDebugEvent *events, uint8_t maxEvents);
+
+// LU6JMF - Marcelo Ferreira (Oct/2026): crash black box (RTC memory).
+// Last TX events of the PREVIOUS run when it ended in PANIC/WDT/BROWNOUT/SW
+// reset, newest-first. Returns 0 if the previous boot was clean or a power-on.
+void lu6jmfCrumbBoot(void);
+uint8_t lu6jmfCrumbPrevEvents(Lu6jmfTxDebugEvent *events,
+                              uint8_t maxEvents,
+                              char *reason,
+                              size_t reasonLen);
+
+// 2.1.5: heap history for /txdebug (RAM only, lost on reset). One sample ~1 min after boot,
+// then one per hour (last 24 kept). lu6jmfHeapSample() is called from taskAPRS and decides
+// by itself when a sample is due. lu6jmfHeapHistory() copies them newest-first.
+// 2.1.5: persistent copy of the last 4 watchdog recoveries (the 24-entry TX event log rolls
+// over in a couple of minutes, which lost the evidence of a boot-time stall). Newest first.
+// stackFree = taskAPRS lowest free stack and heapFree at the moment of the recovery.
+void lu6jmfWdSnapshotSet(uint32_t stuckMs, uint32_t packed, uint8_t jobType);
+uint8_t lu6jmfWdSnapshotGet(uint32_t *atMs, uint32_t *stuckMs, uint32_t *packed, uint8_t *jobType,
+                            uint32_t *stackFree, uint32_t *heapFree, uint8_t maxN);
+// 2.1.5: wall-clock for the black box ("previous run ended about ...") and the boot time.
+void lu6jmfWallClockTick(void);
+uint32_t lu6jmfCrumbPrevEpoch(void);
+uint32_t lu6jmfCrumbPrevUptimeS(void);
+uint32_t lu6jmfBootEpoch(void);
+void lu6jmfHeapSample(void);
+uint8_t lu6jmfHeapHistory(uint32_t *upMin, uint32_t *freeHeap, uint32_t *maxBlock, uint8_t maxN);
+
+struct Lu6jmfTxTimingDebug
+{
+    uint8_t jobType;
+    uint32_t lastAirMs;
+    uint32_t avgAirMs;
+    uint32_t maxAirMs;
+    uint32_t samples;
+};
+
+uint8_t lu6jmfTxDebugTiming(Lu6jmfTxTimingDebug *stats,
+                            uint8_t maxStats);
+
+struct Lu6jmfTxQueueDebug
+{
+    uint8_t current;
+    uint8_t peak;
+    uint8_t capacity;
+    uint32_t saturated;
+    uint32_t rejected;
+};
+
+struct Lu6jmfTxQueueWaitDebug
+{
+    uint8_t priority;
+    uint32_t lastMs;
+    uint32_t avgMs;
+    uint32_t maxMs;
+    uint32_t samples;
+};
+
+void lu6jmfTxDebugQueue(Lu6jmfTxQueueDebug *queue);
+
+uint8_t lu6jmfTxDebugQueueWait(Lu6jmfTxQueueWaitDebug *stats,
+                               uint8_t maxStats);
+
+struct Lu6jmfTxQueueRejectDebug
+{
+    uint8_t jobType;
+    uint32_t rejected;
+};
+
+uint8_t lu6jmfTxDebugQueueRejectedByJob(
+    Lu6jmfTxQueueRejectDebug *stats,
+    uint8_t maxStats);
+
 //bool pkgTxUpdate(const char *info, int delay);
 void dispWindow(String line, uint8_t mode, bool filter);
 void dispTxWindow(txDisp txs);
@@ -452,7 +614,7 @@ void gpsDisp();
 void radioDisp();
 void wifiDisp();
 void sensorDisp();
-void LED_Status(uint8_t r, uint8_t g, uint8_t b);
 void convertSecondsToDHMS(char *dmhs,unsigned long totalSeconds);
+void wifiConnection();
 
 #endif

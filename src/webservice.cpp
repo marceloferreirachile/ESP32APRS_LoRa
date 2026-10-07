@@ -1,5 +1,5 @@
 /*
- Name:		ESP32C3_LoRa
+ Name:		ESP32APRS_Audio
  Created:	13-10-2023 14:27:23
  Author:	HS5TQA/Atten
  Github:	https://github.com/nakhonthai
@@ -8,8 +8,13 @@
  Support IS monitor: http://aprs.nakhonthai.net:14501 or http://aprs.hs5tqa.ampr.org:14501
 */
 #include <Arduino.h>
-#include <esp_task_wdt.h>
+#include <memory>
 #include "webservice.h"
+// LU6JMF - Marcelo Ferreira: PRIME account system, ported from TX-SCHEDULER-TEST.
+#include "prime.h"
+// LU6JMF - Marcelo Ferreira: motor de templates (fase 6), template embutido no
+// firmware - ver include/template_engine.h.
+#include "template_engine.h"
 #include "base64.hpp"
 #include "wireguard_vpn.h"
 #include <LibAPRSesp.h>
@@ -18,42 +23,24 @@
 #include <ESPCPUTemp.h>
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include <esp_task_wdt.h>
 #include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
 
-extern bool psramBusy;
+extern SemaphoreHandle_t psramMutex;
+extern bool psramLock(TickType_t timeout = portMAX_DELAY);
+extern void psramUnlock();
+
+extern int offset;
 
 // Helper function to allocate memory with PSRAM support
 char *allocateStringMemory(size_t size)
 {
 	char *ptr = NULL;
 #ifdef BOARD_HAS_PSRAM
-    while (psramBusy)
-        delay(1);
-    psramBusy = true;
 	// Try to allocate in PSRAM first
-	size *= 2; // overallocation to reduce fragmentation
-	// char *ptr = (char *)ps_calloc(size, sizeof(char));
-
-	// Retry loop for PSRAM allocation with backoff
-	
-	int retry_count = 3;
-	int delay_ms = 10;
-
-	// while (retry_count > 0 && ptr == NULL)
-	// {
-		ptr = (char *)ps_malloc(size);
-	// 	if (ptr == NULL)
-	// 	{
-	// 		retry_count--;
-	// 		if (retry_count > 0)
-	// 		{
-	// 			vTaskDelay(pdMS_TO_TICKS(delay_ms));
-	// 			delay_ms *= 2; // Exponential backoff
-	// 		}
-	// 	}
-	// }
-	psramBusy = false;
-
+	size*=2; // overallocation to reduce fragmentation
+	ptr = (char *)ps_calloc(size, sizeof(char));
 	if (ptr != NULL)
 	{
 		memset(ptr, 0, size); // Initialize memory to zero
@@ -63,9 +50,9 @@ char *allocateStringMemory(size_t size)
 #endif
 	// Regular heap allocation
 	ptr = (char *)calloc(size, sizeof(char));
-	// LU6JMF: calloc can fail on a fragmented heap (no PSRAM); never memset NULL.
-	if (ptr != NULL)
-		memset(ptr, 0, size); // Initialize memory to zero
+	// calloc() already returns zero-initialized memory, and may return NULL
+	// under memory pressure -- do NOT memset() an unchecked pointer here,
+	// that was the real cause of the StoreProhibited crash (write to 0x0).
 	return ptr;
 }
 
@@ -120,6 +107,18 @@ char *StringToCharPtr(const String &str)
 	return charPtr;
 }
 
+#ifdef PPPOS
+#include <PPP.h>
+#endif
+
+#ifdef SH1106
+#include <Adafruit_SH1106.h>
+#else
+#include "Adafruit_SSD1306.h"
+#endif // SH1106
+
+#define SCREEN_ADDRESS 0x3C
+
 AsyncWebServer async_server(80);
 AsyncWebServer async_websocket(81);
 AsyncWebSocket ws("/ws");
@@ -130,10 +129,7 @@ AsyncWebSocket ws_gnss("/ws_gnss");
 extern PubSubClient clientMQTT;
 #endif
 
-extern unsigned long lastHeardTimeout;
-
 #ifdef PPPOS
-#include <PPP.h>
 extern pppType pppStatus;
 #endif
 
@@ -143,22 +139,27 @@ AsyncEventSource message_events("/eventMsg");
 
 char *webString;
 
+extern unsigned long waitISRetry;
+extern volatile int8_t adcEn;
+extern volatile int8_t dacEn;
 extern unsigned long upTimeStamp;
-bool defaultSetting = false;
-extern float VBat;
+extern double VBat;
 extern bool VBat_Flag;
-extern bool VbatRead;
+extern char lastResetReasonStr[24];
+extern uint16_t blnSentCount[9];
+extern volatile bool blnRestartPending[9];
 
-// ประกาศ global semaphore
-static SemaphoreHandle_t cfg_mutex = NULL;
+#ifdef OLED
+#ifdef SH1106
+extern Adafruit_SH1106 display;
+#else
+extern Adafruit_SSD1306 display;
+#endif
+#elif defined(GUI_LCD)
+extern Adafruit_SH1106 display;
+#endif // OLED
 
-// #ifdef OLED
-// #ifdef SH1106
-// extern Adafruit_SH1106 display;
-// #else
-// extern Adafruit_SSD1306 display;
-// #endif
-// #endif // OLED
+bool defaultSetting = false;
 
 void saveConfig(AsyncWebServerRequest *request)
 {
@@ -181,16 +182,122 @@ void serviceHandle()
 	// server.handleClient();
 }
 
+// custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+// APRS symbol icons are packed into a single LittleFS file (data/symbols/icons.dat,
+// built by pack_icons.py) instead of ~190 separate tiny files: LittleFS allocates a
+// full 4KB block per file, and our 128KB partition only has 32 blocks total - not
+// enough for 190 files, but plenty for one ~60KB archive (~15 blocks).
+#define ICON_PACK_PATH "/symbols/icons.dat"
+#define ICON_PACK_MAX_ENTRIES 250
+struct IconPackEntry
+{
+	char name[12];
+	uint32_t offset;
+	uint32_t length;
+};
+static IconPackEntry iconPackIndex[ICON_PACK_MAX_ENTRIES];
+static int iconPackCount = -1; // -1 = not loaded yet, 0 = loaded but empty/missing
+static uint32_t iconPackDataStart = 0;
+
+static void loadIconPackIndex()
+{
+	iconPackCount = 0;
+	if (!LITTLEFS.exists(ICON_PACK_PATH))
+		return;
+	File f = LITTLEFS.open(ICON_PACK_PATH, "r");
+	if (!f)
+		return;
+	uint8_t hdr[6];
+	if (f.read(hdr, 6) != 6 || hdr[0] != 'I' || hdr[1] != 'C' || hdr[2] != 'P' || hdr[3] != 'K')
+	{
+		f.close();
+		return;
+	}
+	uint16_t count = hdr[4] | (hdr[5] << 8);
+	if (count > ICON_PACK_MAX_ENTRIES)
+		count = ICON_PACK_MAX_ENTRIES;
+	for (uint16_t i = 0; i < count; i++)
+	{
+		uint8_t rec[20];
+		if (f.read(rec, 20) != 20)
+			break;
+		memcpy(iconPackIndex[i].name, rec, 12);
+		iconPackIndex[i].name[11] = '\0';
+		iconPackIndex[i].offset = (uint32_t)rec[12] | ((uint32_t)rec[13] << 8) | ((uint32_t)rec[14] << 16) | ((uint32_t)rec[15] << 24);
+		iconPackIndex[i].length = (uint32_t)rec[16] | ((uint32_t)rec[17] << 8) | ((uint32_t)rec[18] << 16) | ((uint32_t)rec[19] << 24);
+		iconPackCount++;
+	}
+	iconPackDataStart = 6 + (uint32_t)count * 20;
+	f.close();
+}
+
+// Returns true if it handled the request (found + served, or found + I/O error already answered).
+static bool serveIconFromPack(AsyncWebServerRequest *request, const String &fileName)
+{
+	if (iconPackCount < 0)
+		loadIconPackIndex();
+	if (iconPackCount <= 0)
+		return false;
+	for (int i = 0; i < iconPackCount; i++)
+	{
+		if (fileName.equals(iconPackIndex[i].name))
+		{
+			uint32_t entryOffset = iconPackDataStart + iconPackIndex[i].offset;
+			uint32_t entryLength = iconPackIndex[i].length;
+			AsyncWebServerResponse *response = request->beginResponse(
+				"image/png", entryLength,
+				[entryOffset, entryLength](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+				{
+					if (index >= entryLength)
+						return 0;
+					size_t remaining = entryLength - index;
+					size_t toRead = remaining < maxLen ? remaining : maxLen;
+					File pf = LITTLEFS.open(ICON_PACK_PATH, "r");
+					if (!pf)
+						return 0;
+					if (!pf.seek(entryOffset + index))
+					{
+						pf.close();
+						return 0;
+					}
+					size_t got = pf.read(buffer, toRead);
+					pf.close();
+					return got;
+				});
+			response->addHeader("Cache-Control", "public, max-age=86400");
+			request->send(response);
+			return true;
+		}
+	}
+	return false;
+}
+
 void notFound(AsyncWebServerRequest *request)
 {
+	String url = request->url();
+	if (url.startsWith("/symbols/icons/"))
+	{
+		String fileName = url.substring(strlen("/symbols/icons/"));
+		if (serveIconFromPack(request, fileName))
+			return;
+	}
 	request->send(404, "text/plain", "Not found");
 }
 
 void handle_logout(AsyncWebServerRequest *request)
 {
-	String webString = "Log out";
-	request->send(200, "text/html",webString);
+	char *webString = allocateStringMemory(64); // Small buffer for "Log out"
+	if (!webString)
+	{
+		return; // Memory allocation failed
+	}
+	strcpy(webString, "Log out");
+	request->send(200, "text/html", webString);
+	free(webString); // Free the allocated memory
 }
+
+// 2.1.5: defined further below (before handle_radio); declared here because earlier handlers use it.
+static void sendHtmlChunked(AsyncWebServerRequest *request, String &page, const char *hdrName);
 
 void setMainPage(AsyncWebServerRequest *request)
 {
@@ -199,575 +306,600 @@ void setMainPage(AsyncWebServerRequest *request)
 		return request->requestAuthentication();
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(12000); // Initial buffer size, adjust as needed
+	// LU6JMF - Marcelo Ferreira:
+	// Fase 6 (tirar HTML do codigo pra templates): a casca do SPA (o que
+	// setMainPage imprime abaixo) agora tambem existe como arquivo em
+	// LittleFS (data/templates/main_shell.html), com 4 placeholders pros
+	// pontos dinamicos ({{TITLE}}, {{H1}}, {{MQTT_TAB_JS}}, {{MQTT_TAB_BTN}}).
+	// Um device que so recebeu o .bin por OTA (sem subir esse arquivo pela
+	// pagina Storage) ainda nao tem o template no filesystem - nesse caso o
+	// bloco abaixo simplesmente nao entra, e o codigo antigo (mantido logo
+	// depois, inalterado) gera a mesma pagina exatamente como sempre gerou.
+	if (LITTLEFS.exists("/main_shell.html"))
+	{
+		File tf = LITTLEFS.open("/main_shell.html", "r");
+		if (tf)
+		{
+			String tpl;
+			tpl.reserve(tf.size() + 1);
+			while (tf.available())
+				tpl += (char)tf.read();
+			tf.close();
+
+			char temp_buffer[512];
+			// LU6JMF - Marcelo Ferreira:
+			// AR-APRS visual identity - fixed brand name/version, independent
+			// of the configurable network hostname (matches the "black"
+			// palette/branding already used in the newer TX-SCHEDULER engine).
+			tpl.replace("{{TITLE}}", "<title>AR-APRS - Argentina APRS System</title>\n");
+
+			snprintf(temp_buffer, sizeof(temp_buffer),
+					 "<h1 style=\"margin-bottom:2px;\">AR-APRS</h1>\n"
+					 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">Argentina APRS System &middot; V%s%s</div>\n",
+					 VERSION, VERSION_BUILD);
+			tpl.replace("{{H1}}", temp_buffer);
+
+#ifdef MQTT
+			tpl.replace("{{MQTT_TAB_JS}}", "} else if (tabName == 'MQTT') {\n$(\"#contentmain\").load(\"/mqtt\");\n");
+			tpl.replace("{{MQTT_TAB_BTN}}", "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
+#else
+			tpl.replace("{{MQTT_TAB_JS}}", "");
+			tpl.replace("{{MQTT_TAB_BTN}}", "");
+#endif
+
+			AsyncResponseStream *tplStream = request->beginResponseStream("text/html", tpl.length() + 200);
+			if (tplStream)
+			{
+				tplStream->print(tpl);
+				tplStream->addHeader("Sensor", "content");
+				tplStream->addHeader("Cache-Control", "no-cache");
+				request->send(tplStream);
+				lastHeardTimeout = 0;
+				lastHeard_Flag = true;
+				return;
+			}
+		}
+	}
+
+	// ---- Fallback: embedded shell, used when the LittleFS template is absent ----
+	// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+	AsyncResponseStream *webString = request->beginResponseStream("text/html", 26000);
 	if (!webString)
 	{
 		return; // Memory allocation failed
 	}
 
-	strcpy(webString, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
-	strcat(webString, "<meta name=\"robots\" content=\"index\" />\n");
-	strcat(webString, "<meta name=\"robots\" content=\"follow\" />\n");
-	strcat(webString, "<meta name=\"language\" content=\"English\" />\n");
-	strcat(webString, "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />\n");
-	strcat(webString, "<meta name=\"GENERATOR\" content=\"configure 20240418\" />\n");
-	strcat(webString, "<meta name=\"Author\" content=\"Mr.Somkiat Nakhonthai (HS5TQA)\" />\n");
-	strcat(webString, "<meta name=\"Description\" content=\"Web Embedded Configuration\" />\n");
-	strcat(webString, "<meta name=\"KeyWords\" content=\"ESP32,ESP32C3,AFSK,APRS\" />\n");
-	strcat(webString, "<meta http-equiv=\"Cache-Control\" content=\"no-cache, no-store, must-revalidate\" />\n");
-	strcat(webString, "<meta http-equiv=\"pragma\" content=\"no-cache\" />\n");
-	strcat(webString, "<link rel=\"shortcut icon\" href=\"http://aprs.nakhonthai.com/favicon.ico\" type=\"image/x-icon\" />\n");
-	strcat(webString, "<meta http-equiv=\"Expires\" content=\"0\" />\n");
+	webString->print("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+	webString->print("<meta name=\"robots\" content=\"index\" />\n");
+	webString->print("<meta name=\"robots\" content=\"follow\" />\n");
+	webString->print("<meta name=\"language\" content=\"English\" />\n");
+	webString->print("<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />\n");
+	webString->print("<meta name=\"GENERATOR\" content=\"configure 20230924\" />\n");
+	webString->print("<meta name=\"Author\" content=\"Mr.Somkiat Nakhonthai (HS5TQA)\" />\n");
+	webString->print("<meta name=\"Description\" content=\"Web Embedded Configuration\" />\n");
+	webString->print("<meta name=\"KeyWords\" content=\"ESP32,ESP32C3,AFSK,APRS\" />\n");
+	webString->print("<meta http-equiv=\"Cache-Control\" content=\"no-cache, no-store, must-revalidate\" />\n");
+	webString->print("<meta http-equiv=\"pragma\" content=\"no-cache\" />\n");
+	webString->print("<link rel=\"shortcut icon\" href=\"http://aprs.nakhonthai.net/favicon.ico\" type=\"image/x-icon\" />\n");
+	webString->print("<meta http-equiv=\"Expires\" content=\"0\" />\n");
 
 	char temp_buffer[512];
-	if (strlen(config.host_name) > 0)
-	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "<title>%s</title>\n", config.host_name);
-		strcat(webString, temp_buffer);
-	}
-	else
-	{
-		strcat(webString, "<title>ESP32APRS_LoRa</title>\n");
-	}
+	// LU6JMF - Marcelo Ferreira:
+	// AR-APRS visual identity - fixed brand name/version, independent of the
+	// configurable network hostname.
+	webString->print("<title>AR-APRS - Argentina APRS System</title>\n");
 
-	strcat(webString, "<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\" />\n");
-	strcat(webString, "<script src=\"/jquery-3.7.1.js\"></script>\n");
-	strcat(webString, "<script type=\"text/javascript\">\n");
-	strcat(webString, "function selectTab(evt, tabName) {\n");
-	strcat(webString, "var i, tabcontent, tablinks;\n");
-	strcat(webString, "tablinks = document.getElementsByClassName(\"nav-tabs\");\n");
-	strcat(webString, "for (i = 0; i < tablinks.length; i++) {\n");
-	strcat(webString, "tablinks[i].className = tablinks[i].className.replace(\" active\", \"\");\n");
-	strcat(webString, "}\n");
-	strcat(webString, "\n");
-	strcat(webString, "//document.getElementById(tabName).style.display = \"block\";\n");
-	strcat(webString, "if (tabName == 'DashBoard') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/dashboard\");\n");
-	strcat(webString, "} else if (tabName == 'Radio') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/radio\");\n");
-	strcat(webString, "} else if (tabName == 'IGATE') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/igate\");\n");
-	strcat(webString, "} else if (tabName == 'DIGI') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/digi\");\n");
-	strcat(webString, "} else if (tabName == 'TRACKER') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/tracker\");\n");
-	strcat(webString, "} else if (tabName == 'WX') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/wx\");\n");
-	strcat(webString, "} else if (tabName == 'TLM') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/tlm\");\n");
-	strcat(webString, "} else if (tabName == 'SENSOR') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/sensor\");\n");
-	strcat(webString, "} else if (tabName == 'VPN') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/vpn\");\n");
+	webString->print("<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\" />\n");
+	webString->print("<script src=\"/jquery-3.7.1.js\"></script>\n");
+	webString->print("<script type=\"text/javascript\">\n");
+	webString->print("function selectTab(evt, tabName) {\n");
+	webString->print("var i, tabcontent, tablinks;\n");
+	webString->print("tablinks = document.getElementsByClassName(\"nav-tabs\");\n");
+	webString->print("for (i = 0; i < tablinks.length; i++) {\n");
+	webString->print("tablinks[i].className = tablinks[i].className.replace(\" active\", \"\");\n");
+	webString->print("}\n");
+	webString->print("\n");
+	webString->print("//document.getElementById(tabName).style.display = \"block\";\n");
+	webString->print("if (tabName == 'DashBoard') {\n");
+	webString->print("$(\"#contentmain\").load(\"/dashboard\");\n");
+	webString->print("} else if (tabName == 'Radio') {\n");
+	webString->print("$(\"#contentmain\").load(\"/radio\");\n");
+	webString->print("} else if (tabName == 'IGATE') {\n");
+	webString->print("$(\"#contentmain\").load(\"/igate\");\n");
+	webString->print("} else if (tabName == 'IGTLM') {\n");
+	webString->print("$(\"#contentmain\").load(\"/igate2\");\n");
+	webString->print("} else if (tabName == 'DIGI') {\n");
+	webString->print("$(\"#contentmain\").load(\"/digi\");\n");
+	webString->print("} else if (tabName == 'TRACKER') {\n");
+	webString->print("$(\"#contentmain\").load(\"/tracker\");\n");
+	webString->print("} else if (tabName == 'WX') {\n");
+	webString->print("$(\"#contentmain\").load(\"/wx\");\n");
+	webString->print("} else if (tabName == 'WXCH') {\n");
+	webString->print("$(\"#contentmain\").load(\"/wx2\");\n");
+	webString->print("} else if (tabName == 'TLM') {\n");
+	webString->print("$(\"#contentmain\").load(\"/tlm\");\n");
+	webString->print("} else if (tabName == 'SENSOR') {\n");
+	webString->print("$(\"#contentmain\").load(\"/sensor\");\n");
+	webString->print("} else if (tabName == 'SCFG') {\n");
+	webString->print("$(\"#contentmain\").load(\"/sensor2\");\n");
+	webString->print("} else if (tabName == 'VPN') {\n");
+	webString->print("$(\"#contentmain\").load(\"/vpn\");\n");
 #ifdef MQTT
-	strcat(webString, "} else if (tabName == 'MQTT') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/mqtt\");\n");
+	webString->print("} else if (tabName == 'MQTT') {\n");
+	webString->print("$(\"#contentmain\").load(\"/mqtt\");\n");
 #endif
-	strcat(webString, "} else if (tabName == 'MSG') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/msg\");\n");
-	strcat(webString, "} else if (tabName == 'WiFi') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/wireless\");\n");
-	strcat(webString, "} else if (tabName == 'MOD') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/mod\");\n");
-	strcat(webString, "} else if (tabName == 'System') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/system\");\n");
-	strcat(webString, "} else if (tabName == 'File') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/storage\");\n");
-	strcat(webString, "} else if (tabName == 'About') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/about\");\n");
-	strcat(webString, "}\n");
-	strcat(webString, "\n");
-	strcat(webString, "if (evt != null) evt.currentTarget.className += \" active\";\n");
-	strcat(webString, "}\n");
-	strcat(webString, "if (!!window.EventSource) {");
-	strcat(webString, "var source = new EventSource('/eventHeard');");
+	webString->print("} else if (tabName == 'MSG') {\n");
+	webString->print("$(\"#contentmain\").load(\"/msg\");\n");
+	webString->print("} else if (tabName == 'OBJ') {\n");
+	webString->print("$(\"#contentmain\").load(\"/object\");\n");
+	webString->print("} else if (tabName == 'WiFi') {\n");
+	webString->print("$(\"#contentmain\").load(\"/wireless\");\n");
+	webString->print("} else if (tabName == 'MOD') {\n");
+	webString->print("$(\"#contentmain\").load(\"/mod\");\n");
+	webString->print("} else if (tabName == 'IO') {\n");
+	webString->print("$(\"#contentmain\").load(\"/mod2\");\n");
+	webString->print("} else if (tabName == 'System') {\n");
+	webString->print("$(\"#contentmain\").load(\"/system\");\n");
+	webString->print("} else if (tabName == 'File') {\n");
+	webString->print("$(\"#contentmain\").load(\"/storage\");\n");
+	webString->print("} else if (tabName == 'About') {\n");
+	webString->print("$(\"#contentmain\").load(\"/about\");\n");
+	webString->print("} else if (tabName == 'PRIME') {\n");
+	webString->print("$(\"#contentmain\").load(\"/prime\");\n");
+	webString->print("}\n");
+	webString->print("\n");
+	webString->print("if (evt != null) evt.currentTarget.className += \" active\";\n");
+	webString->print("}\n");
+	webString->print("if (!!window.EventSource) {");
+	webString->print("var source = new EventSource('/eventHeard');");
 
-	strcat(webString, "source.addEventListener('open', function(e) {");
-	strcat(webString, "console.log(\"Events Connected\");");
-	strcat(webString, "}, false);");
-	strcat(webString, "source.addEventListener('error', function(e) {");
-	strcat(webString, "if (e.target.readyState != EventSource.OPEN) {");
-	strcat(webString, "console.log(\"Events Disconnected\");");
-	strcat(webString, "}\n}, false);");
-	strcat(webString, "source.addEventListener('lastHeard', function(e) {");
-	// strcat(webString, "console.log(\"lastHeard\", e.data);");
-	strcat(webString, "var lh=document.getElementById(\"aprsTable\");");
-	strcat(webString, "if(lh != null) {renderTable(e.data);}");
-	strcat(webString, "}, false);\n}");
-	strcat(webString, "if (!!window.EventSource) {");
-	strcat(webString, "var source = new EventSource('/eventMsg');");
+	webString->print("source.addEventListener('open', function(e) {");
+	webString->print("console.log(\"Events Connected\");");
+	webString->print("}, false);");
+	webString->print("source.addEventListener('error', function(e) {");
+	webString->print("if (e.target.readyState != EventSource.OPEN) {");
+	webString->print("console.log(\"Events Disconnected\");");
+	webString->print("}\n}, false);");
+	webString->print("source.addEventListener('lastHeard', function(e) {");
+	// webString->print("console.log(\"lastHeard\", e.data);");
+	webString->print("var lh=document.getElementById(\"aprsTable\");");
+	webString->print("if(lh != null) {renderTable(e.data);}");
+	webString->print("}, false);\n}");
+	webString->print("if (!!window.EventSource) {");
+	webString->print("var source = new EventSource('/eventMsg');");
 
-	strcat(webString, "source.addEventListener('open', function(e) {");
-	strcat(webString, "console.log(\"Events MSG Connected\");");
-	strcat(webString, "}, false);");
-	strcat(webString, "source.addEventListener('error', function(e) {");
-	strcat(webString, "if (e.target.readyState != EventSource.OPEN) {");
-	strcat(webString, "console.log(\"Events MSG Disconnected\");");
-	strcat(webString, "}\n}, false);");
-	strcat(webString, "source.addEventListener('chatMsg', function(e) {");
-	// strcat(webString, "console.log(\"lastHeard\", e.data);");
-	strcat(webString, "var lh=document.getElementById(\"chatMsg\");");
-	strcat(webString, "if(lh != null) {lh.innerHTML = e.data;}");
-	strcat(webString, "}, false);\n}\n");
-	// strcat(webString, "</script>\n");
+	webString->print("source.addEventListener('open', function(e) {");
+	webString->print("console.log(\"Events MSG Connected\");");
+	webString->print("}, false);");
+	webString->print("source.addEventListener('error', function(e) {");
+	webString->print("if (e.target.readyState != EventSource.OPEN) {");
+	webString->print("console.log(\"Events MSG Disconnected\");");
+	webString->print("}\n}, false);");
+	webString->print("source.addEventListener('chatMsg', function(e) {");
+	// webString->print("console.log(\"lastHeard\", e.data);");
+	webString->print("var lh=document.getElementById(\"chatMsg\");");
+	webString->print("if(lh != null) {lh.innerHTML = e.data;}");
+	webString->print("}, false);\n}\n");
+	//webString->print("</script>\n");
 
-	strcat(webString, "let sortDirection = {};\n");
-	strcat(webString, "let currentSortKey = \"time\";\n\n");
-	strcat(webString, "function renderTable(raw) {\n");
-	// strcat(webString, "const tableBody = document.getElementById(\"aprsTableBody\");\n");
-	// //strcat(webString, "const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
-	// strcat(webString, "if(tableBody == null) {return;}\n");
-	strcat(webString, "var data=JSON.parse(raw);\n");
-	strcat(webString, "lastHeardSort(data);\n");
-	strcat(webString, "document.querySelectorAll(\"#aprsTable th[data-sort]\")\n");
-	strcat(webString, ".forEach(header => {\n\n");
-	strcat(webString, "header.addEventListener(\"click\", () => {\n\n");
-	strcat(webString, "const key = header.dataset.sort;\n\n");
-	strcat(webString, "sortDirection[key] = !sortDirection[key];\n");
-	strcat(webString, "currentSortKey = key;\n\n");
-	strcat(webString, "clearArrows();\n\n");
-	strcat(webString, "const arrowSpan = header.querySelector(\".arrow\");\n");
-	strcat(webString, "arrowSpan.textContent = sortDirection[key] ? \"▲\" : \"▼\";\n\n");
-	strcat(webString, "lastHeardSort(data);\n");
-	strcat(webString, "printLastHeard(data);\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "printLastHeard(data);\n");
-	strcat(webString, "}\n\n");
+	webString->print("let sortDirection = {};\n");
+	webString->print("let currentSortKey = \"time\";\n\n");
+	webString->print("function renderTable(raw) {\n");
+	// webString->print("const tableBody = document.getElementById(\"aprsTableBody\");\n");
+	// //webString->print("const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
+	// webString->print("if(tableBody == null) {return;}\n");
+	webString->print("var data=JSON.parse(raw);\n");	
+	webString->print("lastHeardSort(data);\n");
+	webString->print("document.querySelectorAll(\"#aprsTable th[data-sort]\")\n");
+	webString->print(".forEach(header => {\n\n");
+	webString->print("header.addEventListener(\"click\", () => {\n\n");
+	webString->print("const key = header.dataset.sort;\n\n");
+	webString->print("sortDirection[key] = !sortDirection[key];\n");
+	webString->print("currentSortKey = key;\n\n");	
+	webString->print("clearArrows();\n\n");
+	webString->print("const arrowSpan = header.querySelector(\".arrow\");\n");
+	webString->print("arrowSpan.textContent = sortDirection[key] ? \"▲\" : \"▼\";\n\n");
+	webString->print("lastHeardSort(data);\n");
+	webString->print("printLastHeard(data);\n");
+	webString->print("});\n\n");
+	webString->print("});\n\n");
+	webString->print("printLastHeard(data);\n");
+	webString->print("}\n\n");
 
-	strcat(webString, "function printLastHeard(data) {\n");
-	strcat(webString, "const tableBody = document.getElementById(\"aprsTableBody\");\n");
-	// strcat(webString, "const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
-	strcat(webString, "if(tableBody == null) {return;}\n");
-	strcat(webString, "tableBody.innerHTML = \"\";\n");
-	strcat(webString, "data.forEach(row => {\n");
-	strcat(webString, "const tr = document.createElement(\"tr\");\n");
-	strcat(webString, "tr.innerHTML = `\n");
-	strcat(webString, "<td>${row.time}</td>\n");
-	strcat(webString, "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/${row.icon}\"></td>\n");
-	strcat(webString, "<td>${row.callsign}</td>\n");
-	strcat(webString, "<td align=\"left\">${row.path}</td>\n");
-	strcat(webString, "<td>${row.dx !== null ? row.dx : \"-\"}</td>\n");
-	strcat(webString, "<td>${row.packet}</td>\n");
-	strcat(webString, "<td style=\"color:green;\">${row.rssi !== '-' ? row.rssi + \"dBm\" : \"-\"}</td>\n");
-	strcat(webString, "<td style=\"color:green;\">${row.freqErr !== '-' ? row.freqErr : \"-\"}</td>\n");
-	strcat(webString, "`;\n");
-	strcat(webString, "tableBody.appendChild(tr);\n");
-	strcat(webString, "});\n");
-	strcat(webString, "}\n\n");
+	webString->print("function iconFallback(imgEl, iconFile, initial) {\n");
+webString->print("  imgEl.style.display='none';\n");
+webString->print("  var span = imgEl.nextElementSibling;\n");
+webString->print("  if (!span) return;\n");
+webString->print("  span.style.display='inline-flex';\n");
+webString->print("  span.style.alignItems='center';\n");
+webString->print("  span.style.justifyContent='center';\n");
+webString->print("  var code = parseInt(iconFile.split('-')[0], 10);\n");
+webString->print("  var shapes = {\n");
+webString->print("    62: \"<svg viewBox='0 0 24 24' width='18' height='18'><rect x='2' y='10' width='20' height='8' rx='2' fill='#1565c0'/><circle cx='7' cy='19' r='2' fill='#333'/><circle cx='17' cy='19' r='2' fill='#333'/></svg>\",\n");
+webString->print("    45: \"<svg viewBox='0 0 24 24' width='18' height='18'><polygon points='12,3 22,12 19,12 19,21 5,21 5,12 2,12' fill='#8d6e63'/></svg>\",\n");
+webString->print("    35: \"<svg viewBox='0 0 24 24' width='18' height='18'><polygon points='12,2 15,9 22,9 16,14 18,21 12,17 6,21 8,14 2,9 9,9' fill='#fbc02d'/></svg>\",\n");
+webString->print("    95: \"<svg viewBox='0 0 24 24' width='18' height='18'><ellipse cx='12' cy='13' rx='9' ry='6' fill='#90a4ae'/></svg>\"\n");
+webString->print("  };\n");
+webString->print("  if (shapes[code]) {\n");
+webString->print("    span.innerHTML = shapes[code];\n");
+webString->print("  } else {\n");
+webString->print("    span.style.width='18px'; span.style.height='18px'; span.style.borderRadius='50%';\n");
+webString->print("    span.style.background='#607d8b'; span.style.color='#fff'; span.style.fontSize='11px'; span.style.fontWeight='bold';\n");
+webString->print("    span.style.display='inline-flex'; span.style.alignItems='center'; span.style.justifyContent='center';\n");
+webString->print("    span.textContent = (initial || '?').toUpperCase();\n");
+webString->print("  }\n");
+webString->print("}\n\n");
 
-	strcat(webString, "function clearArrows() {\n");
-	strcat(webString, "document.querySelectorAll(\".arrow\").forEach(a => a.textContent = \"\");\n");
-	strcat(webString, "}\n\n");
-	strcat(webString, "function lastHeardSort(data) {\nvar key=currentSortKey;\n");
-	strcat(webString, "data.sort((a, b) => {\n\n");
-	strcat(webString, "let valA = a[key];\n");
-	strcat(webString, "let valB = b[key];\n\n");
-	strcat(webString, "if (key === \"time\") {\n");
-	// strcat(webString, "// Parse time in dd hh:mm:ss format\n");
-	strcat(webString, "const [dayTime, timePart] = valA.split(' ');\n");
-	strcat(webString, "const [hours, minutes, seconds] = timePart.split(':');\n");
-	strcat(webString, "valA = parseInt(dayTime) * 86400 + parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseInt(seconds);\n");
-	// strcat(webString, "                \n");
-	strcat(webString, "const [dayTimeB, timePartB] = valB.split(' ');\n");
-	strcat(webString, "const [hoursB, minutesB, secondsB] = timePartB.split(':');\n");
-	strcat(webString, "valB = parseInt(dayTimeB) * 86400 + parseInt(hoursB) * 3600 + parseInt(minutesB) * 60 + parseInt(secondsB);\n");
-	strcat(webString, "}\n\n");
-	strcat(webString, "if (valA === null) return 1;\n");
-	strcat(webString, "if (valB === null) return -1;\n\n");
-	strcat(webString, "if (valA < valB) return sortDirection[key] ? -1 : 1;\n");
-	strcat(webString, "if (valA > valB) return sortDirection[key] ? 1 : -1;\n");
-	strcat(webString, "return 0;\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "}\n\n");
-	strcat(webString, "</script>\n");
-	strcat(webString, "</head>\n");
-	// strcat(webString, "\n");
-	strcat(webString, "<body onload=\"selectTab(event, 'DashBoard')\">\n");
-	strcat(webString, "\n");
-	strcat(webString, "<div class=\"container\">\n");
-	strcat(webString, "<div class=\"header\">\n");
-	// strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\">ESP32IGate Firmware V" + String(VERSION) + "</div>\n");
-	// strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
-	if (strlen(config.host_name) > 0)
-	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "<h1>%s</h1>\n", config.host_name);
-		strcat(webString, temp_buffer);
-	}
-	else
-	{
-		strcat(webString, "<h1>ESP32APRS_LoRa</h1>\n");
-	}
-	strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
-	strcat(webString, "<div class=\"row\">\n");
-	strcat(webString, "<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DashBoard')\">DashBoard</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Radio')\" id=\"btnRadio\">Radio</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IGATE')\">IGATE</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DIGI')\">DIGI</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TRACKER')\">TRACKER</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
+webString->print("function iconError(imgEl, iconFile, initial) {\n");
+webString->print("  if (!imgEl.dataset.stage) {\n");
+webString->print("    imgEl.dataset.stage = 'local';\n");
+webString->print("    imgEl.src = '/symbols/icons/' + iconFile;\n");
+webString->print("  } else {\n");
+webString->print("    iconFallback(imgEl, iconFile, initial);\n");
+webString->print("  }\n");
+webString->print("}\n\n");
+
+webString->print("function printLastHeard(data) {\n");
+	webString->print("const tableBody = document.getElementById(\"aprsTableBody\");\n");
+	//webString->print("const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
+	webString->print("if(tableBody == null) {return;}\n");
+	webString->print("tableBody.innerHTML = \"\";\n");
+	webString->print("data.forEach(row => {\n");
+	webString->print("const tr = document.createElement(\"tr\");\n");
+	webString->print("tr.innerHTML = `\n");
+	webString->print("<td>${row.time}</td>\n");
+	webString->print("<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/${row.icon}\" style=\"width:20px;height:20px;\" onerror=\"iconError(this, '${row.icon}', '${(row.callsign||'?').charAt(0)}');\"><span style=\"display:none;width:20px;height:20px;\"></span></td>\n");
+	// Clickable callsign -> aprs.fi - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+	webString->print("<td><a style=\"text-decoration:underline;\" href=\"https://www.qrz.com/db/${encodeURIComponent(row.callsign.split('-')[0])}\" target=\"_blank\" rel=\"noopener\">${row.callsign}</a> <a href=\"https://aprs.fi/#!z=12&call=a%2F${encodeURIComponent(row.callsign)}&timerange=3600&tail=3600\" target=\"_blank\" rel=\"noopener\" title=\"Ver en aprs.fi\">🗺</a></td>\n");
+	webString->print("<td align=\"left\">${row.path}</td>\n");
+	webString->print("<td>${row.dx !== null ? row.dx : \"-\"}</td>\n");
+	webString->print("<td>${row.packet}</td>\n");
+	webString->print("<td style=\"color:green;\">${row.audio !== '-' ? row.audio + \"dBV\" : \"-\"}</td>\n");
+	webString->print("`;\n");
+	webString->print("tableBody.appendChild(tr);\n");
+	webString->print("});\n");
+	webString->print("}\n\n");
+
+	webString->print("function clearArrows() {\n");
+	webString->print("document.querySelectorAll(\".arrow\").forEach(a => a.textContent = \"\");\n");
+	webString->print("}\n\n");
+	webString->print("function lastHeardSort(data) {\nvar key=currentSortKey;\n");
+	webString->print("data.sort((a, b) => {\n\n");
+	webString->print("let valA = a[key];\n");
+	webString->print("let valB = b[key];\n\n");
+	webString->print("if (key === \"time\") {\n");
+	//webString->print("// Parse time in dd hh:mm:ss format\n");
+	webString->print("const [dayTime, timePart] = valA.split(' ');\n");
+	webString->print("const [hours, minutes, seconds] = timePart.split(':');\n");
+	webString->print("valA = parseInt(dayTime) * 86400 + parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseInt(seconds);\n");
+	//webString->print("                \n");
+	webString->print("const [dayTimeB, timePartB] = valB.split(' ');\n");
+	webString->print("const [hoursB, minutesB, secondsB] = timePartB.split(':');\n");
+	webString->print("valB = parseInt(dayTimeB) * 86400 + parseInt(hoursB) * 3600 + parseInt(minutesB) * 60 + parseInt(secondsB);\n");
+	webString->print("}\n\n");
+	webString->print("if (valA === null) return 1;\n");
+	webString->print("if (valB === null) return -1;\n\n");
+	webString->print("if (valA < valB) return sortDirection[key] ? -1 : 1;\n");
+	webString->print("if (valA > valB) return sortDirection[key] ? 1 : -1;\n");
+	webString->print("return 0;\n");
+	webString->print("});\n\n");
+	webString->print("}\n\n");
+	webString->print("</script>\n");
+	webString->print("</head>\n");
+	//webString->print("\n");
+	webString->print("<body onload=\"selectTab(event, 'DashBoard')\">\n");
+	webString->print("\n");
+	webString->print("<div class=\"container\">\n");
+	webString->print("<div class=\"header\">\n");
+	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\">ESP32IGate Firmware V" + String(VERSION) + "</div>\n");
+	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
+	// LU6JMF - Marcelo Ferreira: AR-APRS header, version generated from build data.
+	webString->print("<h1 style=\"margin-bottom:2px;\">AR-APRS</h1>\n");
+	snprintf(temp_buffer, sizeof(temp_buffer),
+			 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">Argentina APRS System &middot; V%s%s</div>\n",
+			 VERSION, VERSION_BUILD);
+	webString->print(temp_buffer);
+	webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\" style=\"color:#d7d7d7;\">[LOG OUT]</a></div>\n");
+	webString->print("<div class=\"row\">\n");
+	webString->print("<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DashBoard')\">DashBoard</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Radio')\" id=\"btnRadio\">Radio</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IGATE')\">IGATE</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DIGI')\">DIGI</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TRACKER')\">TRACKER</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MSG')\">MSG</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'OBJ')\">OBJ</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WiFi')\">WiFi</button>\n");
+	webString->print("</ul>\n");
+	webString->print("<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IGTLM')\">IGTLM</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WXCH')\">WXCH</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SCFG')\">SCFG</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
 #ifdef MQTT
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
 #endif
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MSG')\">MSG</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WiFi')\">WiFi</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MOD')\">MOD</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'System')\">System</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'File')\">File</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'About')\">About</button>\n");
-	strcat(webString, "</ul>\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MOD')\">MOD</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IO')\">I/O</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'System')\">System</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'File')\">File</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'About')\">About</button>\n");
+	webString->print("<button class=\"nav-tabs\" onclick=\"selectTab(event, 'PRIME')\">PRIME</button>\n");
+	webString->print("</ul>\n");
+	webString->print("</div>\n");
+	webString->print("</div>\n");
+	webString->print("\n");
 
-	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\"  style=\"font-size: 2pt;\">\n");
-	strcat(webString, "\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "<br />\n");
-	strcat(webString, "<div class=\"footer\">\n");
-	strcat(webString, "ESP32APRS_LoRa Web Configuration<br />Copy right ©2024.\n");
-	strcat(webString, "<br />\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "<!-- <script type=\"text/javascript\" src=\"/nice-select.min.js\"></script> -->\n");
-	strcat(webString, "<script type=\"text/javascript\">\n");
-	strcat(webString, "var selectize = document.querySelectorAll('select')\n");
-	strcat(webString, "var options = { searchable: true };\n");
-	strcat(webString, "selectize.forEach(function (select) {\n");
-	strcat(webString, "if (select.length > 30 && null === select.onchange && !select.name.includes(\"ExtendedId\")) {\n");
-	strcat(webString, "select.classList.add(\"small\", \"selectize\");\n");
-	strcat(webString, "tabletd = select.closest('td');\n");
-	strcat(webString, "tabletd.style.cssText = 'overflow-x:unset';\n");
-	strcat(webString, "NiceSelect.bind(select, options);\n");
-	strcat(webString, "}\n");
-	strcat(webString, "});\n");
-	strcat(webString, "</script>\n");
-	strcat(webString, "</body>\n");
-	strcat(webString, "</html>");
+	webString->print("<div class=\"contentwide\" id=\"contentmain\"  style=\"font-size: 2pt;\">\n");
+	webString->print("\n");
+	webString->print("</div>\n");
+	webString->print("<br />\n");
+	webString->print("<div class=\"footer\">\n");
+	// LU6JMF - Marcelo Ferreira: AR-APRS signature.
+	webString->print("AR-APRS &middot; Argentina APRS System &middot; 2027<br />\n");
+	webString->print("LU6JMF &mdash; Marcelo Ferreira\n");
+	webString->print("<br />\n");
+	webString->print("</div>\n");
+	webString->print("</div>\n");
+	webString->print("<!-- <script type=\"text/javascript\" src=\"/nice-select.min.js\"></script> -->\n");
+	webString->print("<script type=\"text/javascript\">\n");
+	webString->print("var selectize = document.querySelectorAll('select')\n");
+	webString->print("var options = { searchable: true };\n");
+	webString->print("selectize.forEach(function (select) {\n");
+	webString->print("if (select.length > 30 && null === select.onchange && !select.name.includes(\"ExtendedId\")) {\n");
+	webString->print("select.classList.add(\"small\", \"selectize\");\n");
+	webString->print("tabletd = select.closest('td');\n");
+	webString->print("tabletd.style.cssText = 'overflow-x:unset';\n");
+	webString->print("NiceSelect.bind(select, options);\n");
+	webString->print("}\n");
+	webString->print("});\n");
+	webString->print("</script>\n");
+	webString->print("</body>\n");
+	webString->print("</html>");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("Sensor", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(webString);
+
+	webString->addHeader("Sensor", "content");
+	webString->addHeader("Cache-Control", "no-cache");
+	request->send(webString);
 	lastHeardTimeout = 0;
 	lastHeard_Flag = true;
 }
+
 ////////////////////////////////////////////////////////////
 // handler for web server request: http://IpAddress/      //
 ////////////////////////////////////////////////////////////
 
 void handle_css(AsyncWebServerRequest *request)
 {
-	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #2194ec;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#0f07f2;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#0525f7;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #010369}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;\n";
+	// LU6JMF - Marcelo Ferreira:
+	// Fase 6 (tirar HTML/CSS do codigo pra templates): style.css agora vive em
+	// LittleFS (data/style.css) e e servido direto dali quando presente. Um
+	// device que so recebeu o .bin por OTA (sem subir esse arquivo pela pagina
+	// Storage) ainda nao tem esse arquivo no filesystem - nesse caso cai pro
+	// texto embutido abaixo, que fica igual ao style.css de hoje. Sem esse
+	// fallback a pagina ficaria sem estilo ate alguem subir o arquivo.
+	if (LITTLEFS.exists("/style.css"))
+	{
+		request->send(LITTLEFS, "/style.css", "text/css");
+		return;
+	}
+	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #171717;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#263B43;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{cursor: pointer;user-select: none;font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#1F4E5F;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #263B43}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0;padding:1px 4px;font-size:12px;flex:1 1 auto;min-width:0;white-space:nowrap}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;}\n";
 	request->send_P(200, "text/css", css);
 }
 
 void handle_jquery(AsyncWebServerRequest *request)
 {
+#if defined(CONFIG_IDF_TARGET_ESP32)
+	adcEn = -1;
+	dacEn = -1;
+	delay(100);
+#endif
 	AsyncWebServerResponse *response = request->beginResponse_P(200, "application/javascript", (const uint8_t *)jquery_3_7_1_min_js_gz, jquery_3_7_1_min_js_gz_len);
 	response->addHeader("Content-Encoding", "gzip");
 	response->addHeader("Cache-Control", "no-cache");
 	response->setContentLength(jquery_3_7_1_min_js_gz_len);
 	request->send(response);
+#if defined(CONFIG_IDF_TARGET_ESP32)
+	delay(200);
+	adcEn = 1;
+	dacEn = 0;
+#endif
 }
+
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+static const char *DASHBOARD_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"function reloadSysInfo() {\n"
+	"$(\"#sysInfo\").load(\"/sysinfo\", function () { setTimeout(reloadSysInfo, 60000) });\n"
+	"}\n"
+	"setTimeout(reloadSysInfo(), 100);\n"
+	"function reloadSidebarInfo() {\n"
+	"$(\"#sidebarInfo\").load(\"/sidebarInfo\", function () { setTimeout(reloadSidebarInfo, 10000) });\n"
+	"}\n"
+	"setTimeout(reloadSidebarInfo, 1000);\n"
+	"$(window).trigger('resize');\n"
+	"</script>\n"
+	"<div id=\"sysInfo\">\n</div>\n"
+	"<br />\n"
+	"<div class=\"nav-status\">\n"
+	"<div id=\"sidebarInfo\">\n</div>\n"
+	"<br />\n"
+	"<table>\n<tr>\n<th colspan=\"2\">Radio Info</th>\n</tr>\n"
+	"{{#if rf}}"
+	"<tr>\n<td>Freq.TX</td>\n<td style=\"background: #ffffff;\">{{freqTx}} MHz</td>\n</tr>\n"
+	"<tr>\n<td>Freq.RX</td>\n<td style=\"background: #ffffff;\">{{freqRx}} MHz</td>\n</tr>\n"
+	"<tr>\n<td>TX PWR</td>\n<td>{{txPower}}</td>\n</tr>\n"
+	"{{/if}}"
+	"<tr>\n<td>MODEM</td>\n<td style=\"background: #ffffff;\">{{modem}}</td>\n</tr>\n"
+	"<tr>\n<td>FX.25</td>\n<td style=\"background: #ffffff;\">{{fx25}}</td>\n</tr>\n"
+	"</table>\n\n"
+	"{{#if igate}}"
+	"<br />\n<table>\n<tr>\n<th colspan=\"2\">APRS-IS SERVER</th>\n</tr>\n"
+	"<tr>\n<td>HOST</td>\n<td style=\"background: #ffffff;\">{{igate.host}}</td>\n</tr>\n"
+	"<tr>\n<td>PORT</td>\n<td style=\"background: #ffffff;\">{{igate.port}}</td>\n</tr>\n"
+	"</table>\n"
+	"{{/if}}"
+	"<br />\n<table>\n<tr>\n<th colspan=\"2\">WiFi</th>\n</tr>\n"
+	"<tr>\n<td>MODE</td>\n<td style=\"background: #ffffff;\">{{wifiMode}}</td>\n</tr>\n"
+	"<tr>\n<td>SSID</td>\n<td style=\"background: #ffffff;\">{{ssid}}</td>\n</tr>\n"
+	"<tr>\n<td>RSSI</td>\n"
+	"{{#if wifiConnected}}"
+	"<td style=\"background: #ffffff;\">{{rssi}} dBm</td>\n"
+	"{{else}}"
+	"<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disconnect</td>\n"
+	"{{/if}}"
+	"</tr>\n</table>\n<br />\n"
+	"{{#if bluetooth}}"
+	"<table>\n<tr>\n<th colspan=\"2\">Bluetooth</th>\n</tr>\n"
+	"<td>Master</td>\n"
+	"{{#if bluetooth.master}}"
+	"<td style=\"background:#0b0; color:#030; width:50%;\">Enabled</td>\n"
+	"{{else}}"
+	"<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n"
+	"{{/if}}"
+	"</tr>\n<tr>\n<tr>\n<td>NAME</td>\n<td style=\"background: #ffffff;\">{{bluetooth.name}}</td>\n</tr>\n"
+	"<tr>\n<tr>\n<td>MODE</td>\n<td style=\"background: #ffffff;\">{{bluetooth.mode}}</td>\n</tr>\n<tr>\n</table>\n"
+	"{{/if}}"
+	"</div>\n</div>\n\n"
+	"<div class=\"content\">\n<div id=\"lastHeard\">\n"
+	"<table id=\"aprsTable\">\n<thread>\n"
+	"<th colspan=\"7\" style=\"background-color: #070ac2;\">LAST HEARD <a href=\"/tnc2\" target=\"_tnc2\" style=\"color: yellow;font-size:8pt\">[RAW]</a></th>\n"
+	"<tr>\n<th data-sort=\"time\" style=\"min-width:10ch\"><span><b>Time ({{tzStr}})</b></span><span class=\"arrow\"></span></th>\n"
+	"<th style=\"min-width:16px\">ICON</th>\n"
+	"<th data-sort=\"callsign\" style=\"min-width:10ch\">Callsign<span class=\"arrow\"></span></th>\n"
+	"<th>VIA LAST PATH</th>\n"
+	"<th data-sort=\"dx\" style=\"min-width:5ch\">DX<span class=\"arrow\"></span></th>\n"
+	"<th data-sort=\"packet\" style=\"min-width:5ch\">PACKET<span class=\"arrow\"></span></th>\n"
+	"<th data-sort=\"audio\" style=\"min-width:5ch\">AUDIO<span class=\"arrow\"></span></th>\n"
+	"</tr></thread>\n<tbody id=\"aprsTableBody\"></tbody>\n"
+	"</table>\n</div>\n";
 
 void handle_dashboard(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
-	{
-		return request->requestAuthentication();
-	}
-
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
 	char temp_buffer[200];
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(4096); // Initial buffer size, adjust as needed
-	if (!webString)
-	{
-		return; // Memory allocation failed
-	}
-
+	// if (!request->authenticate(config.http_username, config.http_password))
+	// {
+	// 	return request->requestAuthentication();
+	// }
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
-	strcpy(webString, "<script type=\"text/javascript\">\n");
-	strcat(webString, "function reloadSysInfo() {\n");
-	strcat(webString, "$(\"#sysInfo\").load(\"/sysinfo\", function () { setTimeout(reloadSysInfo, 60000) });\n");
-	strcat(webString, "}\n");
-	strcat(webString, "setTimeout(reloadSysInfo(), 100);\n");
-	strcat(webString, "function reloadSidebarInfo() {\n");
-	strcat(webString, "$(\"#sidebarInfo\").load(\"/sidebarInfo\", function () { setTimeout(reloadSidebarInfo, 10000) });\n");
-	strcat(webString, "}\n");
-	strcat(webString, "setTimeout(reloadSidebarInfo, 1000);\n");
-	strcat(webString, "$(window).trigger('resize');\n");
 
-	strcat(webString, "</script>\n");
+	JsonDocument data;
 
-	strcat(webString, "<div id=\"sysInfo\">\n");
-	strcat(webString, "</div>\n");
+	data["rf"] = config.rf_en; // truthy flag for {{#if rf}}
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_tx);
+	data["freqTx"] = temp_buffer;
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_rx);
+	data["freqRx"] = temp_buffer;
+	data["txPower"] = config.rf_power ? "HIGH" : "LOW";
 
-	strcat(webString, "<br />\n");
-	strcat(webString, "<div class=\"nav-status\">\n");
-	strcat(webString, "<div id=\"sidebarInfo\">\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "<br />\n");
-
-	strcat(webString, "<table>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<th colspan=\"2\">Radio Info</th>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Frequency</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.3f MHz</td>\n", config.rf_freq);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Modem Mode</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", RF_MODE[config.rf_mode]);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Band Width</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.1f Khz</td>\n", config.rf_bw);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	if (config.rf_mode == RF_MODE_LoRa)
-	{
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>SF/CR</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%d/%d</td>\n", config.rf_sf, config.rf_cr);
-		strcat(webString, temp_buffer);
-		strcat(webString, "</tr>\n");
-	}
-	else
-	{
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>Baud Rate</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.1f Kbps</td>\n", config.rf_br);
-		strcat(webString, temp_buffer);
-		strcat(webString, "</tr>\n");
-	}
-
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>TX Power</td>\n");
-	if (config.rf_power >= 0)
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">+%d dBm</td>\n", config.rf_power);
-	else
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">-%d dBm</td>\n", config.rf_power);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "</table>\n");
-	strcat(webString, "\n");
-
-#ifdef RF2
-	strcat(webString, "<table>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<th colspan=\"2\">Radio#2 Info</th>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Frequency</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.3f MHz</td>\n", config.rf1_freq);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Modem Mode</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", RF_MODE[config.rf1_mode]);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>Band Width</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.1f Khz</td>\n", config.rf1_bw);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	if (config.rf_mode == RF_MODE_LoRa)
-	{
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>SF/CR</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%d/%d</td>\n", config.rf1_sf, config.rf1_cr);
-		strcat(webString, temp_buffer);
-		strcat(webString, "</tr>\n");
-	}
-	else
-	{
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>Baud Rate</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%.1f Kbps</td>\n", config.rf1_br);
-		strcat(webString, temp_buffer);
-		strcat(webString, "</tr>\n");
-	}
-
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>TX Power</td>\n");
-	if (config.rf1_power >= 0)
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">+%d dBm</td>\n", config.rf1_power);
-	else
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">-%d dBm</td>\n", config.rf1_power);
-	strcat(webString, temp_buffer);
-	strcat(webString, "</tr>\n");
-	strcat(webString, "</table>\n");
-	strcat(webString, "\n");
-#endif
+	data["modem"] = MODEM_TYPE[config.modem_type];
+	data["fx25"] = FX25_MODE[config.fx25_mode];
 
 	if (config.igate_en)
 	{
-		strcat(webString, "<br />\n");
-		strcat(webString, "<table>\n");
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<th colspan=\"2\">APRS-IS SERVER</th>\n");
-		strcat(webString, "</tr>\n");
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>HOST</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", config.igate_host);
-		strcat(webString, temp_buffer);
-
-		strcat(webString, "</tr>\n");
-		strcat(webString, "<tr>\n");
-		strcat(webString, "<td>PORT</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%d</td>\n", config.aprs_port);
-		strcat(webString, temp_buffer);
-
-		strcat(webString, "</tr>\n");
-		strcat(webString, "</table>\n");
+		JsonObject igate = data["igate"].to<JsonObject>();
+		igate["host"] = config.aprs_host;
+		igate["port"] = config.aprs_port;
 	}
-	strcat(webString, "<br />\n");
-	strcat(webString, "<table>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<th colspan=\"2\">WiFi</th>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>MODE</td>\n");
+
 	const char *strWiFiMode = "OFF";
-	if (config.wifi_mode == WIFI_STA_FIX)
-	{
-		strWiFiMode = "STA";
-	}
-	else if (config.wifi_mode == WIFI_AP_FIX)
-	{
-		strWiFiMode = "AP";
-	}
-	else if (config.wifi_mode == WIFI_AP_STA_FIX)
-	{
-		strWiFiMode = "AP+STA";
-	}
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", strWiFiMode);
-	strcat(webString, temp_buffer);
-
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>SSID</td>\n");
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", WiFi.SSID().c_str());
-	strcat(webString, temp_buffer);
-
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>RSSI</td>\n");
+	if (config.wifi_mode == WIFI_STA_FIX) strWiFiMode = "STA";
+	else if (config.wifi_mode == WIFI_AP_FIX) strWiFiMode = "AP";
+	else if (config.wifi_mode == WIFI_AP_STA_FIX) strWiFiMode = "AP+STA";
+	data["wifiMode"] = strWiFiMode;
+	data["ssid"] = WiFi.SSID();
+	data["wifiConnected"] = WiFi.isConnected();
 	if (WiFi.isConnected())
-	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%d dBm</td>\n", WiFi.RSSI());
-		strcat(webString, temp_buffer);
-	}
-	else
-		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disconnect</td>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "</table>\n");
-	strcat(webString, "<br />\n");
+		data["rssi"] = WiFi.RSSI();
+
 #ifdef BLUETOOTH
-	strcat(webString, "<table>\n");
-	strcat(webString, "<tr>\n");
-
-	strcat(webString, "<th colspan=\"2\">Bluetooth</th>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<td>Master</td>\n");
-	if (config.bt_master)
-		strcat(webString, "<td style=\"background:#0b0; color:#030; width:50%;\">Enabled</td>\n");
-	else
-		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n");
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>NAME</td>\n");
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", config.bt_name);
-	strcat(webString, temp_buffer);
-
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<td>MODE</td>\n");
-	const char *btMode = "";
-	if (config.bt_mode == 1)
-	{
-		btMode = "TNC2";
-	}
-	else if (config.bt_mode == 2)
-	{
-		btMode = "KISS";
-	}
-	else
-	{
-		btMode = "NONE";
-	}
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%s</td>\n", btMode);
-	strcat(webString, temp_buffer);
-
-	strcat(webString, "</tr>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "</table>\n");
+	JsonObject bt = data["bluetooth"].to<JsonObject>();
+	bt["master"] = config.bt_master;
+	bt["name"] = config.bt_name;
+	if (config.bt_mode == 1) bt["mode"] = "TNC2";
+	else if (config.bt_mode == 2) bt["mode"] = "KISS";
+	else bt["mode"] = "NONE";
 #endif
-	strcat(webString, "</div>\n");
 
-	strcat(webString, "</div>\n");
-	strcat(webString, "\n");
-	strcat(webString, "<div class=\"content\">\n");
-	strcat(webString, "<div id=\"lastHeard\">\n");
-	strcat(webString, "<table id=\"aprsTable\">\n<thread>\n");
-	strcat(webString, "<th colspan=\"8\" style=\"background-color: #070ac2;\">LAST HEARD <a href=\"/tnc2\" target=\"_tnc2\" style=\"color: yellow;font-size:8pt\">[RAW]</a></th>\n");
-	strcat(webString, "<tr>\n");
-	strcat(webString, "<th data-sort=\"time\" style=\"min-width:10ch\"><span><b>Time (");
 	if (config.timeZone >= 0)
-		strcat(webString, "+");
-	// else
-	//	strcat(webString, "-");
-
-	if (config.timeZone == (int)config.timeZone)
 	{
-		sprintf(temp_buffer, "%d", (int)config.timeZone);
-		strcat(webString, temp_buffer);
-		strcat(webString, ")</b></span><span class=\"arrow\"></span></th>\n");
+		if (config.timeZone == (int)config.timeZone)
+			snprintf(temp_buffer, sizeof(temp_buffer), "+%d", (int)config.timeZone);
+		else
+			snprintf(temp_buffer, sizeof(temp_buffer), "+%.1f", config.timeZone);
 	}
 	else
 	{
-		sprintf(temp_buffer, "%.1f", config.timeZone);
-		strcat(webString, temp_buffer);
-		strcat(webString, ")</b></span><span class=\"arrow\"></span></th>\n");
+		if (config.timeZone == (int)config.timeZone)
+			snprintf(temp_buffer, sizeof(temp_buffer), "%d", (int)config.timeZone);
+		else
+			snprintf(temp_buffer, sizeof(temp_buffer), "%.1f", config.timeZone);
 	}
-	strcat(webString, "<th style=\"min-width:16px\">ICON</th>\n");
-	strcat(webString, "<th data-sort=\"callsign\" style=\"min-width:10ch\">Callsign<span class=\"arrow\"></span></th>\n");
-	strcat(webString, "<th>VIA LAST PATH</th>\n");
-	strcat(webString, "<th data-sort=\"dx\" style=\"min-width:5ch\">DX<span class=\"arrow\"></span></th>\n");
-	strcat(webString, "<th data-sort=\"packet\" style=\"min-width:5ch\">PACKET<span class=\"arrow\"></span></th>\n");
-	strcat(webString, "<th data-sort=\"rssi\" style=\"min-width:5ch\">RSSI<span class=\"arrow\"></span></th>\n");
-	strcat(webString, "<th data-sort=\"freq\" style=\"min-width:5ch\">FreqErr<span class=\"arrow\"></span></th>\n");
-	strcat(webString, "</tr></thread>\n<tbody id=\"aprsTableBody\"></tbody>\n");
-	strcat(webString, "</table>\n");
-	strcat(webString, "</div>\n");
+	data["tzStr"] = temp_buffer;
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("dashboard", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(webString);
+	String html = renderTemplate(DASHBOARD_TEMPLATE, data.as<JsonVariant>());
+	sendHtmlChunked(request, html, "dashboard");
 	lastHeardTimeout = millis() + 500;
 	lastHeard_Flag = true;
 }
+
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+// Nota: o rewrite corrigiu um bug de sintaxe pre-existente no bloco #ifdef MQTT
+// (um "print(...;);" com ponto-e-virgula sobrando dentro dos parenteses -
+// nunca compilava porque MQTT nao estava definido em nenhum build atual, por
+// isso nunca deu erro visivel) - a versao em template nao carrega esse bug.
+static const char *SIDEBAR_TEMPLATE =
+	"<table style=\"background:white;border-collapse: unset;\">\n"
+	"<tr>\n<th colspan=\"2\">Modes Enabled</th>\n</tr>\n<tr>\n"
+	"{{#if igate}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">IGATE</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">IGATE</th>\n{{/if}}"
+	"{{#if digi}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">DIGI</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">DIGI</th>\n{{/if}}"
+	"</tr>\n<tr>\n"
+	"{{#if wx}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">WX</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">WX</th>\n{{/if}}"
+	"{{#if tracker}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">TRACKER</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">TRACKER</th>\n{{/if}}"
+	"</tr>\n</table>\n<br />\n"
+	"<table style=\"background:white;border-collapse: unset;\">\n"
+	"<tr>\n<th colspan=\"2\">Network Status</th>\n</tr>\n<tr>\n"
+	"{{#if aprsis}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">APRS-IS</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">APRS-IS</th>\n{{/if}}"
+	"{{#if vpn}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">VPN</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">VPN</th>\n{{/if}}"
+	"</tr>\n<tr>\n"
+	"{{#if pppos}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">PPPoS</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">PPPoS</th>\n{{/if}}"
+	"{{#if mqttCompiled}}"
+	"{{#if mqtt}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">MQTT</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">MQTT</th>\n{{/if}}"
+	"{{/if}}"
+	"{{#if fx25}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">FX.25</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">FX.25</th>\n{{/if}}"
+	"</tr>\n</table>\n<br />\n"
+	"<table>\n<tr>\n<th colspan=\"2\">STATISTICS</th>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">RADIO RX:</td>\n<td style=\"background: #ffffff;\">{{rxCount}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">PACKET RX:</td>\n<td style=\"background: #ffffff;\">{{allCount}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">PACKET TX:</td>\n<td style=\"background: #ffffff;\">{{txCount}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">RF2INET:</td>\n<td style=\"background: #ffffff;\">{{rf2inet}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">INET2RF:</td>\n<td style=\"background: #ffffff;\">{{inet2rf}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">DIGI:</td>\n<td style=\"background: #ffffff;\">{{digiCount}}</td>\n</tr>\n"
+	"<tr>\n<td style=\"width: 60px;text-align: right;\">DROP/ERR:</td>\n<td style=\"background: #ffffff;\">{{dropCount}}/{{errorCount}}</td>\n</tr>\n"
+	"</table>\n<br />\n"
+	"{{#if gnss}}"
+	"<table>\n<tr>\n<th colspan=\"2\">GPS Info <a href=\"/gnss\" target=\"_gnss\" style=\"color: yellow;font-size:8pt\">[View]</a></th>\n</tr>\n"
+	"<tr>\n<td>LAT:</td>\n<td style=\"background: #ffffff;text-align: left;\">{{gnss.lat}}</td>\n</tr>\n"
+	"<tr>\n<td>LON:</td>\n<td style=\"background: #ffffff;text-align: left;\">{{gnss.lon}}</td>\n</tr>\n"
+	"<tr>\n<td>ALT:</td>\n<td style=\"background: #ffffff;text-align: left;\">{{gnss.alt}}</td>\n</tr>\n"
+	"<tr>\n<td>SAT:</td>\n<td style=\"background: #ffffff;text-align: left;\">{{gnss.sat}}</td>\n</tr>\n"
+	"</table>\n"
+	"{{/if}}"
+	"<script>\n$(window).trigger('resize');\n</script>\n";
 
 void handle_sidebar(AsyncWebServerRequest *request)
 {
@@ -776,317 +908,219 @@ void handle_sidebar(AsyncWebServerRequest *request)
 		return request->requestAuthentication();
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *html = allocateStringMemory(4096); // Initial buffer size, adjust as needed
-	if (!html)
-	{
-		return; // Memory allocation failed
-	}
-
-	strcpy(html, "<table style=\"background:white;border-collapse: unset;\">\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<th colspan=\"2\">Modes Enabled</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	if (config.igate_en)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">IGATE</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">IGATE</th>\n");
-
-	if (config.digi_en)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">DIGI</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">DIGI</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	if (config.wx_en)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">WX</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">WX</th>\n");
-	if (config.trk_en)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">TRACKER</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\">TRACKER</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "</table>\n");
-	strcat(html, "<br />\n");
-	strcat(html, "<table style=\"background:white;border-collapse: unset;\">\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<th colspan=\"2\">Network Status</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	if (aprsClient.connected() == true)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">APRS-IS</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">APRS-IS</th>\n");
-	if (wireguard_active() == true)
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">VPN</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">VPN</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-// strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">4G LTE</th>\n");
+	JsonDocument data;
+	data["igate"] = config.igate_en;
+	data["digi"] = config.digi_en;
+	data["wx"] = config.wx_en;
+	data["tracker"] = config.trk_en;
+	data["aprsis"] = aprsClient.connected();
+	data["vpn"] = wireguard_active();
 #ifdef PPPOS
-	if (PPP.connected())
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">PPPoS</th>\n");
-	else
+	data["pppos"] = PPP.connected();
+#else
+	data["pppos"] = false;
 #endif
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">PPPoS</th>\n");
 #ifdef MQTT
-	if (clientMQTT.connected())
-		strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">MQTT</th>\n");
-	else
-		strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">MQTT</th>\n");
+	data["mqttCompiled"] = true;
+	data["mqtt"] = clientMQTT.connected();
+#else
+	data["mqttCompiled"] = false;
 #endif
-	// if (config.fx25_mode > 0)
-	// 	strcat(html, "<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">FX.25</th>\n");
-	// else
-	// 	strcat(html, "<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">FX.25</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "</table>\n");
-	strcat(html, "<br />\n");
-	strcat(html, "<table>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<th colspan=\"2\">STATISTICS</th>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">RADIO RX:</td>\n");
+	data["fx25"] = config.fx25_mode > 0;
 
-	// Convert numeric values to strings using temporary buffers
-	char temp_buffer[64];
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.rxCount);
-	strcat(html, temp_buffer);
+	data["rxCount"] = status.rxCount;
+	data["allCount"] = status.allCount;
+	data["txCount"] = status.txCount;
+	data["rf2inet"] = status.rf2inet;
+	data["inet2rf"] = status.inet2rf;
+	data["digiCount"] = status.digiCount;
+	data["dropCount"] = status.dropCount;
+	data["errorCount"] = status.errorCount;
 
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">PACKET RX:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.allCount);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">PACKET TX:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.txCount);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">RF2INET:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.rf2inet);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">INET2RF:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.inet2rf);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">DIGI:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.digiCount);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td style=\"width: 60px;text-align: right;\">DROP/ERR:</td>\n");
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu/", status.dropCount);
-	strcat(html, temp_buffer);
-	snprintf(temp_buffer, sizeof(temp_buffer), "%lu</td>\n", status.errorCount);
-	strcat(html, temp_buffer);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "</table>\n");
-	strcat(html, "<br />\n");
 	if (config.gnss_enable)
 	{
-		strcat(html, "<table>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<th colspan=\"2\">GPS Info <a href=\"/gnss\" target=\"_gnss\" style=\"color: yellow;font-size:8pt\">[View]</a></th>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td>LAT:</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;text-align: left;\">%f</td>\n", gps.location.lat());
-		strcat(html, temp_buffer);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td>LON:</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;text-align: left;\">%f</td>\n", gps.location.lng());
-		strcat(html, temp_buffer);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td>ALT:</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;text-align: left;\">%f</td>\n", gps.altitude.meters());
-		strcat(html, temp_buffer);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td>SAT:</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;text-align: left;\">%d</td>\n", gps.satellites.value());
-		strcat(html, temp_buffer);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "</table>\n");
+		JsonObject gnss = data["gnss"].to<JsonObject>();
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%f", gps.location.lat());
+		gnss["lat"] = buf;
+		snprintf(buf, sizeof(buf), "%f", gps.location.lng());
+		gnss["lon"] = buf;
+		snprintf(buf, sizeof(buf), "%f", gps.altitude.meters());
+		gnss["alt"] = buf;
+		gnss["sat"] = gps.satellites.value();
 	}
-	strcat(html, "<script>\n");
-	strcat(html, "$(window).trigger('resize');\n");
-	strcat(html, "</script>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-	response->addHeader("Sidebar", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(html); // Free the allocated memory
+	String html_str = renderTemplate(SIDEBAR_TEMPLATE, data.as<JsonVariant>());
+	sendHtmlChunked(request, html_str, "Sidebar");
 }
+
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+// Loop de linhas/colunas virou {{#each}} aninhado (tables -> rows -> cells);
+// a quebra de linha a cada 16 colunas e' feita em C++ ao montar o JSON (o
+// motor nao tem aritmetica de modulo na sintaxe do template, entao a divisao
+// em linhas continua sendo decidida no C++, so a impressao virou declarativa).
+static const char *SYMBOL_TEMPLATE =
+	"{{#each tables}}"
+	"<table border=\"1\" align=\"center\">\n"
+	"<tr><th colspan=\"16\">{{title}}</th></tr>\n"
+	"{{#each rows}}"
+	"<tr>\n"
+	"{{#each this}}<td><img onclick=\"{{onclick}}\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{icon}}\"></td>{{/each}}"
+	"</tr>\n"
+	"{{/each}}"
+	"</table>\n<br />"
+	"{{/each}}";
 
 void handle_symbol(AsyncWebServerRequest *request)
 {
-	int i;
 	int sel = -1;
-	for (i = 0; i < request->args(); i++)
+	for (int i = 0; i < request->args(); i++)
 	{
 		if (request->argName(i) == "sel")
 		{
-			if (request->arg(i) != "")
+			if (request->arg(i) != "" && isValidNumber(request->arg(i)))
 			{
-				if (isValidNumber(request->arg(i)))
-				{
-					sel = request->arg(i).toInt();
-				}
+				sel = request->arg(i).toInt();
 			}
 		}
 	}
 
-	char *web = allocateStringMemory(22000); // Initial buffer size, adjust as needed
-	if (web)
+	JsonDocument data;
+	JsonArray tables = data["tables"].to<JsonArray>();
+	char buf[64];
+	for (int suffix = 1; suffix <= 2; suffix++)
 	{
-		strcat(web, "<table border=\"1\" align=\"center\">\n");
-		strcat(web, "<tr><th colspan=\"16\">Table '/'</th></tr>\n");
-		strcat(web, "<tr>\n");
-		char lnk[200];
-		for (i = 33; i < 129; i++)
+		JsonObject table = tables.add<JsonObject>();
+		table["title"] = (suffix == 1) ? "Table '/'" : "Table '\\'";
+		JsonArray rows = table["rows"].to<JsonArray>();
+		JsonArray row = rows.add<JsonArray>();
+		for (int i = 33; i < 129; i++)
 		{
-			memset(lnk, 0, sizeof(lnk));
-			//<td><img onclick="window.opener.setValue(113,2);" src="http://aprs.nakhonthai.net/symbols/icons/113-2.png"></td>
+			JsonObject cell = row.add<JsonObject>();
 			if (sel == -1)
-				sprintf(lnk, "<td><img onclick=\"window.opener.setValue(%d,1);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-1.png\"></td>", i, i);
+				snprintf(buf, sizeof(buf), "window.opener.setValue(%d,%d);", i, suffix);
 			else
-				sprintf(lnk, "<td><img onclick=\"window.opener.setValue(%d,%d,1);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-1.png\"></td>", sel, i, i);
-			strcat(web, lnk);
+				snprintf(buf, sizeof(buf), "window.opener.setValue(%d,%d,%d);", sel, i, suffix);
+			cell["onclick"] = buf;
+			snprintf(buf, sizeof(buf), "%d-%d.png", i, suffix);
+			cell["icon"] = buf;
 
 			if (((i % 16) == 0) && (i < 126))
-				strcat(web, "</tr>\n<tr>\n");
+				row = rows.add<JsonArray>();
 		}
-		strcat(web, "</tr>");
-		strcat(web, "</table>\n<br />");
-		strcat(web, "<table border=\"1\" align=\"center\">\n");
-		strcat(web, "<tr><th colspan=\"16\">Table '\\'</th></tr>\n");
-		strcat(web, "<tr>\n");
-		for (i = 33; i < 129; i++)
-		{
-			memset(lnk, 0, sizeof(lnk));
-			if (sel == -1)
-				sprintf(lnk, "<td><img onclick=\"window.opener.setValue(%d,2);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-2.png\"></td>", i, i);
-			else
-				sprintf(lnk, "<td><img onclick=\"window.opener.setValue(%d,%d,2);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-2.png\"></td>", sel, i, i);
-			strcat(web, lnk);
-			if (((i % 16) == 0) && (i < 126))
-				strcat(web, "</tr>\n<tr>\n");
-		}
-		strcat(web, "</tr>");
-		strcat(web, "</table>\n");
-		size_t len = strlen(web);
-		AsyncWebServerResponse *response = request->beginResponse_P(200, String(F("text/html")), (const uint8_t *)web, len);
-		response->addHeader("Symbol", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(web);
+	}
+
+	String html_str = renderTemplate(SYMBOL_TEMPLATE, data.as<JsonVariant>());
+	AsyncResponseStream *web = request->beginResponseStream("text/html", html_str.length() + 200);
+	if (web)
+	{
+		web->print(html_str);
+		web->addHeader("Symbol", "content");
+		web->addHeader("Cache-Control", "no-cache");
+		request->send(web);
 	}
 }
 
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+static const char *SYSINFO_TEMPLATE =
+	"<table style=\"table-layout: fixed;border-collapse: unset;border-radius: 10px;border-color: #ee800a;border-style: ridge;border-spacing: 1px;border-width: 4px;background: #ee800a;\">\n"
+	"<tr>\n"
+	"<th><span><b>Up Time</b></span></th>\n"
+	"<th><span>RAM(KByte)</span></th>\n"
+	"{{#if psram}}<th><span>PSRAM(KByte)</span></th>\n{{/if}}"
+	"<th><span>SPIFFS(KByte)</span></th>\n"
+	"{{#if vbat}}<th><span>VBat(V)</span></th>\n{{/if}}"
+	"<th><span>CPU(Mhz)</span></th>\n"
+	"<th><span>CPU.Temp(\xc2\xb0" "C)</span></th>\n"
+	"</tr>\n<tr>\n"
+	"<td><b>{{upTime}}</b></td>\n"
+	"<td><b>{{ram}}</b></td>\n"
+	"{{#if psram}}<td><b>{{psram}}</b></td>\n{{/if}}"
+	"<td><b>{{spiffs}}</b></td>\n"
+	"{{#if vbat}}<td><b>{{vbat}}</b></td>\n{{/if}}"
+	"<td><b>{{cpuMhz}}</b></td>\n"
+	"<td><b>{{cpuTemp}}</b></td>\n"
+	"</tr>\n</table>\n";
+
 void handle_sysinfo(AsyncWebServerRequest *request)
 {
-	// Using dynamic memory allocation instead of String
-	char *html = allocateStringMemory(1024); // Initial buffer size, adjust as needed
-	if (!html)
-	{
-		return; // Memory allocation failed
-	}
+	JsonDocument data;
+	char temp_buffer[64];
 
-	strcpy(html, "<table style=\"table-layout: fixed;border-collapse: unset;border-radius: 10px;border-color: #ee800a;border-style: ridge;border-spacing: 1px;border-width: 4px;background: #ee800a;\">\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<th><span><b>Up Time</b></span></th>\n");
-	strcat(html, "<th><span>RAM(KByte)</span></th>\n");
-#ifdef BOARD_HAS_PSRAM
-	strcat(html, "<th><span>PSRAM(KByte)</span></th>\n");
-#endif
-	strcat(html, "<th><span>SPIFFS(KByte)</span></th>\n");
-	if (VBat_Flag){
-		strcat(html, "<th><span>VBat(V)</span></th>\n");
-	}
-	strcat(html, "<th><span>CPU(Mhz)</span></th>\n");
-	strcat(html, "<th><span>CPU.Temp(°C)</span></th>\n");
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	// time_t tn = time(NULL) - systemUptime;
-	//  char* uptime = String(day(tn) - 1, DEC) + "D " + String(hour(tn), DEC) + ":" + String(minute(tn), DEC) + ":" + String(second(tn), DEC);
-	// String uptime = String(day(tn) - 1, DEC) + "D " + String(hour(tn), DEC) + ":" + String(minute(tn), DEC);
 	char strTime[20];
 	convertSecondsToDHMS(strTime, (millis() / 1000) - upTimeStamp);
+	data["upTime"] = strTime;
 
-	char temp_buffer[512];
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%s</b></td>\n", strTime);
-	strcat(html, temp_buffer);
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%.1f/%.1f</b></td>\n", (float)ESP.getFreeHeap() / 1000, (float)ESP.getHeapSize() / 1000);
-	strcat(html, temp_buffer);
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.1f/%.1f", (float)ESP.getFreeHeap() / 1000, (float)ESP.getHeapSize() / 1000);
+	data["ram"] = temp_buffer;
 
 #ifdef BOARD_HAS_PSRAM
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%.1f/%.1f</b></td>\n", (float)ESP.getFreePsram() / 1000, (float)ESP.getPsramSize() / 1000);
-	strcat(html, temp_buffer);
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.1f/%.1f", (float)ESP.getFreePsram() / 1000, (float)ESP.getPsramSize() / 1000);
+	data["psram"] = temp_buffer;
 #endif
 
 	unsigned long cardTotal = LITTLEFS.totalBytes();
 	unsigned long cardUsed = LITTLEFS.usedBytes();
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%.1f/%.1f</b></td>\n", (double)cardUsed / 1024, (double)cardTotal / 1024);
-	strcat(html, temp_buffer);
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.1f/%.1f", (double)cardUsed / 1024, (double)cardTotal / 1024);
+	data["spiffs"] = temp_buffer;
 
 	if (VBat_Flag)
 	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%.2f</b></td>\n", VBat);
-		strcat(html, temp_buffer);
+		snprintf(temp_buffer, sizeof(temp_buffer), "%.2f", VBat);
+		data["vbat"] = temp_buffer;
 	}
 
-	snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%d</b></td>\n", ESP.getCpuFreqMHz());
-	strcat(html, temp_buffer);
+	data["cpuMhz"] = ESP.getCpuFreqMHz();
 
-	ESPCPUTemp tempSensor;
-	if (tempSensor.begin())
+	// CPU temp dashboard fix - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+	// The ESPCPUTemp lib refuses classic ESP32 (D0WD/D0WD-V3) outright ("not found" - unsupported
+	// by the official IDF driver on this chip), so we read the raw Arduino core sensor directly
+	// instead, same as the earlier v1.6H build did. Not officially calibrated on classic ESP32,
+	// but gives a usable relative reading instead of a permanent N/A.
+	float cpuTempC = temperatureRead();
+	if (!isnan(cpuTempC) && cpuTempC > -40.0f && cpuTempC < 125.0f)
 	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td><b>%.1f</b></td>\n", tempSensor.getTemp());
-		strcat(html, temp_buffer);
+		snprintf(temp_buffer, sizeof(temp_buffer), "%.1f", cpuTempC);
+		data["cpuTemp"] = temp_buffer;
 	}
 	else
 	{
-		strcat(html, "<td><b>N/A</b></td>\n");
+		data["cpuTemp"] = "N/A";
 	}
-	// html += "<td style=\"background: #f00\"><b>" + String(ESP.getCycleCount()) + "</b></td>\n";
-	strcat(html, "</tr>\n");
-	strcat(html, "</table>\n");
 
-	// request->send(200, "text/html", html); // send to someones browser when asked
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	String html_str = renderTemplate(SYSINFO_TEMPLATE, data.as<JsonVariant>());
+	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", html_str);
 	response->addHeader("Sysinfo", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
+}
+
+// Copy src into dest escaping characters that would break JSON string syntax
+// (", \) and stripping raw control bytes, so text taken from a TNC2 packet
+// (callsign, path, object/item name) can be embedded safely inside a JSON string.
+static void jsonEscapeCopy(char *dest, size_t destSize, const char *src)
+{
+	size_t j = 0;
+	for (size_t i = 0; src[i] != '\0' && j + 1 < destSize; i++)
+	{
+		unsigned char c = (unsigned char)src[i];
+		if (c == '"' || c == '\\')
+		{
+			if (j + 2 >= destSize)
+				break;
+			dest[j++] = '\\';
+			dest[j++] = (char)c;
+		}
+		else if (c < 0x20)
+		{
+			continue; // strip control bytes
+		}
+		else
+		{
+			dest[j++] = (char)c;
+		}
+	}
+	dest[j] = '\0';
 }
 
 void event_lastHeard(bool gethtml)
@@ -1100,7 +1134,8 @@ void event_lastHeard(bool gethtml)
 	struct tm tmstruct, tmNow;
 
 	// Using dynamic memory allocation instead of String
-	char temp_html[100];
+	// Sized to fit a fully-escaped path/LPath (up to 256 raw chars -> 512 escaped) plus JSON key/quote overhead
+	char temp_html[600];
 	char *html = allocateStringMemory(16384); // Initial buffer size, adjust as needed
 	if (html==nullptr)
 	{
@@ -1110,7 +1145,7 @@ void event_lastHeard(bool gethtml)
 
 	// log_d("Create html last heard");
 	localtime_r(&timeNow, &tmNow);
-	// strcat(webString, "  { time: \"21:54:23\", icon: \"91-1.png\", callsign: \"HS5TQA-7\", path: \"RF: WIDE1-1\", dx: 0.0, packet: 2, audio: -19.6 },\n");
+//strcat(webString, "  { time: \"21:54:23\", icon: \"91-1.png\", callsign: \"HS5TQA-7\", path: \"RF: WIDE1-1\", dx: 0.0, packet: 2, audio: -19.6 },\n");
 	strcpy(html, "[");
 	for (int i = 0; i < PKGLISTSIZE; i++)
 	{
@@ -1122,9 +1157,10 @@ void event_lastHeard(bool gethtml)
 			// if (pkg.raw == nullptr || pkg.length == 0)
 			// 	continue;
 			// bool validText = true;
-			// for (size_t ci = 0; ci < pkg.length; ci++)
+			// for (size_t ci = 0; ci < pkg.length-1; ci++)
 			// {
-			// 	if (!isprint((unsigned char)pkg.raw[ci]))
+			// 	//if (!isprint((unsigned char)pkg.raw[ci]))
+			// 	if((unsigned char)pkg.raw[ci] < 32 || (unsigned char)pkg.raw[ci] > 126)
 			// 	{
 			// 		validText = false;
 			// 		break;
@@ -1135,20 +1171,24 @@ void event_lastHeard(bool gethtml)
 
 			int packet = pkg.pkg;
 			char *pos_gt = strchr(pkg.raw, '>'); // Find first position of '>'
+			char *pos_colon = strchr(pkg.raw, ':');
+			if(pos_gt == nullptr || pos_colon == nullptr)
+				continue;
+			if(pos_colon < pos_gt)
+				continue;
 			int start_val = pos_gt ? (pos_gt - pkg.raw) : -1;
-			if (start_val > 3)
+			if (start_val > 3 && start_val < 10)
 			{
 				// Extract src_call substring
 				char src_call[11];
 				strncpy(src_call, pkg.raw, start_val);
 				src_call[start_val] = '\0';
-
 				memset(&aprs, 0, sizeof(pbuf_t));
 				aprs.buf_len = 300;
 				aprs.packet_len = pkg.length;
 				strncpy((char *)aprs.data, pkg.raw, aprs.packet_len < sizeof(aprs.data) ? aprs.packet_len : sizeof(aprs.data) - 1);
 
-				char *pos_colon = strchr(pkg.raw, ':');
+				//char *pos_colon = strchr(pkg.raw, ':');
 				char *pos_comma = strchr(pkg.raw, ',');
 				char *pos_gt2 = strstr(pkg.raw + 2, ">"); // Find '>' starting from position 2
 				char *pos_dash = pos_gt2 ? strchr(pos_gt2, '-') : NULL;
@@ -1189,10 +1229,10 @@ void event_lastHeard(bool gethtml)
 					// time_t tm = pkg.time;
 					localtime_r(&pkg.time, &tmstruct);
 					char strTime[20];
-					// if (tmNow.tm_mday == tmstruct.tm_mday)
+					//if (tmNow.tm_mday == tmstruct.tm_mday)
 					//	sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
-					// else
-					sprintf(strTime, "%02d %02d:%02d:%02d", tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
+					//else
+						sprintf(strTime, "%02d %02d:%02d:%02d", tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
 					// String str = String(tmstruct.tm_hour, DEC) + ":" + String(tmstruct.tm_min, DEC) + ":" + String(tmstruct.tm_sec, DEC);
 
 					// Append to html
@@ -1201,7 +1241,6 @@ void event_lastHeard(bool gethtml)
 					snprintf(temp_html, sizeof(temp_html), "{\"time\":\"%s\",", strTime);
 					strcat(html, temp_html);
 					char fileImg[64] = "";
-					bool pkgINET = false;
 					uint8_t sym = (uint8_t)aprs.symbol[1];
 					if (sym > 31 && sym < 127)
 					{
@@ -1214,10 +1253,10 @@ void event_lastHeard(bool gethtml)
 							// }
 							// else if (aprs.symbol[0] == 47)
 							// {
-							strcat(fileImg, "-1.png");
+								strcat(fileImg, "-1.png");
 							//}
 
-							// snprintf(temp_html, sizeof(temp_html), "<td><b>%c</b></td>", aprs.symbol[0]);
+							//snprintf(temp_html, sizeof(temp_html), "<td><b>%c</b></td>", aprs.symbol[0]);
 							snprintf(temp_html, sizeof(temp_html), "\"icon\":\"%s\",", fileImg);
 							strcat(html, temp_html);
 						}
@@ -1236,31 +1275,33 @@ void event_lastHeard(bool gethtml)
 							{
 								strcpy(fileImg, "dot.png");
 							}
-							// snprintf(temp_html, sizeof(temp_html), "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/%s\"></td>", fileImg);
+							//snprintf(temp_html, sizeof(temp_html), "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/%s\"></td>", fileImg);
 							snprintf(temp_html, sizeof(temp_html), "\"icon\":\"%s\",", fileImg);
 							strcat(html, temp_html);
 						}
 					}
 					else
 					{
-						// strcat(html, "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/dot.png\"></td>");
+						//strcat(html, "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/dot.png\"></td>");
 						strcat(html, "\"icon\":\"dot.png\",");
 					}
-
+					
+					char src_call_esc[23];
+					jsonEscapeCopy(src_call_esc, sizeof(src_call_esc), src_call);
 					if (aprs.srcname_len > 0 && aprs.srcname_len < 10) // Get Item/Object
 					{
 						char itemname[10];
 						memset(&itemname, 0, 10);
 						memcpy(&itemname, aprs.srcname, aprs.srcname_len);
-						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s(%s)\",", itemname, src_call);
+						char itemname_esc[21];
+						jsonEscapeCopy(itemname_esc, sizeof(itemname_esc), itemname);
+						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s(%s)\",", itemname_esc, src_call_esc);
+						strcat(html, temp_html);
+					}else{
+						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s\",", src_call_esc);
 						strcat(html, temp_html);
 					}
-					else
-					{
-						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s\",", src_call);
-						strcat(html, temp_html);
-					}
-					// strcat(html, "</td>");
+					//strcat(html, "</td>");
 					if (strlen(path) == 0)
 					{
 						strcat(html, "\"path\":\"RF: DIRECT\",");
@@ -1280,24 +1321,25 @@ void event_lastHeard(bool gethtml)
 							strncpy(LPath, path, sizeof(LPath) - 1);
 							LPath[sizeof(LPath) - 1] = '\0';
 						}
+						char path_esc[513];
 						// if(path.indexOf("qAR")>=0 || path.indexOf("qAS")>=0 || path.indexOf("qAC")>=0){ //Via from Internet Server
-						pkgINET = false;
 						if (strstr(path, "qA") != NULL || strstr(path, "TCPIP") != NULL)
 						{
-							snprintf(temp_html, sizeof(temp_html), "\"path\":\"INET:%s\",", LPath);
+							jsonEscapeCopy(path_esc, sizeof(path_esc), LPath);
+							snprintf(temp_html, sizeof(temp_html), "\"path\":\"INET:%s\",", path_esc);
 							strcat(html, temp_html);
-							pkgINET = true;
 						}
 						else
 						{
+							jsonEscapeCopy(path_esc, sizeof(path_esc), path);
 							if (strchr(path, '*') != NULL)
 							{
-								snprintf(temp_html, sizeof(temp_html), "\"path\":\"DIGI: %s\",", path);
+								snprintf(temp_html, sizeof(temp_html), "\"path\":\"DIGI: %s\",", path_esc);
 								strcat(html, temp_html);
 							}
 							else
 							{
-								snprintf(temp_html, sizeof(temp_html), "\"path\":\"RF: %s\",", path);
+								snprintf(temp_html, sizeof(temp_html), "\"path\":\"RF: %s\",", path_esc);
 								strcat(html, temp_html);
 							}
 						}
@@ -1327,13 +1369,14 @@ void event_lastHeard(bool gethtml)
 					}
 					snprintf(temp_html, sizeof(temp_html), "\"packet\":\"%d\",", packet);
 					strcat(html, temp_html);
-					if (pkgINET)
+					if (pkg.audio_level == 0)
 					{
-						strcat(html, "\"rssi\":\"-\",");
+						strcat(html, "\"audio\":\"-\"},");
 					}
 					else
 					{
-						float rssi = pkg.rssi;
+						double Vrms = (double)pkg.audio_level / 1000;
+						double audBV = 20.0F * log10(Vrms);
 						// if (audBV < -20.0F)
 						// {
 						// 	strcat(html, " audio:\"");
@@ -1346,31 +1389,17 @@ void event_lastHeard(bool gethtml)
 						// {
 						// 	strcat(html, "<td style=\"color: #008000;\">");
 						// }
-						snprintf(temp_html, sizeof(temp_html), "\"rssi\":\"%.1f\",", rssi);
+						snprintf(temp_html, sizeof(temp_html), "\"audio\":\"%.1f\"},", audBV);
 						strcat(html, temp_html);
-						// strcat(html, "dBV</td></tr>\n");
+						//strcat(html, "dBV</td></tr>\n");
 					}
-
-					if (config.rf_mode != RF_MODE_AIS)
-					{
-						if (pkg.freqErr == 0)
-						{
-							strcat(html, "\"freqErr\":\"-\"},");
-						}
-						else
-						{
-							snprintf(temp_html, sizeof(temp_html), "\"freqErr\":\"%dHz\"},", (int)pkg.freqErr);
-							strcat(html, temp_html);
-						}
-					}
-					// log_d("%s",html_ptr);
 				}
 			}
 		}
 	}
 	html[strlen(html) - 1] = '\0'; // Remove the last comma
 	if (html[0] == '[')
-		strcat(html, "]");
+	strcat(html, "]");
 
 	size_t len = strlen(html);
 	// char *info = (char *)calloc(len + 1, sizeof(char));
@@ -1393,42 +1422,43 @@ String event_chatMessage(bool gethtml)
 
 	struct tm tmstruct, tmNow;
 
-	// Using dynamic memory allocation instead of String
-	char *html = allocateStringMemory(4096); // Initial buffer size, adjust as needed
-	if (!html)
-	{
-		return String(""); // Memory allocation failed
-	}
+	// LU6JMF fix (Set/2026): the old fixed 4096-byte char* buffer + strcat()
+	// loop had no bounds checking. With PKGLISTSIZE=20 and long messages,
+	// the accumulated HTML could exceed 4096 bytes and overflow the heap
+	// buffer, corrupting adjacent memory (same class of bug as the earlier
+	// IGATE block_trim_free heap-corruption incident). Switched to a String
+	// that grows as needed - no fixed cap, no overflow.
+	String html;
+	html.reserve(2048);
 
 	time_t timen = time(NULL);
 	localtime_r(&timen, &tmNow);
 
-	strcpy(html, "<tr>\n");
-	strcat(html, "<th style=\"width:60pt\"><span><b>Time (");
+	html += "<tr>\n";
+	html += "<th style=\"width:60pt\"><span><b>Time (";
 	if (config.timeZone >= 0)
-		strcat(html, "+");
+		html += "+";
 
 	// Convert timezone to string
 	char temp_buffer[64];
 	if (config.timeZone == (int)config.timeZone)
 	{
 		snprintf(temp_buffer, sizeof(temp_buffer), "%d", (int)config.timeZone);
-		strcat(html, temp_buffer);
-		strcat(html, ")</b></span></th>\n");
+		html += temp_buffer;
+		html += ")</b></span></th>\n";
 	}
 	else
 	{
 		snprintf(temp_buffer, sizeof(temp_buffer), "%.1f", config.timeZone);
-		strcat(html, temp_buffer);
-		strcat(html, ")</b></span></th>\n");
+		html += temp_buffer;
+		html += ")</b></span></th>\n";
 	}
-	// strcat(html, "<th style=\"min-width:16px\">ICON</th>\n");
 
-	strcat(html, "<th style=\"width:70pt\">Callsign</th>\n");
-	strcat(html, "<th>Message</th>\n");
-	strcat(html, "<th style=\"width:10pt\">ACK</th>\n");
-	strcat(html, "<th style=\"width:20pt\">msgID</th>\n");
-	strcat(html, "</tr>\n");
+	html += "<th style=\"width:70pt\">Callsign</th>\n";
+	html += "<th>Message</th>\n";
+	html += "<th style=\"width:10pt\">ACK</th>\n";
+	html += "<th style=\"width:20pt\">msgID</th>\n";
+	html += "</tr>\n";
 
 	pkgMsgSort(msgQueue);
 	for (int i = 0; i < PKGLISTSIZE; i++)
@@ -1438,102 +1468,179 @@ String event_chatMessage(bool gethtml)
 		msgType pkg = getMsgList(i);
 		if (pkg.time > 0)
 		{
-			// String line = String(pkg.text); // Not needed anymore
-
 			pkg.callsign[10] = 0;
-			// time_t tm = pkg.time;
 			localtime_r(&pkg.time, &tmstruct);
 			char strTime[10];
-			// sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
 			if (tmNow.tm_mday == tmstruct.tm_mday)
 				sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
 			else
 				sprintf(strTime, "%dd %02d:%02d", tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min);
-			// String str = String(tmstruct.tm_hour, DEC) + ":" + String(tmstruct.tm_min, DEC) + ":" + String(tmstruct.tm_sec, DEC);
 
 			if (pkg.ack > 0)
 			{
-				strcat(html, "<tr style=\"background-color: #f1697dff;\">\n");
+				html += "<tr style=\"background-color: #f1697dff;\">\n";
 			}
 			else if (pkg.ack == -1)
 			{
-				strcat(html, "<tr style=\"background-color: #7ff1c5ff;\">\n");
+				html += "<tr style=\"background-color: #7ff1c5ff;\">\n";
 			}
 			else if (pkg.ack == -2)
 			{
-				strcat(html, "<tr style=\"background-color: #73caf0ff;\">\n");
+				html += "<tr style=\"background-color: #73caf0ff;\">\n";
 			}
 			else
 			{
-				strcat(html, "<tr style=\"background-color: #f55353ff;\">\n");
+				html += "<tr style=\"background-color: #f55353ff;\">\n";
 			}
 
-			strcat(html, "<td>");
-			strcat(html, strTime);
-			strcat(html, "</td>");
+			html += "<td>";
+			html += strTime;
+			html += "</td>";
 
-			strcat(html, "<td>");
-			strcat(html, pkg.callsign);
-			strcat(html, "</td>");
+			html += "<td>";
+			html += pkg.callsign;
+			html += "</td>";
 
-			strcat(html, "<td style=\"text-align: left;\">");
-			strcat(html, pkg.text);
-			strcat(html, "</td>");
+			html += "<td style=\"text-align: left;\">";
+			html += pkg.text;
+			html += "</td>";
 
 			if (pkg.ack > 0)
 			{
 				snprintf(temp_buffer, sizeof(temp_buffer), "<td>%d/%d</td>", pkg.ack, config.msg_retry);
-				strcat(html, temp_buffer);
+				html += temp_buffer;
 			}
 			else if (pkg.ack == -1)
 			{
-				strcat(html, "<td>RX</td>");
+				html += "<td>RX</td>";
 			}
 			else if (pkg.ack == -2)
 			{
-				strcat(html, "<td>TX</td>");
+				html += "<td>TX</td>";
 			}
 			else
 			{
-				strcat(html, "<td>TF</td>");
+				html += "<td>TF</td>";
 			}
 
 			snprintf(temp_buffer, sizeof(temp_buffer), "<td>%d</td></tr>\n", pkg.msgID);
-			strcat(html, temp_buffer);
+			html += temp_buffer;
 		}
 	}
 
-	size_t html_len = strlen(html);
-	log_d("HTML Length=%d Byte gethtml:%d event_cnt:%d", html_len, gethtml, message_events.count());
+	log_d("HTML Length=%d Byte gethtml:%d event_cnt:%d", html.length(), gethtml, message_events.count());
 
 	if (gethtml)
 	{
-		String result = String(html); // Convert back to String for return
-		free(html);					  // Free the allocated memory
-		return result;
+		return html;
 	}
 
 	if (message_events.count() > 0)
 	{
-		char *info = (char *)calloc(html_len + 1, sizeof(char)); // +1 for null terminator
-		if (info)
-		{
-			strcpy(info, html);
-			message_events.send(info, "chatMsg", time(NULL), 5000);
-			free(info);
-		}
+		message_events.send(html.c_str(), "chatMsg", time(NULL), 5000);
 	}
 
-	free(html); // Free the allocated memory
 	return String("");
 }
 
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+static const char *STORAGE_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"function sub(obj){"
+	"var fileName = obj.value.split('\\\\');"
+	"document.getElementById('file-input').innerHTML = '   '+ fileName[fileName.length-1];"
+	"}\n"
+	"$('form').submit(function(e){"
+	"e.preventDefault();"
+	"if(e.currentTarget.id === 'formDownload'){"
+	"var fd = new FormData(e.currentTarget);"
+	"window.open('/download?FILE=' + encodeURIComponent(fd.get('FILE')), '_blank');"
+	"return;"
+	"}"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id === 'upload_form'){ document.getElementById('upload_sumbit').disabled = true;"
+	"var formUp = $('#upload_form')[0];"
+	"var dataUp = new FormData(formUp);"
+	"$.ajax({"
+	"url: '/upload',"
+	"type: 'POST',"
+	"data: dataUp,"
+	"contentType: false,"
+	"processData:false,"
+	"xhr: function() {"
+	"var xhr = new window.XMLHttpRequest();"
+	"xhr.upload.addEventListener('progress', function(evt) {"
+	"if (evt.lengthComputable) {"
+	"var per = evt.loaded / evt.total;"
+	"$('#prg').html(Math.round(per*100) + '%');"
+	"$('#bar').css('width',Math.round(per*100) + '%');"
+	"}"
+	"}, false);"
+	"return xhr;"
+	"},"
+	"success:function(d, s) {"
+	"alert('Upload Success');"
+	"$(\"#contentmain\").load(\"/storage\");\n"
+	"},"
+	"error: function (a, b, c) {"
+	"}"
+	"});"
+	"}else{"
+	"$.ajax({"
+	"url: '/storage',"
+	"type: 'POST',"
+	"data: data,"
+	"contentType: false,"
+	"processData:false,"
+	"success:function(d, s) {"
+	"if(e.currentTarget.id===\"formDelete\") $(\"#contentmain\").load(\"/storage\");\n"
+	"},"
+	"error: function (a, b, c) {"
+	"}"
+	"});"
+	"}"
+	"});"
+	"</script>"
+	"<div style=\"font-size: 8pt;text-align:left;\">"
+	"<b>Total space: </b>{{totalStr}} ,"
+	"<b>Used space: </b>{{usedStr}}"
+	"</br>Listing directory: </b>{{dirname}}</div>\n"
+	"{{#if openFailed}}Failed to open directory\n{{/if}}"
+	"{{#if notDir}}Not a directory{{/if}}"
+	"<table border=\"1\"><tr align=\"center\" bgcolor=\"#03DDFC\"><th width=\"100\"><b>DIRECTORY</b></th><th><b>FILE NAME</b></th><th width=\"100\"><b>SIZE(Byte)</b></th><th width=\"170\"><b>DATE TIME</b></th><th width=\"50\"><b>DELETE</b></th><th width=\"100\"><b>DOWNLOAD</b></th></tr>"
+	"{{#each entries}}"
+	"{{#if isDir}}"
+	"<tr><td>{{name}}</td><td></td><td></td><td align=\"right\">{{dateStr}}</td><td></td></tr>\n"
+	"{{#each subfiles}}"
+	"<tr><td>{{dirName}}</td><td align=\"left\">{{name}}</td><td align=\"right\">{{size}}</td><td align=\"center\">{{dateStr}}</td><td></td><td></td></tr>\n"
+	"{{/each}}"
+	"{{else}}"
+	"<tr><td>/</td><td align=\"left\"><a href=\"/download?FILE={{name}}\" target=\"_blank\">{{name}}</a></td><td align=\"right\">{{size}}</td><td align=\"center\">{{dateStr}}</td>"
+	"{{#if deletable}}"
+	"<td align=\"center\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formDelete\" method=\"post\"><input name=\"delete\" type=\"hidden\" /><input name=\"FILE\" type=\"hidden\" value=\"{{name}}\" /><button name=\"commit\" id=\"btnDelete\" type=\"submit\" style=\"background-color:red;color:white\">X</button></form></td>\n"
+	"{{else}}<td></td>{{/if}}"
+	"<td align=\"center\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formDownload\" method=\"post\"><input name=\"download\" type=\"hidden\" /><input name=\"FILE\" type=\"hidden\" value=\"{{name}}\" /><button name=\"commit\" id=\"btnDownload\" type=\"submit\" style=\"background-color:green;color:white\">DOWNLOAD</button></form></td></tr>\n"
+	"{{/if}}"
+	"{{/each}}"
+	"</table>\n"
+	"<br><form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"upload_form\" method=\"post\" enctype=\"multipart/form-data\">\n"
+	"<table border=\"1\" style=\"margin-top:10px;width:100%;\">\n"
+	"<tr align=\"center\" bgcolor=\"#03DDFC\"><th colspan=\"3\"><b>UPLOAD FILE</b></th></tr>\n"
+	"<tr align=\"center\"><td width=\"60\" align=\"right\"><b>File:</b></td><td align=\"left\"><input type=\"file\" name=\"data\" required></td><td width=\"120\"><button class=\"button\" type='submit' id='upload_sumbit'>UPLOAD</button></td></tr>\n"
+	"</table>\n</form><br/>\n"
+	"</body>\n</html>\n";
+
 void handle_storage(AsyncWebServerRequest *request)
 {
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
+	adcEn = -1;
+	dacEn = -1;
+	delay(100);	
 
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -1555,14 +1662,14 @@ void handle_storage(AsyncWebServerRequest *request)
 #endif
 				if (LITTLEFS.remove("/" + path))
 				{
-					// html = "File deleted";
+					//html = "File deleted";
 #ifdef DEBUG
 					Serial.println("File deleted");
 #endif
 				}
 				else
 				{
-					// html = "Delete failed";
+					//html = "Delete failed";
 #ifdef DEBUG
 					Serial.println("Delete failed");
 #endif
@@ -1570,8 +1677,7 @@ void handle_storage(AsyncWebServerRequest *request)
 				break;
 			}
 		}
-	}
-	else if (request->hasArg("download"))
+	}else if (request->hasArg("download"))
 	{
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
@@ -1627,22 +1733,20 @@ void handle_storage(AsyncWebServerRequest *request)
 						dataType = "image/svg+xml";
 					else
 						dataType = "application/x-gzip";
-				}
-				else
-				{
+				}else{
 					dataType = "application/octet-stream";
 					path = path.substring(0, path.lastIndexOf("."));
-					// html = "File type not support";
-					// request->send_P(404, PSTR("text/plain"), PSTR("File type not support"));
-					// break;
+					//html = "File type not support";
+					//request->send_P(404, PSTR("text/plain"), PSTR("File type not support"));
+					//break;
 				}
 
 				if (path != "" && dataType != "")
 				{
 					String file = "/" + path;
-					// request->send(LITTLEFS, file, dataType, true);
+					//request->send(LITTLEFS, file, dataType, true);
 					AsyncWebServerResponse *response = request->beginResponse(LITTLEFS, file, dataType, true);
-					// response->addHeader("Content-Disposition","attachment");
+					//response->addHeader("Content-Disposition","attachment");
 					request->send(response);
 				}
 				else
@@ -1657,176 +1761,101 @@ void handle_storage(AsyncWebServerRequest *request)
 		}
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(8192); // Initial buffer size, adjust as needed
-	if (!webString)
-	{
-		return; // Memory allocation failed
-	}
+	JsonDocument data;
 
-	strcat(webString, "<script type=\"text/javascript\">\n"
-					  "function sub(obj){"
-					  "var fileName = obj.value.split('\\\\');"
-					  "document.getElementById('file-input').innerHTML = '   '+ fileName[fileName.length-1];"
-					  "}\n"
-					  //"var form = document.getElementById('upload_form');"
-					  "$('form').submit(function(e){"
-					  "e.preventDefault();"
-					  "var data = new FormData(e.currentTarget);\n"
-
-					  "if(e.currentTarget.id === 'upload_form'){ document.getElementById('upload_sumbit').disabled = true;"
-					  "var formUp = $('#upload_form')[0];"
-					  "var dataUp = new FormData(formUp);"
-					  //"document.getElementById('upload_sumbit').disabled = true;"
-					  "$.ajax({"
-					  "url: '/upload',"
-					  "type: 'POST',"
-					  "data: dataUp,"
-					  "contentType: false,"
-					  "processData:false,"
-					  "xhr: function() {"
-					  "var xhr = new window.XMLHttpRequest();"
-					  "xhr.upload.addEventListener('progress', function(evt) {"
-					  "if (evt.lengthComputable) {"
-					  "var per = evt.loaded / evt.total;"
-					  "$('#prg').html(Math.round(per*100) + '%');"
-					  "$('#bar').css('width',Math.round(per*100) + '%');"
-					  "}"
-					  "}, false);"
-					  "return xhr;"
-					  "},"
-					  "success:function(d, s) {"
-					  "alert('Upload Success');"
-					  "$(\"#contentmain\").load(\"/storage\");\n"
-					  "},"
-					  "error: function (a, b, c) {"
-					  "}"
-					  "});"
-					  //"});"
-					  "}else{"
-					  "$.ajax({"
-					  "url: '/storage',"
-					  "type: 'POST',"
-					  "data: data,"
-					  "contentType: false,"
-					  "processData:false,"
-					  "success:function(d, s) {"
-					  //"alert('Upload Success');"
-					  "if(e.currentTarget.id===\"formDelete\") $(\"#contentmain\").load(\"/storage\");\n"
-					  "},"
-					  "error: function (a, b, c) {"
-					  "}"
-					  "});"
-					  //"});"
-					  "}"
-					  "});"
-					  "</script>");
-
-	strcat(webString, "<div style=\"font-size: 8pt;text-align:left;\">");
-	strcat(webString, "<b>Total space: </b>");
-
-	char temp_buffer[512];
 	if (cardTotal > 1000000)
 	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "%.2f MByte ,", (double)cardTotal / 1048576);
-		strcat(webString, temp_buffer);
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.2f MByte", (double)cardTotal / 1048576);
+		data["totalStr"] = buf;
 	}
 	else
 	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "%.2f KByte ,", (double)cardTotal / 1024);
-		strcat(webString, temp_buffer);
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.2f KByte", (double)cardTotal / 1024);
+		data["totalStr"] = buf;
 	}
+	{
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.2f KByte", (double)cardUsed / 1024);
+		data["usedStr"] = buf;
+	}
+	data["dirname"] = dirname;
 
-	strcat(webString, "<b>Used space: </b>");
-	snprintf(temp_buffer, sizeof(temp_buffer), "%.2f KByte", (double)cardUsed / 1024);
-	strcat(webString, temp_buffer);
-
-	snprintf(temp_buffer, sizeof(temp_buffer), "</br>Listing directory: </b>%s</div>\n", dirname);
-	strcat(webString, temp_buffer);
+	JsonArray entries = data["entries"].to<JsonArray>();
 
 	File root = LITTLEFS.open(dirname);
-	if (!root)
-	{
-		strcat(webString, "Failed to open directory\n");
-		// return;
-	}
-	if (!root.isDirectory())
-	{
-		strcat(webString, "Not a directory");
-		// return;
-	}
+	bool openFailed = !root;
+	bool notDir = root && !root.isDirectory();
 
-	File file = root.openNextFile();
-	strcat(webString, "<table border=\"1\"><tr align=\"center\" bgcolor=\"#03DDFC\"><th width=\"100\"><b>DIRECTORY</b></th><th><b>FILE NAME</b></th><th width=\"100\"><b>SIZE(Byte)</b></th><th width=\"170\"><b>DATE TIME</b></th><th width=\"50\"><b>DELETE</b></th><th width=\"100\"><b>DOWNLOAD</b></th></tr>");
-	while (file)
+	if (root && root.isDirectory())
 	{
-		if (file.isDirectory())
+		File file = root.openNextFile();
+		while (file)
 		{
-			// webString += "<tr><td>DIR : ");
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td>%s</td>", file.name());
-			strcat(webString, temp_buffer);
-			time_t t = file.getLastWrite();
-			struct tm *tmstruct = localtime(&t);
-			sprintf(strTime, "<td></td><td></td><td align=\"right\">%d-%02d-%02d %02d:%02d:%02d</td>", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
-			strcat(webString, strTime);
-			// if (levels) {
-			//	listDir(fs, file.name(), levels - 1);
-			// }
-			strcat(webString, "<td></td></tr>\n");
+			JsonObject entry = entries.add<JsonObject>();
+			char buf[64];
+			if (file.isDirectory())
+			{
+				entry["isDir"] = true;
+				entry["name"] = file.name();
+				time_t t = file.getLastWrite();
+				struct tm *tmstruct = localtime(&t);
+				snprintf(buf, sizeof(buf), "%d-%02d-%02d %02d:%02d:%02d", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
+				entry["dateStr"] = buf;
+
+				// LU6JMF - Marcelo Ferreira:
+				// This listing only ever showed root-level files, so a file saved
+				// under a subfolder (like /templates/main_shell.html) was invisible
+				// here even though it was really on the filesystem - made it look
+				// like uploads into subfolders silently failed when they hadn't.
+				// List one level into the subfolder too (read-only, no
+				// delete/download - just enough to see what's really there).
+				JsonArray subfiles = entry["subfiles"].to<JsonArray>();
+				String subDirName = String(file.name());
+				File sub = LITTLEFS.open(subDirName);
+				if (sub && sub.isDirectory())
+				{
+					File subFile = sub.openNextFile();
+					while (subFile)
+					{
+						if (!subFile.isDirectory())
+						{
+							JsonObject se = subfiles.add<JsonObject>();
+							se["dirName"] = subDirName;
+							se["name"] = subFile.name();
+							se["size"] = subFile.size();
+							time_t st = subFile.getLastWrite();
+							struct tm *stmstruct = localtime(&st);
+							snprintf(buf, sizeof(buf), "%d-%02d-%02d %02d:%02d:%02d", (stmstruct->tm_year) + 1900, (stmstruct->tm_mon) + 1, stmstruct->tm_mday, stmstruct->tm_hour, stmstruct->tm_min, stmstruct->tm_sec);
+							se["dateStr"] = buf;
+						}
+						subFile = sub.openNextFile();
+					}
+				}
+			}
+			else
+			{
+				entry["isDir"] = false;
+				const char *fName = file.name();
+				entry["name"] = fName;
+				entry["size"] = file.size();
+				time_t t = file.getLastWrite();
+				struct tm *tmstruct = localtime(&t);
+				snprintf(buf, sizeof(buf), "%d-%02d-%02d %02d:%02d:%02d", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
+				entry["dateStr"] = buf;
+				entry["deletable"] = (strcmp(fName, "fsversion.txt") != 0);
+			}
+			file = root.openNextFile();
 		}
-		else
-		{
-			/*Serial.print("  FILE: ");
-			Serial.print(file.name());*/
-			// char *fName = String(file.name()).substring(1).c_str(); // Not needed for full path
-			const char *fName = file.name();
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td>/</td><td align=\"left\"><a href=\"/download?FILE=%s\" target=\"_blank\">%s</a></td>", fName, fName);
-			strcat(webString, temp_buffer);
-			// Serial.print("  SIZE: ");
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"right\">%d</td>", file.size());
-			strcat(webString, temp_buffer);
-			time_t t = file.getLastWrite();
-			struct tm *tmstruct = localtime(&t);
-			sprintf(strTime, "<td align=\"center\">%d-%02d-%02d %02d:%02d:%02d</td>", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
-			strcat(webString, strTime);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"center\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formDelete\" method=\"post\"><input name=\"delete\" type=\"hidden\" /><input name=\"FILE\" type=\"hidden\" value=\"%s\" /><button name=\"commit\" id=\"btnDelete\" type=\"submit\" style=\"background-color:red;color:white\">X</button></form></td>\n", fName);
-			strcat(webString, temp_buffer);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"center\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formDownload\" method=\"post\"><input name=\"download\" type=\"hidden\" /><input name=\"FILE\" type=\"hidden\" value=\"%s\" /><button name=\"commit\" id=\"btnDownload\" type=\"submit\" style=\"background-color:green;color:white\">DOWNLOAD</button></form></td></tr>\n", fName);
-			strcat(webString, temp_buffer);
-		}
-		file = root.openNextFile();
 	}
-	strcat(webString, "</table>\n");
-	// strcat(webString, "<form accept-charset=\"UTF-8\" action=\"/format\" class=\"form-horizontal\" id=\"format_form\" method=\"post\">\n");
-	// strcat(webString, "<br><div><button class=\"button\" type='submit' id='format_form_sumbit'  name=\"commit\"> FORMAT </button></div>\n");
-	// strcat(webString, "</form><br/>\n");
+	data["openFailed"] = openFailed;
+	data["notDir"] = notDir;
 
-	// UPLOAD CONFIGURATION FILE
-	strcat(webString, "<br><form accept-charset=\"UTF-8\" action=\"#\" "
-					  "class=\"form-horizontal\" id=\"upload_form\" method=\"post\" "
-					  "enctype=\"multipart/form-data\">\n");
-
-	strcat(webString, "<table border=\"1\" style=\"margin-top:10px;width:100%;\">\n");
-	strcat(webString, "<tr align=\"center\" bgcolor=\"#03DDFC\">"
-					  "<th colspan=\"3\"><b>UPLOAD FILE</b></th>"
-					  "</tr>\n");
-
-	strcat(webString, "<tr align=\"center\">"
-					  "<td width=\"60\" align=\"right\"><b>File:</b></td>"
-					  "<td align=\"left\"><input type=\"file\" name=\"data\" required></td>"
-					  "<td width=\"120\"><button class=\"button\" type='submit' id='upload_sumbit'>UPLOAD</button></td>"
-					  "</tr>\n");
-
-	strcat(webString, "</table>\n");
-	strcat(webString, "</form><br/>\n");
-
-	strcat(webString, "</body>\n</html>\n");
-
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("Sensor", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(webString); // Free the allocated memory
+	String html_str = renderTemplate(STORAGE_TEMPLATE, data.as<JsonVariant>());
+	sendHtmlChunked(request, html_str, "Sensor");
+	adcEn = 1;
+	dacEn = 0;
 }
 
 void handle_download(AsyncWebServerRequest *request)
@@ -1878,6 +1907,8 @@ void handle_download(AsyncWebServerRequest *request)
 		dataType = "application/pdf";
 	else if (path.endsWith(".zip"))
 		dataType = "application/zip";
+	else if (path.endsWith(".txt"))
+		dataType = "text/plain";
 	else if (path.endsWith(".cfg"))
 		dataType = "text/html";
 	else if (path.endsWith(".json"))
@@ -1983,24 +2014,336 @@ void handle_format(AsyncWebServerRequest *request)
 	request->send(200, "text/html", html); // send to someones browser when asked
 }
 
+static const char *RADIO_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"var sliderVol = document.getElementById(\"sliderVolume\");\n"
+	"var outputVol = document.getElementById(\"volShow\");\n"
+	"var sliderSql = document.getElementById(\"sliderSql\");\n"
+	"var outputSql = document.getElementById(\"sqlShow\");\n"
+	"var sliderTxGain = document.getElementById(\"sliderTxGain\");\n"
+	"var outputTxGain = document.getElementById(\"txGainShow\");\n"
+	"var sliderTxTilt = document.getElementById(\"sliderTxTilt\");\n"
+	"var outputTxTilt = document.getElementById(\"txTiltShow\");\n"
+	"outputVol.innerHTML = sliderVol.value;\n"
+	"outputSql.innerHTML = sliderSql.value;\n"
+	"outputTxGain.innerHTML = sliderTxGain.value;\n"
+	"outputTxTilt.innerHTML = sliderTxTilt.value;\n"
+	"\n"
+	"sliderVol.oninput = function () {\n"
+	"outputVol.innerHTML = this.value;\n"
+	"}\n"
+	"sliderSql.oninput = function () {\n"
+	"outputSql.innerHTML = this.value;\n"
+	"}\n"
+	"sliderTxGain.oninput = function () {\n"
+	"outputTxGain.innerHTML = this.value;\n"
+	"}\n"
+	"sliderTxTilt.oninput = function () {\n"
+	"outputTxTilt.innerHTML = this.value;\n"
+	"}\n"
+	"\n"
+	"function calibrateTone(type){\n"
+	"document.getElementById('calBtnLow').disabled=true;\n"
+	"document.getElementById('calBtnHigh').disabled=true;\n"
+	"document.getElementById('calBtnAlt').disabled=true;\n"
+	"document.getElementById('calStatus').innerHTML='Sending...';\n"
+	"fetch('/calibrate_tone?type='+type).then(function(r){return r.text();}).then(function(t){\n"
+	"document.getElementById('calStatus').innerHTML=t;\n"
+	"}).catch(function(e){\n"
+	"document.getElementById('calStatus').innerHTML='Error calling /calibrate_tone';\n"
+	"}).finally(function(){\n"
+	"setTimeout(function(){\n"
+	"document.getElementById('calBtnLow').disabled=false;\n"
+	"document.getElementById('calBtnHigh').disabled=false;\n"
+	"document.getElementById('calBtnAlt').disabled=false;\n"
+	"},11000);\n"
+	"});\n"
+	"}\n"
+	"\n"
+	"function calibrateRestart(){\n"
+	"if(!confirm('Restart the device now? Any in-progress tone test will stop and the web panel will briefly disconnect.')) return;\n"
+	"document.getElementById('calBtnRestart').disabled=true;\n"
+	"document.getElementById('calStatus').innerHTML='Restarting - the device will be back online in a few seconds...';\n"
+	"var data = new FormData();\n"
+	"data.append('REBOOT','1');\n"
+	"fetch('/system',{method:'POST',body:data});\n"
+	"}\n"
+	"\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formRadio\") document.getElementById(\"submitRadio\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formTNC\") document.getElementById(\"submitTNC\").disabled=true;\n"
+	"var formIdForReenable = e.currentTarget.id;\n"
+	"$.ajax({\n"
+	"url: '/radio',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"},\n"
+	// v2.1.3.1-audiotest: the submit button was disabled above to prevent a double-click, but was
+	// never re-enabled after the request finished (success or error) - so a second Apply Change on
+	// the same page load (e.g. while iterating on TX Audio Calibration) silently did nothing. Always
+	// re-enable it once the request settles.
+	"complete: function (data) {\n"
+	"if(formIdForReenable===\"formRadio\") document.getElementById(\"submitRadio\").disabled=false;\n"
+	"if(formIdForReenable===\"formTNC\") document.getElementById(\"submitTNC\").disabled=false;\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"function rfType(){\n"
+	"var type = document.getElementById(\"rf_type\").value;\n"
+	"if(type==1||type==4||type==7){document.getElementById(\"tx_freq\").setAttribute(\"max\",174);document.getElementById(\"rx_freq\").setAttribute(\"max\",174);};\n"
+	"if(type==1){document.getElementById(\"tx_freq\").setAttribute(\"min\",134);document.getElementById(\"rx_freq\").setAttribute(\"min\",134);};\n"
+	"if(type==4||type==7){document.getElementById(\"tx_freq\").setAttribute(\"min\",136);document.getElementById(\"rx_freq\").setAttribute(\"min\",136);};\n"
+	"if(type==2||type==5||type==8){document.getElementById(\"tx_freq\").setAttribute(\"max\",470);document.getElementById(\"rx_freq\").setAttribute(\"max\",470);};\n"
+	"if(type==2||type==5||type==8){document.getElementById(\"tx_freq\").setAttribute(\"min\",400);document.getElementById(\"rx_freq\").setAttribute(\"min\",400);};\n"
+	"if(type==3){document.getElementById(\"tx_freq\").setAttribute(\"min\",320);document.getElementById(\"rx_freq\").setAttribute(\"min\",320);};\n"
+	"if(type==3){document.getElementById(\"tx_freq\").setAttribute(\"max\",400);document.getElementById(\"rx_freq\").setAttribute(\"max\",400);};\n"
+	"if(type==6){document.getElementById(\"tx_freq\").setAttribute(\"min\",350);document.getElementById(\"rx_freq\").setAttribute(\"min\",350);};\n"
+	"if(type==6){document.getElementById(\"tx_freq\").setAttribute(\"max\",390);document.getElementById(\"rx_freq\").setAttribute(\"max\",390);};\n"
+	"if(type==1||type==4||type==7){document.getElementById(\"tx_freq\").setAttribute(\"value\",144.390);document.getElementById(\"rx_freq\").setAttribute(\"value\",144.390);};\n"
+	"if(type==2||type==5||type==8){document.getElementById(\"tx_freq\").setAttribute(\"value\",432.5);document.getElementById(\"rx_freq\").setAttribute(\"value\",432.5);};\n"
+	"\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formRadio' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>RF Analog Module</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"radioEnable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Module Type:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"rf_type\" id=\"rf_type\" onchange=\"rfType()\">\n"
+	"{{#each rfTypeOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select>\n"
+	"</td>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Frequency:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" id=\"tx_freq\" name=\"tx_freq\" min=\"{{freqMin}}\" max=\"{{freqMax}}\"\n"
+	"step=\"0.0001\" value=\"{{txFreq}}\" /> MHz</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>RX Frequency:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" id=\"rx_freq\" name=\"rx_freq\" min=\"{{freqMin}}\" max=\"{{freqMax}}\"\n"
+	"step=\"0.0001\" value=\"{{rxFreq}}\" /> Mhz</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX CTCSS:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"tx_ctcss\" id=\"tx_ctcss\">\n"
+	"{{#each txCtcssOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select> Hz\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>RX CTCSS:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"rx_ctcss\" id=\"rx_ctcss\">\n"
+	"<option value=\"0\" selected>0.0</option>\n"
+	"{{#each rxCtcssOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select> Hz\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Narrow/Wide:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"nw_band\" id=\"nw_band\">\n"
+	"<option value=\"0\" {{#if band}}{{else}}selected{{/if}}>12.5KHz</option>\n"
+	"<option value=\"1\" {{#if band}}selected{{/if}}>25.0KHz</option>\n"
+	"</select>\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Power:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"rf_power\" id=\"rf_power\">\n"
+	"<option value=\"1\" {{#if rfPower}}selected{{/if}}>HIGH</option>\n"
+	"<option value=\"0\" {{#if rfPower}}{{else}}selected{{/if}}>LOW</option>\n"
+	"</select>\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>VOLUME:</b></td>\n"
+	"<td style=\"text-align: left;\"><input id=\"sliderVolume\" name=\"volume\" type=\"range\"\nmin=\"1\" max=\"8\" value=\"{{volume}}\" /><b><span style=\"font-size: 14pt;\" id=\"volShow\">{{volume}}</span></b></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>SQL Level:</b></td>\n"
+	"<td style=\"text-align: left;\"><input id=\"sliderSql\" name=\"sql_level\" type=\"range\"\nmin=\"0\" max=\"8\" value=\"{{sqlLevel}}\" /><b><span style=\"font-size: 14pt;\" id=\"sqlShow\">{{sqlLevel}}</span></b></td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitRadio'  name=\"commitRadio\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitRadio\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form>"
+	"<form id='formTNC' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table style=\"table-layout:fixed;width:100%;\">\n"
+	"<th colspan=\"2\"><span><b>AFSK/TNC Configuration</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Modem Type:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"modem_type\" id=\"modem_type\" \">\n"
+	"{{#each modemOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select>\n"
+	"</td>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>FX.25 Mode:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"fx25_mode\" id=\"fx25_mode\" \">\n"
+	"{{#each fx25Options}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select>  (FX.25 = AX.25 + FEC)\n"
+	"</td>\n"
+	"<tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Deemphasis Audio:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"LPF\" value=\"OK\" {{#if lpfEnabled}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Audio low pass filter 1hz-2.5KHz</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Audio Level:</b></td>\n"
+	"<td style=\"text-align: left;\"><input id=\"sliderTxGain\" name=\"txAudioGain\" type=\"range\"\nmin=\"0\" max=\"100\" value=\"{{txAudioGain}}\" /><b><span style=\"font-size: 14pt;\" id=\"txGainShow\">{{txAudioGain}}</span></b> %</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td></td>\n"
+	"<td style=\"text-align: left;word-wrap:break-word;white-space:normal;\"><label style=\"font-size: 8pt;\"><i>TX audio level (0-100%). Adjust while listening on another radio - 100% is factory default (no change if never touched).</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Pre-emphasis:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"txPreemphasis\" value=\"OK\" {{#if txPreemphasisEnabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td></td>\n"
+	"<td style=\"text-align: left;word-wrap:break-word;white-space:normal;\"><label style=\"font-size: 8pt;\"><i>Enable only if the radio input is microphone (not 'flat'/discriminator). Attenuates the 1200Hz tone to compensate for the radio's own pre-emphasis.</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Pre-emphasis Tilt:</b></td>\n"
+	"<td style=\"text-align: left;\"><input id=\"sliderTxTilt\" name=\"txPreemphasisTilt\" type=\"range\"\nmin=\"0\" max=\"100\" value=\"{{txPreemphasisTilt}}\" /><b><span style=\"font-size: 14pt;\" id=\"txTiltShow\">{{txPreemphasisTilt}}</span></b> %</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Time Slot:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" name=\"timeSlot\" min=\"0\" max=\"99999\"\nstep=\"100\" value=\"{{timeSlot}}\" /> mSec.</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Preamble:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"preamble\">\n"
+	"{{#each preambleOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select> mSec.\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitTNC'  name=\"commitTNC\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitTNC\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form>"
+	"<table style=\"table-layout:fixed;width:100%;\">\n"
+	"<th colspan=\"2\"><span><b>TX Audio Calibration</b></span></th>\n"
+	"<tr>\n"
+	"<td colspan=\"2\" style=\"text-align:left;font-size:8pt;word-wrap:break-word;white-space:normal;\"><i>Transmits a continuous tone for 10 seconds (turns off by itself) to calibrate TX audio while listening on another radio. This keys the PTT and transmits real RF.</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td colspan=\"2\" style=\"text-align:left;\">\n"
+	"<button class=\"button\" type='button' id='calBtnLow' onclick=\"calibrateTone('low')\"> Low Tone (1200Hz) </button>\n"
+	"<button class=\"button\" type='button' id='calBtnHigh' onclick=\"calibrateTone('high')\"> High Tone (2200Hz) </button>\n"
+	"<button class=\"button\" type='button' id='calBtnAlt' onclick=\"calibrateTone('alt')\"> Alternating </button>\n"
+	"</td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" id=\"calStatus\" style=\"text-align:left;word-wrap:break-word;white-space:normal;\"></td></tr>\n"
+	// v2.1.3.1-audiotest: the calibration tone bypasses the normal AX.25 TX scheduler (it drives
+	// hw_afsk_dac_isr/the DAC timer directly instead of going through a scheduled TX job), so the
+	// scheduler can be left thinking a slot is busy after a calibration run. Warn and offer a direct
+	// restart so real beacons/objects resume reliably without the operator having to go find the
+	// System tab.
+	"<tr><td colspan=\"2\" style=\"text-align:left;font-size:8pt;color:#b35900;word-wrap:break-word;white-space:normal;\"><i>While a tone plays (10 s) the TX scheduler waits; queued packets go out right after it ends. No restart needed. If the digipeater is transmitting when you press a tone button, wait a few seconds and press it again.</i></td></tr>\n"
+	"<tr><td colspan=\"2\" style=\"text-align:left;\">\n"
+	"<button class=\"button\" type='button' id='calBtnRestart' style=\"background-color:#b35900;\" onclick=\"calibrateRestart()\"> Restart Device Now </button>\n"
+	"</td></tr>\n"
+	"</table><br />";
+
+// 2.1.5: job name for the persistent watchdog snapshot card on /txdebug.
+static const char *lu6jmfJobNameStr(uint8_t jobType)
+{
+	switch (jobType)
+	{
+	case LU6JMF_TXJOB_ACK:           return "ACK";
+	case LU6JMF_TXJOB_MESSAGE:       return "MESSAGE";
+	case LU6JMF_TXJOB_MSG_RETRY:     return "MSG RETRY";
+	case LU6JMF_TXJOB_DIGI:          return "DIGI";
+	case LU6JMF_TXJOB_TRACKER:       return "TRACKER";
+	case LU6JMF_TXJOB_IGATE:         return "IGATE";
+	case LU6JMF_TXJOB_DIGI_POSITION: return "DIGI POS";
+	case LU6JMF_TXJOB_WX:            return "WX";
+	case LU6JMF_TXJOB_TLM:           return "TLM";
+	case LU6JMF_TXJOB_BULLETIN:      return "BULLETIN";
+	case LU6JMF_TXJOB_NEWS:          return "NEWS";
+	case LU6JMF_TXJOB_OBJECT:        return "OBJECT";
+	case LU6JMF_TXJOB_INET2RF:       return "INET->RF";
+	case LU6JMF_TXJOB_EXTERNAL:      return "EXTERNAL";
+	default:                         return "GENERIC";
+	}
+}
+
+// 2.1.5: send an already-rendered HTML page as a CHUNKED response.
+// The old pattern (AsyncResponseStream + print(html_str)) kept TWO full copies of the page in
+// heap at once (the String plus the stream buffer, a big contiguous block): on the largest
+// pages (MOD, SYSTEM, IGATE...) that is what failed under heap fragmentation ("IGATE page
+// stopped opening"). Here the String is MOVED (no copy) into a shared_ptr and handed to the
+// client in small slices as the TCP window allows; the memory is released automatically when
+// the response ends or the client disconnects.
+static void sendHtmlChunked(AsyncWebServerRequest *request, String &page, const char *hdrName)
+{
+	std::shared_ptr<String> body(new (std::nothrow) String());
+	if (!body)
+	{
+		request->send(500, "text/html", "Memory allocation failed");
+		return;
+	}
+	*body = std::move(page);
+	AsyncWebServerResponse *resp = request->beginChunkedResponse("text/html",
+		[body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+		{
+			size_t total = body->length();
+			if (index >= total)
+				return 0;
+			size_t n = total - index;
+			if (n > maxLen)
+				n = maxLen;
+			memcpy(buffer, body->c_str() + index, n);
+			return n;
+		});
+	if (!resp)
+	{
+		request->send(500, "text/html", "Memory allocation failed");
+		return;
+	}
+	if (hdrName)
+		resp->addHeader(hdrName, "content");
+	resp->addHeader("Cache-Control", "no-cache");
+	request->send(resp);
+}
+
 void handle_radio(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
-	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
-
 	// bool noiseEn=false;
 	bool radioEnable = false;
-	bool ax25Enable = false;
-	bool rxBoost = false;
-
-#ifdef RF2
-	bool radioEnable1 = false;
-	bool ax25Enable1 = false;
-	bool rxBoost1 = false;
-#endif
 	if (request->hasArg("commitRadio"))
 	{
 		for (uint8_t i = 0; i < request->args(); i++)
@@ -2013,77 +2356,35 @@ void handle_radio(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					if (String(request->arg(i)) == "OK")
+					// Compare the argument directly without converting to String
+					if (strcmp(request->arg(i).c_str(), "OK") == 0)
 					{
 						radioEnable = true;
 					}
 				}
 			}
 
-			if (request->argName(i) == "rxBoost")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-					{
-						rxBoost = true;
-					}
-				}
-			}
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-					{
-						radioEnable = true;
-					}
-				}
-			}
-
-			if (request->argName(i) == "ax25En")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-					{
-						ax25Enable = true;
-					}
-				}
-			}
-
-			if (request->argName(i) == "rf_type")
+			if (request->argName(i) == "nw_band")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
 					{
-						config.rf_type = request->arg(i).toInt();
+						config.band = request->arg(i).toInt();
+						// if (request->arg(i).toInt())
+						// 	config.band = 1;
+						// else
+						// 	config.band = 0;
 					}
 				}
 			}
 
-			if (request->argName(i) == "rf_mode")
+			if (request->argName(i) == "volume")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-					{
-						config.rf_mode = request->arg(i).toInt();
-						if (config.rf_mode == RF_MODE_AIS)
-						{
-							sprintf(config.igate_host, "aprs.nakhonthai.net");
-							config.aprs_port = 24580;
-						}
-					}
-				}
-			}
-
-			if (request->argName(i) == "freq_offset")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf_freq_offset = request->arg(i).toInt();
+						config.volume = request->arg(i).toInt();
 				}
 			}
 
@@ -2093,1014 +2394,496 @@ void handle_radio(AsyncWebServerRequest *request)
 				{
 					if (isValidNumber(request->arg(i)))
 					{
-						config.rf_power = request->arg(i).toInt();
+						if (request->arg(i).toInt())
+							config.rf_power = true;
+						else
+							config.rf_power = false;
 					}
 				}
 			}
 
-			if (request->argName(i) == "rf_bw")
+			if (request->argName(i) == "sql_level")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_bw = request->arg(i).toFloat();
+						config.sql_level = request->arg(i).toInt();
 				}
 			}
 
-			if (request->argName(i) == "rf_br")
+			if (request->argName(i) == "tx_freq")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_br = request->arg(i).toFloat();
+						config.freq_tx = request->arg(i).toFloat();
+				}
+			}
+			if (request->argName(i) == "rx_freq")
+			{
+				if (request->arg(i) != "")
+				{
+					if (isValidNumber(request->arg(i)))
+						config.freq_rx = request->arg(i).toFloat();
 				}
 			}
 
-			if (request->argName(i) == "freq")
+			if (request->argName(i) == "tx_offset")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_freq = request->arg(i).toFloat();
+						config.offset_tx = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "rx_offset")
+			{
+				if (request->arg(i) != "")
+				{
+					if (isValidNumber(request->arg(i)))
+						config.offset_rx = request->arg(i).toInt();
 				}
 			}
 
-			if (request->argName(i) == "rf_sync")
+			if (request->argName(i) == "tx_ctcss")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_sync = request->arg(i).toInt();
+						config.tone_tx = request->arg(i).toInt();
 				}
 			}
-			if (request->argName(i) == "rf_sf")
+			if (request->argName(i) == "rx_ctcss")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_sf = request->arg(i).toInt();
+						config.tone_rx = request->arg(i).toInt();
 				}
 			}
-
-			if (request->argName(i) == "rf_cr")
+			if (request->argName(i) == "rf_type")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.rf_cr = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_pream")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf_preamable = request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "rf_shaping")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-					{
-						config.rf_shaping = request->arg(i).toInt();
-					}
-				}
-			}
-
-			if (request->argName(i) == "rf_encoding")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-					{
-						config.rf_encoding = request->arg(i).toInt();
-					}
+						config.rf_type = request->arg(i).toInt();
 				}
 			}
 		}
 		// config.noise=noiseEn;
 		// config.agc=agcEn;
 		config.rf_en = radioEnable;
-		config.rf_ax25 = ax25Enable;
-		config.rf_rx_boost = rxBoost;
-
-		String html = "OK";
-		if (APRS_init(&config))
+		// Using dynamic memory allocation instead of String
+		char *html = allocateStringMemory(64); // Small buffer for "OK"
+		if (html)
 		{
-			html = "OK_RF1";
-			saveConfiguration("/default.cfg", config);
+			strcpy(html, "OK");
+			request->send(200, "text/html", html); // send to someones browser when asked
+			free(html);							   // Free the allocated memory
 		}
-		else
-		{
-			html = "FAIL_RF1";
-		}
-		request->send(200, "text/html", html); // send to someones browser when asked
+		saveConfiguration("/default.cfg", config);
+		delay(500);
+		RF_MODULE(false);
 	}
-#ifdef RF2
-	else if (request->hasArg("commitRadio1"))
+	else if (request->hasArg("commitTNC"))
 	{
+		bool hpf = 0;
+		bool lpf = 0;
+		bool txPreemph = false;
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
-			if (request->argName(i) == "radioEnable1")
+			if (request->argName(i) == "HPF")
 			{
 				if (request->arg(i) != "")
 				{
-					if (String(request->arg(i)) == "OK")
+					if (strcmp(request->arg(i).c_str(), "OK") == 0)
 					{
-						radioEnable1 = true;
+						hpf = true;
 					}
 				}
 			}
-
-			if (request->argName(i) == "rxBoost1")
+			if (request->argName(i) == "LPF")
 			{
 				if (request->arg(i) != "")
 				{
-					if (String(request->arg(i)) == "OK")
+					if (strcmp(request->arg(i).c_str(), "OK") == 0)
 					{
-						rxBoost1 = true;
+						lpf = true;
 					}
 				}
 			}
-
-			if (request->argName(i) == "ax25En1")
+			if (request->argName(i) == "txPreemphasis")
 			{
 				if (request->arg(i) != "")
 				{
-					if (String(request->arg(i)) == "OK")
+					if (strcmp(request->arg(i).c_str(), "OK") == 0)
 					{
-						ax25Enable1 = true;
+						txPreemph = true;
 					}
 				}
 			}
-
-			if (request->argName(i) == "rf1_type")
+			if (request->argName(i) == "txAudioGain")
 			{
-				if (request->arg(i) != "")
+				if (request->arg(i) != "" && isValidNumber(request->arg(i)))
 				{
-					if (isValidNumber(request->arg(i)))
-					{
-						config.rf1_type = request->arg(i).toInt();
-					}
+					long v = request->arg(i).toInt();
+					if (v < 0)
+						v = 0;
+					if (v > 100)
+						v = 100;
+					config.tx_audio_gain = (uint8_t)v;
 				}
 			}
-
-			if (request->argName(i) == "rf1_mode")
+			if (request->argName(i) == "txPreemphasisTilt")
 			{
-				if (request->arg(i) != "")
+				if (request->arg(i) != "" && isValidNumber(request->arg(i)))
 				{
-					if (isValidNumber(request->arg(i)))
-					{
-						config.rf1_mode = request->arg(i).toInt();
-						if (config.rf1_mode == RF_MODE_AIS)
-						{
-							sprintf(config.igate_host, "aprs.nakhonthai.net");
-							config.aprs_port = 24580;
-						}
-					}
+					long v = request->arg(i).toInt();
+					if (v < 0)
+						v = 0;
+					if (v > 100)
+						v = 100;
+					config.tx_preemphasis_tilt = (uint8_t)v;
 				}
 			}
-
-			if (request->argName(i) == "freq1_offset")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_freq_offset = request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "rf1_power")
+			if (request->argName(i) == "timeSlot")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
 					{
-						config.rf1_power = request->arg(i).toInt();
+						config.tx_timeslot = request->arg(i).toInt();
 					}
 				}
 			}
-
-			if (request->argName(i) == "rf1_bw")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_bw = request->arg(i).toFloat();
-				}
-			}
-
-			if (request->argName(i) == "rf1_br")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_br = request->arg(i).toFloat();
-				}
-			}
-
-			if (request->argName(i) == "freq1")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_freq = request->arg(i).toFloat();
-				}
-			}
-
-			if (request->argName(i) == "rf1_sync")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_sync = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf1_sf")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_sf = request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "rf1_cr")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_cr = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf1_pream")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.rf1_preamable = request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "rf1_shaping")
+			if (request->argName(i) == "preamble")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
 					{
-						config.rf1_shaping = request->arg(i).toInt();
+						config.preamble = request->arg(i).toInt();
 					}
 				}
 			}
-
-			if (request->argName(i) == "rf1_encoding")
+			if (request->argName(i) == "modem_type")
 			{
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-					{
-						config.rf1_encoding = request->arg(i).toInt();
-					}
+						config.modem_type = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "fx25_mode")
+			{
+				if (request->arg(i) != "")
+				{
+					if (isValidNumber(request->arg(i)))
+						config.fx25_mode = request->arg(i).toInt();
 				}
 			}
 		}
-		config.rf1_en = radioEnable1;
-		config.rf1_ax25 = ax25Enable1;
-		config.rf1_rx_boost = rxBoost1;
-		String html = "";
-		if (APRS_init2(&config))
+		config.audio_hpf = hpf;
+		config.audio_lpf = lpf;
+		config.tx_preemphasis = txPreemph;
+		// Using dynamic memory allocation instead of String
+		char *html = allocateStringMemory(64); // Small buffer for "OK"
+		if (html)
 		{
-			html = "OK_RF2";
-			saveConfiguration("/default.cfg", config);
+			strcpy(html, "OK");
+			request->send(200, "text/html", html); // send to someones browser when asked
+			free(html);							   // Free the allocated memory
 		}
-		else
-		{
-			html = "FAIL_RF2";
-		}
-		request->send(200, "text/html", html); // send to someones browser when asked
+		saveConfiguration("/default.cfg", config);
+		afskSetModem(config.modem_type, config.audio_lpf, config.tx_timeslot, config.preamble * 100, config.fx25_mode);
+		afskSetTxGain(config.tx_audio_gain);
+		afskSetTxPreemphasis(config.tx_preemphasis, config.tx_preemphasis_tilt);
 	}
-#endif
 	else
 	{
-		String html = "<script type=\"text/javascript\">\n";
-		html += "$('form').submit(function (e) {\n";
-		html += "e.preventDefault();\n";
-		html += "var data = new FormData(e.currentTarget);\n";
-		html += "if(e.currentTarget.id===\"formRadio\") document.getElementById(\"submitRadio\").disabled=true;\n";
-#ifdef RF2
-		html += "if(e.currentTarget.id===\"formRadio1\") document.getElementById(\"submitRadio1\").disabled=true;\n";
-// html += "if(e.currentTarget.id===\"formTNC\") document.getElementById(\"submitTNC\").disabled=true;\n";
+		JsonDocument data;
+		data["enabled"] = config.rf_en;
+
+		JsonArray rfTypeOptions = data["rfTypeOptions"].to<JsonArray>();
+		for (int i = 0; i < 9; i++)
+		{
+			JsonObject o = rfTypeOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = RF_TYPE[i];
+			o["selected"] = (config.rf_type == i);
+		}
+
+		float freqMin = 0;
+		float freqMax = 0;
+		switch (config.rf_type)
+		{
+		case RF_SA868_VHF:
+			freqMin = 134.0F;
+			freqMax = 174.0F;
+			break;
+		case RF_SR_1WV:
+		case RF_SR_2WVS:
+			freqMin = 136.0F;
+			freqMax = 174.0F;
+			break;
+		case RF_SA868_350:
+			freqMin = 320.0F;
+			freqMax = 400.0F;
+			break;
+		case RF_SR_1W350:
+			freqMin = 350.0F;
+			freqMax = 390.0F;
+			break;
+		case RF_SA868_UHF:
+		case RF_SR_1WU:
+		case RF_SR_2WUS:
+			freqMin = 400.0F;
+			freqMax = 470.0F;
+			break;
+		default:
+			freqMin = 134.0F;
+			freqMax = 500.0F;
+			break;
+		}
+		char buf[24];
+		snprintf(buf, sizeof(buf), "%.4f", freqMin);
+		data["freqMin"] = buf;
+		snprintf(buf, sizeof(buf), "%.4f", freqMax);
+		data["freqMax"] = buf;
+		snprintf(buf, sizeof(buf), "%.4f", config.freq_tx);
+		data["txFreq"] = buf;
+		snprintf(buf, sizeof(buf), "%.4f", config.freq_rx);
+		data["rxFreq"] = buf;
+
+		JsonArray txCtcssOptions = data["txCtcssOptions"].to<JsonArray>();
+		JsonArray rxCtcssOptions = data["rxCtcssOptions"].to<JsonArray>();
+		for (int i = 0; i < 39; i++)
+		{
+			char label[8];
+			snprintf(label, sizeof(label), "%.1f", ctcss[i]);
+
+			JsonObject ot = txCtcssOptions.add<JsonObject>();
+			ot["value"] = i;
+			ot["label"] = label;
+			ot["selected"] = (config.tone_tx == i);
+
+			JsonObject orr = rxCtcssOptions.add<JsonObject>();
+			orr["value"] = i;
+			orr["label"] = label;
+			orr["selected"] = (config.tone_rx == i);
+		}
+
+		data["band"] = (bool)config.band;
+		data["rfPower"] = (bool)config.rf_power;
+		data["volume"] = config.volume;
+		data["sqlLevel"] = config.sql_level;
+
+		JsonArray modemOptions = data["modemOptions"].to<JsonArray>();
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+		int modemCount = 4;
+#else
+		int modemCount = 3;
 #endif
-		html += "$.ajax({\n";
-		html += "url: '/radio',\n";
-		html += "type: 'POST',\n";
-		html += "data: data,\n";
-		html += "contentType: false,\n";
-		html += "processData: false,\n";
-		html += "success: function (data) {\n";
-		html += "console.log(data);";
-		html += "if(data === \"OK_RF1\") {alert(\"RF1 Initialized Successfully\");}else if(data === \"FAIL_RF1\"){alert(\"RF1 Initialized Failed\");}";
-		html += "else if(data === \"OK_RF2\") {alert(\"RF2 Initialized Successfully\");}else if(data === \"FAIL_RF2\"){alert(\"RF2 Initialized Failed\");}else{alert(\"RF Initialized not response.\");}\n";
-		html += "},\n";
-		html += "error: function (data) {\n";
-		html += "console.log(data);";
-		html += "alert(\"An error occurred.\");\n";
-		html += "}\n";
-		html += "});\n";
-		html += "});\n";
-
-		html += "function loraVHF(){\n";
-		html += "const rftype=Number(document.querySelector('#rf_type').value);";
-		html += "if (rftype>5 && rftype<11) {\n"; // SX127x
-		html += "document.getElementById(\"rf_bw\").value='10.40';\n";
-		html += "document.getElementById(\"rf_sync\").value=18;\n";
-		html += "document.getElementById(\"rf_sf\").value=8;\n";
-		html += "document.getElementById(\"rf_cr\").value=5;\n";
-		html += "document.getElementById(\"freq\").value=144.410;\n";
-		html += "var x = document.getElementById(\"ax25En\");\n";
-		html += "x.checked = true;\n";
-		html += "} else {\n";
-		html += "alert(\"For chip type SX127x model.\");\n";
-		html += "}\n";
-		html += "}\n";
-
-		html += "function loraUHF(){\n";
-		html += "document.getElementById(\"rf_bw\").value='125.00';\n";
-		html += "document.getElementById(\"rf_sync\").value=18;\n";
-		html += "document.getElementById(\"rf_sf\").value=12;\n";
-		html += "document.getElementById(\"rf_cr\").value=5;\n";
-		html += "document.getElementById(\"freq\").value=433.775;\n";
-		html += "var x = document.getElementById(\"ax25En\");\n";
-		html += "x.checked = false;\n";
-		html += "}\n";
-
-		html += "function loraUHFCB(){\n";
-		html += "document.getElementById(\"rf_bw\").value='62.50';\n";
-		html += "document.getElementById(\"rf_sync\").value=18;\n";
-		html += "document.getElementById(\"rf_sf\").value=10;\n";
-		html += "document.getElementById(\"rf_cr\").value=5;\n";
-		html += "document.getElementById(\"freq\").value=433.9;\n";
-		html += "var x = document.getElementById(\"ax25En\");\n";
-		html += "x.checked = true;\n";
-		html += "}\n";
-
-		html += "function rfMode(){\n";
-		html += "const rfmode=Number(document.querySelector('#rf_mode').value);";
-		html += "const rftype=Number(document.querySelector('#rf_type').value);";
-		// html += "console.log(rftype);";
-		html += "if (rfmode===1) {\n"; // LoRa
-		html += "document.getElementById(\"loraGrp\").disabled=false;\n";
-		html += "document.getElementById(\"gfskGrp\").disabled=true;\n";
-		html += "document.getElementById(\"rf_bw\").value='125.00';\n";
-		html += "document.getElementById(\"rf_sync\").value=18;\n";
-		html += "document.getElementById(\"rf_sf\").value=12;\n";
-		html += "document.getElementById(\"rf_cr\").value=5;\n";
-		html += "document.getElementById(\"freq\").value=433.775;\n";
-		html += "document.getElementById(\"mode_desc\").innerHTML=\"Default frequency [VHF:144.410Mhz,UHF:433.775MHz]\";\n";
-		html += "}else{";
-		html += "document.getElementById(\"loraGrp\").disabled=true;\n";
-		html += "document.getElementById(\"gfskGrp\").disabled=false;\n";
-		html += "if (rftype>5 && rftype<11) {\n"; // SX127x
-		html += "document.getElementById(\"rf_bw\").value=15.60;\n";
-		html += "document.getElementById(\"rf_br\").value=9.6;\n";
-		html += "document.getElementById(\"rf_shaping\").value=2;\n";
-		html += "document.getElementById(\"rf_encoding\").value=0;\n";
-		html += "} else {\n";
-		html += "document.getElementById(\"rf_bw\").value=14.60;\n";
-		html += "document.getElementById(\"rf_br\").value=9.7;\n";
-		html += "document.getElementById(\"rf_shaping\").value=2;\n";
-		html += "document.getElementById(\"rf_encoding\").value=0;\n";
-		html += "}\n";
-		html += "if (rfmode===3) {\n"; // AIS
-		html += "document.getElementById(\"freq\").value=161.975;\n";
-		html += "document.getElementById(\"mode_desc\").innerHTML=\"Use frequency [87B]161.975Mhz,[88B]162.025MHz RX Only.\";\n";
-		html += "}else{\n";
-		html += "document.getElementById(\"freq\").value=433.275;\n";
-		html += "if(rfmode===2) {document.getElementById(\"mode_desc\").innerHTML=\"Works with Yaesu radio VX8-DR/FTM350/FTM400 TX Delay 100mS.\";}\n";
-		html += "if(rfmode===4) {document.getElementById(\"mode_desc\").innerHTML=\"D.I.Y (G)FSK\";}\n";
-		html += "}\n}\n";
-		html += "}\n";
-
-#ifdef RF2
-
-		html += "function loraVHF1(){\n";
-		html += "const rf1type=Number(document.querySelector('#rf1_type').value);";
-		html += "if (rf1type>5 && rf1type<11) {\n"; // SX127x
-		html += "document.getElementById(\"rf1_bw\").value='10.40';\n";
-		html += "document.getElementById(\"rf1_sync\").value=18;\n";
-		html += "document.getElementById(\"rf1_sf\").value=8;\n";
-		html += "document.getElementById(\"rf1_cr\").value=5;\n";
-		html += "document.getElementById(\"freq1\").value=144.410;\n";
-		html += "var x = document.getElementById(\"ax25En1\");\n";
-		html += "x.checked = true;\n";
-		html += "} else {\n";
-		html += "alert(\"For chip type SX127x model.\");\n";
-		html += "}\n";
-		html += "}\n";
-
-		html += "function loraUHF1(){\n";
-		html += "document.getElementById(\"rf1_bw\").value='125.00';\n";
-		html += "document.getElementById(\"rf1_sync\").value=18;\n";
-		html += "document.getElementById(\"rf1_sf\").value=12;\n";
-		html += "document.getElementById(\"rf1_cr\").value=5;\n";
-		html += "document.getElementById(\"freq1\").value=433.775;\n";
-		html += "var x = document.getElementById(\"ax25En1\");\n";
-		html += "x.checked = false;\n";
-		html += "}\n";
-
-		html += "function rf1Mode(){\n";
-		html += "const rf1mode=Number(document.querySelector('#rf1_mode').value);";
-		html += "const rf1type=Number(document.querySelector('#rf1_type').value);";
-		// html += "console.log(rftype);";
-		html += "if (rf1mode===1) {\n"; // LoRa
-		html += "document.getElementById(\"loraGrp1\").disabled=false;\n";
-		html += "document.getElementById(\"gfskGrp1\").disabled=true;\n";
-		html += "document.getElementById(\"rf1_bw\").value='125.00';\n";
-		html += "document.getElementById(\"rf1_sync\").value=18;\n";
-		html += "document.getElementById(\"rf1_sf\").value=12;\n";
-		html += "document.getElementById(\"rf1_cr\").value=5;\n";
-		html += "document.getElementById(\"freq1\").value=433.775;\n";
-		html += "document.getElementById(\"mode_desc1\").innerHTML=\"Default frequency [VHF:144.410Mhz,UHF:433.775MHz]\";\n";
-		html += "}else{";
-		html += "document.getElementById(\"loraGrp1\").disabled=true;\n";
-		html += "document.getElementById(\"gfskGrp1\").disabled=false;\n";
-		html += "if (rf1type>5 && rf1type<11) {\n"; // SX127x
-		html += "document.getElementById(\"rf1_bw\").value=15.60;\n";
-		html += "document.getElementById(\"rf1_br\").value=9.6;\n";
-		html += "document.getElementById(\"rf1_shaping\").value=2;\n";
-		html += "document.getElementById(\"rf1_encoding\").value=0;\n";
-		html += "} else {\n";
-		html += "document.getElementById(\"rf1_bw\").value=14.60;\n";
-		html += "document.getElementById(\"rf1_br\").value=9.7;\n";
-		html += "document.getElementById(\"rf1_shaping\").value=2;\n";
-		html += "document.getElementById(\"rf1_encoding\").value=0;\n";
-		html += "}\n";
-		html += "if (rf1mode===3) {\n"; // AIS
-		html += "document.getElementById(\"freq1\").value=161.975;\n";
-		html += "document.getElementById(\"mode_desc1\").innerHTML=\"Use frequency [87B]161.975Mhz,[88B]162.025MHz RX Only.\";\n";
-		html += "}else{\n";
-		html += "document.getElementById(\"freq1\").value=433.275;\n";
-		html += "if(rf1mode===2) {document.getElementById(\"mode_desc1\").innerHTML=\"Works with Yaesu radio VX8-DR/FTM350/FTM400 TX Delay 100mS.\";}\n";
-		html += "if(rf1mode===4) {document.getElementById(\"mode_desc1\").innerHTML=\"D.I.Y (G)FSK\";}\n";
-		html += "}\n}\n";
-		html += "}\n";
-#endif
-
-		html += "</script>\n";
-		html += "<form id='formRadio' method=\"POST\" action='#' enctype='multipart/form-data'>\n";
-		html += "<table>\n";
-		html += "<th colspan=\"2\"><span><b>Radio Module</b></span></th>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Enable:</b></td>\n";
-		String radioEnFlag = "";
-		if (config.rf_en)
-			radioEnFlag = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"radioEnable\" value=\"OK\" " + radioEnFlag + "><span class=\"slider round\"></span></label></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Chip Type:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_type\" id=\"rf_type\">\n";
-		for (int i = 0; i < 14; i++)
+		for (int i = 0; i < modemCount; i++)
 		{
-			if (config.rf_type == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(RF_TYPE[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(RF_TYPE[i]) + "</option>\n";
+			JsonObject o = modemOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = MODEM_TYPE[i];
+			o["selected"] = (config.modem_type == i);
 		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Modem Mode:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_mode\" id=\"rf_mode\" onchange=\"rfMode()\">\n";
-		for (int i = 0; i < 5; i++)
-		{
-			if (config.rf_mode == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(RF_MODE[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(RF_MODE[i]) + "</option>\n";
-		}
-		html += "</select> ";
-		if (config.rf_mode == RF_MODE_LoRa)
-		{
-			html += "<label id=\"mode_desc\"><i>Default frequency [VHF:144.410Mhz,UHF:433.775MHz]</i></label>\n";
-		}
-		else if (config.rf_mode == RF_MODE_G3RUH)
-		{
-			html += "<label id=\"mode_desc\"><i>Works with Yaesu radio VX8-DR/FTM350/FTM400 TX Delay 100mS.</i></label>\n";
-		}
-		else if (config.rf_mode == RF_MODE_GFSK)
-		{
-			html += "<label id=\"mode_desc\"><i>D.I.Y (G)FSK</i></label>\n";
-		}
-		else if (config.rf_mode == RF_MODE_AIS)
-		{
-			html += "<label id=\"mode_desc\"><i>Use frequency [87B]161.975Mhz,[88B]162.025MHz RX Only.</i></label>\n";
-		}
-		html += "</td>\n";
-		float freqMin = 137;
-		float freqMax = 1020;
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Frequency:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"freq\" name=\"freq\" min=\"" + String(freqMin, 3) + "\" max=\"" + String(freqMax, 3) + "\"\n";
-		html += "step=\"0.001\" value=\"" + String(config.rf_freq, 3) + "\" /> MHz <i>[SX126x:150-960MHz],[SX1278:137-175Mhz,410-525Mhz]</i></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Offset Freq:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"freq_offset\" name=\"freq_offset\" min=\"-30000\" max=\"30000\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf_freq_offset) + "\" /> Hz   <i>[SX1276:137-175Mhz,410-525Mhz,862-1020Mhz]</i></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>TX Power:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_power\" id=\"rf_power\">\n";
-		int pwrMax = 23;
-		if (config.rf_type == RF_SX1272 || config.rf_type == RF_SX1273 || config.rf_type == RF_SX1276 || config.rf_type == RF_SX1278 || config.rf_type == RF_SX1279)
-			pwrMax = 21;
 
-		for (int i = -9; i < pwrMax; i++)
-		{
-			if (config.rf_power == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += " dBm</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>RX Boost:</b></td>\n";
-		String boostEnFlag = "";
-		if (config.rf_rx_boost)
-			boostEnFlag = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"rxBoost\" value=\"OK\" " + boostEnFlag + "><span class=\"slider round\"></span></label> *<i>Support for SX126x only.</i></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Preamble Length:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"rf_pream\" name=\"rf_pream\" min=\"0\" max=\"255\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf_preamable) + "\" /></td>\n";
-		html += "</tr>\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Band Width:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_bw\" id=\"rf_bw\">\n";
-		if (config.rf_mode == RF_MODE_LoRa)
-		{
-			for (int i = 0; i < sizeof(LORA_BW) / sizeof(float); i++)
-			{
-				if ((config.rf_bw > (LORA_BW[i] - 0.5)) && (config.rf_bw < (LORA_BW[i] + 0.5)))
-					html += "<option value=\"" + String(LORA_BW[i], 2) + "\" selected>" + String(LORA_BW[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(LORA_BW[i], 2) + "\" >" + String(LORA_BW[i], 1) + "</option>\n";
-			}
-		}
-		else
-		{
-			if (config.rf_type == RF_SX1272 || config.rf_type == RF_SX1273 || config.rf_type == RF_SX1276 || config.rf_type == RF_SX1278 || config.rf_type == RF_SX1279)
-			{
-				for (int i = 0; i < sizeof(BW1) / sizeof(float); i++)
-				{
-					if ((config.rf_bw > (BW1[i] - 0.5)) && (config.rf_bw < (BW1[i] + 0.5)))
-						html += "<option value=\"" + String(BW1[i], 1) + "\" selected>" + String(BW1[i], 1) + "</option>\n";
-					else
-						html += "<option value=\"" + String(BW1[i], 1) + "\" >" + String(BW1[i], 1) + "</option>\n";
-				}
-			}
-			else
-			{
-				for (int i = 0; i < sizeof(BW2) / sizeof(float); i++)
-				{
-					if ((config.rf_bw > (BW2[i] - 0.5)) && (config.rf_bw < (BW2[i] + 0.5)))
-						html += "<option value=\"" + String(BW2[i], 1) + "\" selected>" + String(BW2[i], 1) + "</option>\n";
-					else
-						html += "<option value=\"" + String(BW2[i], 1) + "\" >" + String(BW2[i], 1) + "</option>\n";
-				}
-			}
-		}
-		html += "</select> KHz. <i>(GFSK: RX Band width)</i>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>AX.25 Protocol:</b></td>\n";
-		radioEnFlag = "";
-		if (config.rf_ax25)
-			radioEnFlag = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"ax25En\" id=\"ax25En\" value=\"OK\" " + radioEnFlag + "><span class=\"slider round\"></span></label>  <i>*Not applicable to LoRa_APRS projects by richonguzman/CA2RXU. </i></td>\n";
-		html += "</tr>\n";
-
-		// LoRa Group
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>LoRa Modem:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		if (config.rf_mode == RF_MODE_LoRa)
-			html += "<fieldset id=\"loraGrp\">\n";
-		else
-			html += "<fieldset id=\"loraGrp\" disabled>\n";
-		html += "<legend>LoRa Modem Configuration</legend>\n";
-		html += "<table style=\"text-align: left;\">\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Spread Factor:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_sf\" id=\"rf_sf\">\n";
-		for (int i = 5; i < 13; i++)
-		{
-			if (config.rf_sf == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\" width=\"20%\"><b>Sync Word:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"rf_sync\" name=\"rf_sync\" min=\"1\" max=\"255\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf_sync) + "\" /></td>\n";
-		html += "</tr>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Coding Rate:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_cr\" id=\"rf_cr\">\n";
-		for (int i = 5; i < 9; i++)
-		{
-			if (config.rf_cr == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-
-		html += "</table>*QuickCFG <button type=\"button\" onClick=\"loraVHF()\" style=\"background-color:green;color:white\">VHF</button>[<i>Freq:144.410Mhz,SF=8,BW=10.4Khz</i>] <button type=\"button\" onClick=\"loraUHF()\" style=\"background-color:gray;color:white\">UHF</button>[<i>Freq:433.775Mhz,SF=12,BW=125Khz</i>] <button type=\"button\" onClick=\"loraUHFCB()\" style=\"background-color:red;color:white\">CB</button><br /></fieldset></tr>";
-
-		// GFSK Group
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>GFSK Modem:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		if (config.rf_mode != RF_MODE_LoRa)
-			html += "<fieldset id=\"gfskGrp\">\n";
-		else
-			html += "<fieldset id=\"gfskGrp\" disabled>\n";
-		html += "<legend>GFSK Modem Configuration</legend>\n";
-		html += "<table style=\"text-align: left;\">\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\" width=\"20%\"><b>Baud Rate:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_br\" id=\"rf_br\">\n";
-
-		if (config.rf_type == RF_SX1272 || config.rf_type == RF_SX1273 || config.rf_type == RF_SX1276 || config.rf_type == RF_SX1278 || config.rf_type == RF_SX1279)
-		{
-			for (int i = 0; i < sizeof(BR1) / sizeof(float); i++)
-			{
-				if ((config.rf_br > (BR1[i] - 0.5)) && (config.rf_br < (BR1[i] + 0.5)))
-					html += "<option value=\"" + String(BR1[i], 1) + "\" selected>" + String(BR1[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(BR1[i], 1) + "\" >" + String(BR1[i], 1) + "</option>\n";
-			}
-		}
-		else
-		{
-			for (int i = 0; i < sizeof(BR2) / sizeof(float); i++)
-			{
-				if ((config.rf_br > (BR2[i] - 0.5)) && (config.rf_br < (BR2[i] + 0.5)))
-					html += "<option value=\"" + String(BR2[i], 1) + "\" selected>" + String(BR2[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(BR2[i], 1) + "\" >" + String(BR2[i], 1) + "</option>\n";
-			}
-		}
-		html += "</select> Kbps.\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Shaping:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_shaping\" id=\"rf_shaping\">\n";
-		for (int i = 0; i < 5; i++)
-		{
-			if (config.rf_shaping == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(SHAPING[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(SHAPING[i]) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Encoding:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf_encoding\" id=\"rf_encoding\">\n";
+		JsonArray fx25Options = data["fx25Options"].to<JsonArray>();
 		for (int i = 0; i < 3; i++)
 		{
-			if (config.rf_encoding == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(ENCODING[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(ENCODING[i]) + "</option>\n";
+			JsonObject o = fx25Options.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = FX25_MODE[i];
+			o["selected"] = (config.fx25_mode == i);
 		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
 
-		html += "</table></fieldset></tr>";
+		data["lpfEnabled"] = config.audio_lpf;
+		data["txAudioGain"] = config.tx_audio_gain;
+		data["txPreemphasisEnabled"] = config.tx_preemphasis;
+		data["txPreemphasisTilt"] = config.tx_preemphasis_tilt;
+		data["timeSlot"] = config.tx_timeslot;
 
-		// html += "</table>\n<br />\n";
-		html += "<tr><td colspan=\"2\" align=\"right\">\n";
-		html += "<div><button class=\"button\" type='submit' id='submitRadio'  name=\"commitRadio\"> Apply Change </button></div>\n";
-		html += "<input type=\"hidden\" name=\"commitRadio\"/>\n";
-		html += "</td></tr></table><br />\n";
-		html += "</form></br />";
+		JsonArray preambleOptions = data["preambleOptions"].to<JsonArray>();
+		for (int i = 1; i < 11; i++)
+		{
+			JsonObject o = preambleOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = i * 100;
+			o["selected"] = (config.preamble == i);
+		}
 
-// Radio Module Configuration 2
-#ifdef RF2
-		html += "<form id='formRadio1' method=\"POST\" action='#' enctype='multipart/form-data'>\n";
-		html += "<table>\n";
-		html += "<th colspan=\"2\"><span><b>Radio Module 2</b></span></th>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Enable:</b></td>\n";
-		String radio1EnFlag = "";
-		if (config.rf1_en)
-			radio1EnFlag = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"radioEnable1\" value=\"OK\" " + radio1EnFlag + "><span class=\"slider round\"></span></label></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Chip Type:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_type\" id=\"rf1_type\">\n";
-		for (int i = 0; i < 14; i++)
-		{
-			if (config.rf1_type == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(RF_TYPE[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(RF_TYPE[i]) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Modem Mode:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_mode\" id=\"rf1_mode\" onchange=\"rf1Mode()\">\n";
-		for (int i = 0; i < 5; i++)
-		{
-			if (config.rf1_mode == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(RF_MODE[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(RF_MODE[i]) + "</option>\n";
-		}
-		html += "</select> ";
-		if (config.rf1_mode == RF_MODE_LoRa)
-		{
-			html += "<label id=\"mode_desc1\"><i>Default frequency [VHF:144.410Mhz,UHF:433.775MHz]</i></label>\n";
-		}
-		else if (config.rf1_mode == RF_MODE_G3RUH)
-		{
-			html += "<label id=\"mode_desc1\"><i>Works with Yaesu radio VX8-DR/FTM350/FTM400 TX Delay 100mS.</i></label>\n";
-		}
-		else if (config.rf1_mode == RF_MODE_GFSK)
-		{
-			html += "<label id=\"mode_desc1\"><i>D.I.Y (G)FSK</i></label>\n";
-		}
-		else if (config.rf1_mode == RF_MODE_AIS)
-		{
-			html += "<label id=\"mode_desc1\"><i>Use frequency [87B]161.975Mhz,[88B]162.025MHz RX Only.</i></label>\n";
-		}
-		html += "</td>\n";
-		float freq1Min = 137;
-		float freq1Max = 1020;
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Frequency:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"freq1\" name=\"freq1\" min=\"" + String(freq1Min, 3) + "\" max=\"" + String(freq1Max, 3) + "\"\n";
-		html += "step=\"0.001\" value=\"" + String(config.rf1_freq, 3) + "\" /> MHz <i>[SX126x:150-960MHz],[SX1278:137-175Mhz,410-525Mhz]</i></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Offset Freq:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"freq1_offset\" name=\"freq1_offset\" min=\"-30000\" max=\"30000\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf1_freq_offset) + "\" /> Hz   <i>[SX1276:137-175Mhz,410-525Mhz,862-1020Mhz]</i></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>TX Power:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_power\" id=\"rf1_power\">\n";
-		int pwr1Max = 23;
-		if (config.rf1_type == RF_SX1272 || config.rf1_type == RF_SX1273 || config.rf1_type == RF_SX1276 || config.rf1_type == RF_SX1278 || config.rf1_type == RF_SX1279)
-			pwrMax = 21;
-
-		for (int i = -9; i < pwr1Max; i++)
-		{
-			if (config.rf1_power == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += " dBm</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>RX Boost:</b></td>\n";
-		String boostEnFlag1 = "";
-		if (config.rf1_rx_boost)
-			boostEnFlag1 = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"rxBoost1\" value=\"OK\" " + boostEnFlag1 + "><span class=\"slider round\"></span></label></td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Preamble Length:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"rf1_pream\" name=\"rf1_pream\" min=\"0\" max=\"255\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf1_preamable) + "\" /></td>\n";
-		html += "</tr>\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Band Width:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_bw\" id=\"rf1_bw\">\n";
-		if (config.rf1_mode == RF_MODE_LoRa)
-		{
-			for (int i = 0; i < sizeof(LORA_BW) / sizeof(float); i++)
-			{
-				if ((config.rf1_bw > (LORA_BW[i] - 0.5)) && (config.rf1_bw < (LORA_BW[i] + 0.5)))
-					html += "<option value=\"" + String(LORA_BW[i], 2) + "\" selected>" + String(LORA_BW[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(LORA_BW[i], 2) + "\" >" + String(LORA_BW[i], 1) + "</option>\n";
-			}
-		}
-		else
-		{
-			if (config.rf1_type == RF_SX1272 || config.rf1_type == RF_SX1273 || config.rf1_type == RF_SX1276 || config.rf1_type == RF_SX1278 || config.rf1_type == RF_SX1279)
-			{
-				for (int i = 0; i < sizeof(BW1) / sizeof(float); i++)
-				{
-					if ((config.rf1_bw > (BW1[i] - 0.5)) && (config.rf1_bw < (BW1[i] + 0.5)))
-						html += "<option value=\"" + String(BW1[i], 1) + "\" selected>" + String(BW1[i], 1) + "</option>\n";
-					else
-						html += "<option value=\"" + String(BW1[i], 1) + "\" >" + String(BW1[i], 1) + "</option>\n";
-				}
-			}
-			else
-			{
-				for (int i = 0; i < sizeof(BW2) / sizeof(float); i++)
-				{
-					if ((config.rf1_bw > (BW2[i] - 0.5)) && (config.rf1_bw < (BW2[i] + 0.5)))
-						html += "<option value=\"" + String(BW2[i], 1) + "\" selected>" + String(BW2[i], 1) + "</option>\n";
-					else
-						html += "<option value=\"" + String(BW2[i], 1) + "\" >" + String(BW2[i], 1) + "</option>\n";
-				}
-			}
-		}
-		html += "</select> KHz. <i>(GFSK: RX Band width)</i>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>AX.25 Protocol:</b></td>\n";
-		radioEnFlag = "";
-		if (config.rf1_ax25)
-			radioEnFlag = "checked";
-		html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"ax25En1\" id=\"ax25En1\" value=\"OK\" " + radioEnFlag + "><span class=\"slider round\"></span></label></td>\n";
-		html += "</tr>\n";
-
-		// LoRa Group
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>LoRa Modem:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		if (config.rf1_mode == RF_MODE_LoRa)
-			html += "<fieldset id=\"loraGrp1\">\n";
-		else
-			html += "<fieldset id=\"loraGrp1\" disabled>\n";
-		html += "<legend>LoRa Modem Configuration</legend>\n";
-		html += "<table style=\"text-align: left;\">\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Spread Factor:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_sf\" id=\"rf1_sf\">\n";
-		for (int i = 5; i < 13; i++)
-		{
-			if (config.rf1_sf == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\" width=\"20%\"><b>Sync Word:</b></td>\n";
-		html += "<td style=\"text-align: left;\"><input type=\"number\" id=\"rf1_sync\" name=\"rf1_sync\" min=\"1\" max=\"255\"\n";
-		html += "step=\"1\" value=\"" + String(config.rf1_sync) + "\" /></td>\n";
-		html += "</tr>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Coding Rate:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_cr\" id=\"rf1_cr\">\n";
-		for (int i = 5; i < 9; i++)
-		{
-			if (config.rf1_cr == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(i) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(i) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-
-		html += "</table>*QuickCFG <button type=\"button\" onClick=\"loraVHF1()\" style=\"background-color:green;color:white\">VHF</button>[<i>Freq:144.410Mhz,SF=8,BW=10.4Khz</i>] <button type=\"button\" onClick=\"loraUHF1()\" style=\"background-color:gray;color:white\">UHF</button>[<i>Freq:433.775Mhz,SF=12,BW=125Khz</i>] <button type=\"button\" onClick=\"loraUHFCB()\" style=\"background-color:red;color:white\">CB</button><br /></fieldset></tr>";
-
-		// GFSK Group
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>GFSK Modem:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		if (config.rf1_mode != RF_MODE_LoRa)
-			html += "<fieldset id=\"gfskGrp1\">\n";
-		else
-			html += "<fieldset id=\"gfskGrp1\" disabled>\n";
-		html += "<legend>GFSK Modem Configuration</legend>\n";
-		html += "<table style=\"text-align: left;\">\n";
-
-		html += "<tr>\n";
-		html += "<td align=\"right\" width=\"20%\"><b>Baud Rate:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_br\" id=\"rf1_br\">\n";
-
-		if (config.rf1_type == RF_SX1272 || config.rf1_type == RF_SX1273 || config.rf1_type == RF_SX1276 || config.rf1_type == RF_SX1278 || config.rf1_type == RF_SX1279)
-		{
-			for (int i = 0; i < sizeof(BR1) / sizeof(float); i++)
-			{
-				if ((config.rf1_br > (BR1[i] - 0.5)) && (config.rf1_br < (BR1[i] + 0.5)))
-					html += "<option value=\"" + String(BR1[i], 1) + "\" selected>" + String(BR1[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(BR1[i], 1) + "\" >" + String(BR1[i], 1) + "</option>\n";
-			}
-		}
-		else
-		{
-			for (int i = 0; i < sizeof(BR2) / sizeof(float); i++)
-			{
-				if ((config.rf1_br > (BR2[i] - 0.5)) && (config.rf1_br < (BR2[i] + 0.5)))
-					html += "<option value=\"" + String(BR2[i], 1) + "\" selected>" + String(BR2[i], 1) + "</option>\n";
-				else
-					html += "<option value=\"" + String(BR2[i], 1) + "\" >" + String(BR2[i], 1) + "</option>\n";
-			}
-		}
-		html += "</select> Kbps.\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Shaping:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_shaping\" id=\"rf1_shaping\">\n";
-		for (int i = 0; i < 5; i++)
-		{
-			if (config.rf1_shaping == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(SHAPING[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(SHAPING[i]) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-		html += "<tr>\n";
-		html += "<td align=\"right\"><b>Encoding:</b></td>\n";
-		html += "<td style=\"text-align: left;\">\n";
-		html += "<select name=\"rf1_encoding\" id=\"rf1_encoding\">\n";
-		for (int i = 0; i < 3; i++)
-		{
-			if (config.rf1_encoding == i)
-				html += "<option value=\"" + String(i) + "\" selected>" + String(ENCODING[i]) + "</option>\n";
-			else
-				html += "<option value=\"" + String(i) + "\" >" + String(ENCODING[i]) + "</option>\n";
-		}
-		html += "</select>\n";
-		html += "</td>\n";
-		html += "</tr>\n";
-
-		html += "</table></fieldset></tr>";
-
-		// html += "</table>\n";
-		html += "<tr><td colspan=\"2\" align=\"right\">\n";
-		html += "<div><button class=\"button\" type='submit' id='submitRadio1'  name=\"commitRadio1\"> Apply Change </button></div>\n";
-		html += "<input type=\"hidden\" name=\"commitRadio1\"/>\n";
-		html += "</td></tr></table><br />\n";
-		html += "</form>";
-#endif
-
-		// html += "<div class=\"form-group\">\n";
-		// html += "<label class=\"col-sm-4 col-xs-12 control-label\"></label>\n";
-		// html += "<div class=\"col-sm-2 col-xs-4\"><button type='submit' id='submitRadio' name=\"commitRadio\"> Apply Change </button></div>\n";
-		// html += "</div><br />\n";
-		// html += "<input type=\"hidden\" name=\"commitRadio\"/>\n";
-		// html += "</form>";
-		request->send(200, "text/html", html); // send to someones browser when asked
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(RADIO_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "Sysinfo");
 	}
 }
 
+// v2.1.3.1-audiotest: TX audio calibration tone (see "TX Audio Calibration" section of the
+// RADIO page). Real RF/PTT - AFSK_StartTxCalibration() enforces its own hard 10s safety timeout
+// independently of this HTTP request, so this handler just needs to kick it off and reply; it
+// does not need to (and must not) block for the duration of the tone.
+void handle_calibrate_tone(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	String type = "low";
+	if (request->hasArg("type"))
+		type = request->arg("type");
+
+	uint8_t toneType = 0; // default: low/mark tone
+	const char *toneName = "1200Hz (low tone)";
+	if (type == "high")
+	{
+		toneType = 1;
+		toneName = "2200Hz (high tone)";
+	}
+	else if (type == "alt")
+	{
+		toneType = 2;
+		toneName = "alternating 1200/2200Hz";
+	}
+
+	if (!config.rf_en)
+	{
+		request->send(409, "text/plain", "RF disabled (RADIO tab > Enable) - enable the RF module before calibrating.");
+		return;
+	}
+
+	// 2.1.5: never start the tone while the RF scheduler is transmitting (or a PTT OFF
+	// is pending): it would collide with the packet. The user just retries in a moment.
+	{
+		bool schedBusy = false, txNow = false, pttOffPend = false;
+		lu6jmfTxDebugSnapshot(&schedBusy, NULL, &txNow, &pttOffPend,
+							  NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+		if (schedBusy || txNow || pttOffPend)
+		{
+			request->send(409, "text/plain", "The digipeater is transmitting right now - wait a few seconds and press the tone button again.");
+			return;
+		}
+	}
+
+	char msg[220];
+	if (AFSK_StartTxCalibration(toneType))
+	{
+		// v2.1.3.1-audiotest (debug): echo back the gain/preemphasis values actually in effect for
+		// this tone, so we can confirm from the browser whether Apply Change really propagated them,
+		// without needing a serial console.
+		snprintf(msg, sizeof(msg),
+				 "Tone %s started - transmitting for 10s, PTT turns off automatically. "
+				 "[debug: gain=%u%% preemph=%s tilt=%u%%]",
+				 toneName, config.tx_audio_gain, config.tx_preemphasis ? "ON" : "OFF", config.tx_preemphasis_tilt);
+		request->send(200, "text/plain", msg);
+	}
+	else
+	{
+		request->send(409, "text/plain", "A tone is already playing or the digipeater is transmitting - wait a few seconds and press the button again.");
+	}
+}
+
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+static const char *VPN_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formVPN\") document.getElementById(\"submitVPN\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/vpn',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"function vpnMsg(t) { var e = document.getElementById('vpnreg'); if (e) e.textContent = t; }\n"
+	"function loadVPNConfig() {\n"
+	"const url = \"http://hs1.hs5tqa.ampr.org:81/wg/create\";\n"
+	"const espID = {'name': '{{espId}}'};\n"
+	"vpnMsg('Registering... the server can take up to a minute, please wait.');\n"
+	"const ctl = new AbortController();\n"
+	"const tm = setTimeout(() => ctl.abort(), 90000);\n"
+	"fetch(url,{\n"
+	"method: 'POST',\n"
+	"body: JSON.stringify(espID),\n"
+	"signal: ctl.signal,\n"
+	"headers: { 'Content-Type': 'application/json' }\n"
+	"})\n"
+	".then(response => { if (!response.ok) throw new Error('server answered ' + response.status); return response.json(); })\n"
+	".then(data => {\n"
+	"clearTimeout(tm);\n"
+	"vpnMsg('Done. Check the fields below, then click Apply Change and reboot the device.');\n"
+	"console.log(\"VPN Data:\", data);\n"
+	"document.getElementById(\"wg_enable\").checked = true;\n"
+	"document.getElementById(\"wg_peer_address\").value = data.Enpoint.split(\":\")[0];\n"
+	"document.getElementById(\"wg_port\").value = data.Enpoint.split(\":\")[1];\n"
+	"document.getElementById(\"wg_local_address\").value = data.Address;\n"
+	"document.getElementById(\"wg_netmask_address\").value = \"255.255.255.0\";\n"
+	"document.getElementById(\"wg_gw_address\").value = data.Gateway;\n"
+	"document.getElementById(\"wg_public_key\").value = data.PublicKey;\n"
+	"document.getElementById(\"wg_private_key\").value = data.PrivateKey;\n"
+	"})\n"
+	".catch(err => { clearTimeout(tm); vpnMsg('Could not register: ' + err + '. Wait a minute and try again.'); console.error(\"VPN API Error:\", err); });\n}\n"
+	"</script>\n"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromVPN\" method=\"post\">\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>Wireguard Configuration</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Status</b></td><td style=\"text-align: left;\">{{vpnStatus}}</td></tr>\n"
+	"<tr>"
+	"<td align=\"right\"><b>Enable</b></td>\n"
+	"{{#if vpnEnabled}}"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"wg_enable\" name=\"vpnEnable\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n"
+	"{{else}}"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"wg_enable\" name=\"vpnEnable\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n"
+	"{{/if}}"
+	"</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Server Address</b></td>\n<td style=\"text-align: left;\"><input  size=\"20\" maxlength=\"32\" id=\"wg_peer_address\" name=\"wg_peer_address\" type=\"text\" value=\"{{peerAddress}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Server Port</b></td>\n<td style=\"text-align: left;\"><input id=\"wg_port\" size=\"5\" name=\"wg_port\" type=\"number\" value=\"{{port}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Local Address</b></td>\n<td style=\"text-align: left;\"><input id=\"wg_local_address\" name=\"wg_local_address\" type=\"text\" value=\"{{localAddress}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Netmask</b></td>\n<td style=\"text-align: left;\"><input id=\"wg_netmask_address\" name=\"wg_netmask_address\" type=\"text\" value=\"{{netmask}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Gateway</b></td>\n<td style=\"text-align: left;\"><input id=\"wg_gw_address\" name=\"wg_gw_address\" type=\"text\" value=\"{{gateway}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Public Server Key</b></td>\n<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"44\" id=\"wg_public_key\" name=\"wg_public_key\" type=\"text\" value=\"{{publicKey}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Private Client Key</b></td>\n<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"44\" id=\"wg_private_key\" name=\"wg_private_key\" type=\"text\" value=\"{{privateKey}}\" /></td>\n</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitVPN'  name=\"commitVPN\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitVPN\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br /><br />"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromGetVPN\" method=\"post\">\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>Helper: Free VPN Wireguard for Web Service</b></span></th>\n"
+	"<tr><td align=\"left\">1. Click New Register button to get VPN config from web service.</td></tr>\n"
+	"<tr><td align=\"left\">2. The VPN config will fill in the form automatically.</td></tr>\n"
+	"<tr><td align=\"left\">3. Click Apply Change and reboot again.</td></tr>\n"
+	"<tr><td align=\"left\">4. Enjoy your free VPN service!</td></tr>\n"
+	"{{#if amprUrl}}"
+	"<tr><td>Your External by AMPR URL: <a href=\"{{amprUrl}}\" target=\"_blank\">{{amprUrl}}</a></td></tr>\n"
+	"<tr><td>Fast Direct URL: <a href=\"{{directUrl}}\" target=\"_blank\">{{directUrl}}</a></td></tr>\n"
+	"{{/if}}"
+	"<tr><td><button type=\"button\" onclick=\"loadVPNConfig()\">New Register</button></td></tr>\n"
+	"<tr><td id=\"vpnreg\" align=\"left\"></td></tr>\n"
+	"</table><br />\n"
+	"</form>";
+
+extern "C" const char *wireguard_last_error; // wireguard_vpn.cpp - why the tunnel was not started
+
 void handle_vpn(AsyncWebServerRequest *request)
 {
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
@@ -3147,8 +2930,10 @@ void handle_vpn(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.wg_public_key, request->arg(i).c_str());
-					config.wg_public_key[44] = 0;
+					// LU6JMF: trim pasted whitespace/newline (it shifts the key and breaks it) + bounded copy
+					String k = request->arg(i);
+					k.trim();
+					strlcpy(config.wg_public_key, k.c_str(), sizeof(config.wg_public_key));
 				}
 			}
 
@@ -3156,8 +2941,9 @@ void handle_vpn(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.wg_private_key, request->arg(i).c_str());
-					config.wg_private_key[44] = 0;
+					String k = request->arg(i);
+					k.trim();
+					strlcpy(config.wg_private_key, k.c_str(), sizeof(config.wg_private_key));
 				}
 			}
 
@@ -3165,7 +2951,9 @@ void handle_vpn(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.wg_peer_address, request->arg(i).c_str());
+					String pa = request->arg(i);
+					pa.trim();
+					strlcpy(config.wg_peer_address, pa.c_str(), sizeof(config.wg_peer_address));
 				}
 			}
 
@@ -3194,195 +2982,129 @@ void handle_vpn(AsyncWebServerRequest *request)
 			}
 		}
 
+		// LU6JMF: never leave VPN enabled with unusable keys (a WireGuard key is exactly
+		// 44 base64 chars ending in '='); it used to crash the unit at every boot.
+		if (vpnEn && !(strlen(config.wg_private_key) == 44 && config.wg_private_key[43] == '=' &&
+					   strlen(config.wg_public_key) == 44 && config.wg_public_key[43] == '='))
+		{
+			vpnEn = false;
+		}
 		config.vpn = vpnEn;
 		saveConfig(request);
 	}
 	else
 	{
-		// Using dynamic memory allocation instead of String
-		char *html = allocateStringMemory(8192); // Initial buffer size, adjust as needed
-		if (!html)
-		{
-			return; // Memory allocation failed
-		}
-
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formVPN\") document.getElementById(\"submitVPN\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/vpn',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-
-		// Get MAC address and remove colons
+		JsonDocument data;
 		String ESP32_ID = WiFi.macAddress();
 		ESP32_ID.replace(":", "");
-		char temp_buffer[512];
-		snprintf(temp_buffer, sizeof(temp_buffer), "function loadVPNConfig() {\nconst url = \"http://hs1.hs5tqa.ampr.org:81/wg/create\";\nconst espID = {'name': '%s'};\n", ESP32_ID.c_str());
-		strcat(html, temp_buffer);
-		strcat(html, "fetch(url,{\n");
-		strcat(html, "method: 'POST',\n");
-		strcat(html, "body: JSON.stringify(espID),\n");
-		strcat(html, "headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Origin': '*','Access-Control-Allow-Methods': 'POST,GET,OPTIONS'}\n");
-		strcat(html, "})\n");
-		strcat(html, ".then(response => response.json())\n");
-		strcat(html, ".then(data => {\n");
-		strcat(html, "console.log(\"VPN Data:\", data);\n");
-		strcat(html, "document.getElementById(\"wg_enable\").checked = true;\n");
-		strcat(html, "document.getElementById(\"wg_peer_address\").value = data.Enpoint.split(\":\")[0];\n");
-		strcat(html, "document.getElementById(\"wg_port\").value = data.Enpoint.split(\":\")[1];\n");
-		strcat(html, "document.getElementById(\"wg_local_address\").value = data.Address;\n");
-		strcat(html, "document.getElementById(\"wg_netmask_address\").value = \"255.255.255.0\";\n");
-		strcat(html, "document.getElementById(\"wg_gw_address\").value = data.Gateway;\n");
-		strcat(html, "document.getElementById(\"wg_public_key\").value = data.PublicKey;\n");
-		strcat(html, "document.getElementById(\"wg_private_key\").value = data.PrivateKey;\n");
-		strcat(html, "})\n");
-		strcat(html, ".catch(err => console.error(\"VPN API Error:\", err));\n}\n");
-		strcat(html, "</script>\n");
-		// ===== JavaScript AJAX =====
-		// strcat(html, "<script>\n");
-		// strcat(html, "function loadVPNConfig() {\n");
-		// strcat(html, "  $.ajax({\n");
-		// strcat(html, "    url: '/api/vpnreq',\n");
-		// strcat(html, "    method: 'GET',\n");
-		// strcat(html, "    dataType: 'json',\n");
-		// strcat(html, "    success: function(data) {\n");
-		// strcat(html, "       console.log(data);\n");
-		// strcat(html, "       let ep = data.Enpoint.split(':');\n");
-		// strcat(html, "       $('#wg_peer_address').val(ep[0]);\n");
-		// strcat(html, "       $('#wg_port').val(ep[1]);\n");
-		// strcat(html, "       $('#wg_local_address').val(data.Address);\n");
-		// strcat(html, "       $('#wg_public_key').val(data.PublicKey);\n");
-		// strcat(html, "       $('#wg_private_key').val(data.PrivateKey);\n");
-		// strcat(html, "    },\n");
-		// strcat(html, "    error: function(e) {\n");
-		// strcat(html, "       alert('โหลดข้อมูล VPN ไม่สำเร็จ');\n");
-		// strcat(html, "       console.log(e);\n");
-		// strcat(html, "    }\n");
-		// strcat(html, "  });\n");
-		// strcat(html, "}\n");
-		// strcat(html, "</script>");
+		data["espId"] = ESP32_ID;
+		data["vpnEnabled"] = config.vpn;
+		data["peerAddress"] = config.wg_peer_address;
+		data["port"] = config.wg_port;
+		data["localAddress"] = config.wg_local_address;
+		data["netmask"] = config.wg_netmask_address;
+		data["gateway"] = config.wg_gw_address;
+		data["publicKey"] = config.wg_public_key;
+		data["privateKey"] = config.wg_private_key;
 
-		// strcat(html, "<h2>System Setting</h2>\n");
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromVPN\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Wireguard Configuration</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// Handle sync flag
-		if (config.vpn)
+		// LU6JMF: tell the user WHY the tunnel is not up (it used to fail silently / crash).
 		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"wg_enable\" name=\"vpnEnable\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n");
+			String st;
+			if (!config.vpn)
+				st = "Disabled";
+			else if (wireguard_last_error != NULL && wireguard_last_error[0] != '\0')
+				st = String("NOT RUNNING - ") + wireguard_last_error + ". Fix it, Apply Change and reboot.";
+			else if (wireguard_active())
+				st = "Started (waiting for the server handshake, or connected)";
+			else
+				st = "Enabled, waiting for WiFi and clock sync";
+			data["vpnStatus"] = st;
 		}
-		else
-		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"wg_enable\" name=\"vpnEnable\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n");
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Address</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  size=\"20\" maxlength=\"32\" id=\"wg_peer_address\" name=\"wg_peer_address\" type=\"text\" value=\"%s\" /></td>\n", config.wg_peer_address);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Port</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input id=\"wg_port\" size=\"5\" name=\"wg_port\" type=\"number\" value=\"%d\" /></td>\n", config.wg_port);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Local Address</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input id=\"wg_local_address\" name=\"wg_local_address\" type=\"text\" value=\"%s\" /></td>\n", config.wg_local_address);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Netmask</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input id=\"wg_netmask_address\" name=\"wg_netmask_address\" type=\"text\" value=\"%s\" /></td>\n", config.wg_netmask_address);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Gateway</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input id=\"wg_gw_address\" name=\"wg_gw_address\" type=\"text\" value=\"%s\" /></td>\n", config.wg_gw_address);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Public Server Key</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"44\" id=\"wg_public_key\" name=\"wg_public_key\" type=\"text\" value=\"%s\" /></td>\n", config.wg_public_key);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Private Client Key</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"44\" id=\"wg_private_key\" name=\"wg_private_key\" type=\"text\" value=\"%s\" /></td>\n", config.wg_private_key);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitVPN'  name=\"commitVPN\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitVPN\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br /><br />");
-
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromGetVPN\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Helper: Free VPN Wireguard for Web Service</b></span></th>\n");
-		strcat(html, "<tr><td align=\"left\">1. Click New Register button to get VPN config from web service.</td></tr>\n");
-		strcat(html, "<tr><td align=\"left\">2. The VPN config will fill in the form automatically.</td></tr>\n");
-		strcat(html, "<tr><td align=\"left\">3. Click Apply Change and reboot again.</td></tr>\n");
-		strcat(html, "<tr><td align=\"left\">4. Enjoy your free VPN service!</td></tr>\n");
 
 		// Check if local address starts with "10.44."
 		String wg_local_addr = String(config.wg_local_address);
 		if (wg_local_addr.startsWith("10.44."))
 		{
 			int lastoct = wg_local_addr.substring(wg_local_addr.lastIndexOf('.') + 1).toInt();
-			// String url="http://"+String(config.wg_peer_address)+":"+String(8000+lastoct);
-			// strcat(html, "<tr><td>Your External Host IP: <a href=\"");
-			// snprintf(temp_buffer, sizeof(temp_buffer), "%s\">%s</a></td></tr>\n", url.c_str(), url.c_str());
-			// strcat(html, temp_buffer);
 			int thirdoct = wg_local_addr.substring(wg_local_addr.indexOf('.', wg_local_addr.indexOf('.') + 1) + 1, wg_local_addr.lastIndexOf('.')).toInt();
-			String url_base = "http://hs" + String(thirdoct) + ".hs5tqa.ampr.org:" + String((thirdoct * 10000) + 8000 + lastoct);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td>Your External by AMPR URL: <a href=\"%s\" target=\"_blank\">%s</a></td></tr>\n", url_base.c_str(), url_base.c_str());
-			strcat(html, temp_buffer);
-			url_base = "http://vpn.nakhonthai.net:" + String((thirdoct * 10000) + 8000 + lastoct);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td>Fast Direct URL: <a href=\"%s\" target=\"_blank\">%s</a></td></tr>\n", url_base.c_str(), url_base.c_str());
-			strcat(html, temp_buffer);
+			data["amprUrl"] = "http://hs" + String(thirdoct) + ".hs5tqa.ampr.org:" + String((thirdoct * 10000) + 8000 + lastoct);
+			data["directUrl"] = "http://vpn.nakhonthai.net:" + String((thirdoct * 10000) + 8000 + lastoct);
 		}
-		strcat(html, "<tr><td><button type=\"button\" onclick=\"loadVPNConfig()\">New Register</button></td></tr>\n");
-		strcat(html, "</table><br />\n");
-		strcat(html, "</form>");
 
-		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("VPN", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		String html_str = renderTemplate(VPN_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "VPN");
 	}
 }
 
 #ifdef MQTT
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+static const char *MQTT_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formVPN\") document.getElementById(\"submitMQTT\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/mqtt',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromMQTT\" method=\"post\">\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>MQTT Configuration</b></span></th>\n"
+	"<tr>"
+	"<td align=\"right\"><b>Enable</b></td>\n"
+	"{{#if enabled}}"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n"
+	"{{else}}"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n"
+	"{{/if}}"
+	"</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Server Address:</b></td>\n<td style=\"text-align: left;\"><input  size=\"30\" maxlength=\"32\" name=\"host\" type=\"text\" value=\"{{host}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Server Port:</b></td>\n<td style=\"text-align: left;\"><input size=\"5\"  maxlength=\"5\"  name=\"port\" type=\"number\" value=\"{{port}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>User:</b></td>\n<td style=\"text-align: left;\"><input maxlength=\"32\" name=\"user\" type=\"text\" value=\"{{user}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Password:</b></td>\n<td style=\"text-align: left;\"><input size=\"40\" maxlength=\"63\" name=\"pass\" type=\"password\" value=\"{{pass}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Topic:</b></td>\n<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"32\" id=\"topic\" name=\"topic\" type=\"text\" value=\"{{topic}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Topic Flag:</b></td>\n"
+	"<td align=\"center\">\n<fieldset id=\"TopicGrp\">\n"
+	"<legend>Topic Flags Send out MQTT</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTNC\" type=\"checkbox\" value=\"OK\" {{#if topicTNC}}checked{{/if}}/>TNC</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSts\" type=\"checkbox\" value=\"OK\" {{#if topicSts}}checked{{/if}}/>Status</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTlm\" type=\"checkbox\" value=\"OK\" {{#if topicTlm}}checked{{/if}}/>Telemetry</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicWX\" type=\"checkbox\" value=\"OK\" {{#if topicWX}}checked{{/if}}/>Weather</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSensor\" type=\"checkbox\" value=\"OK\" {{#if topicSensor}}checked{{/if}}/>Sensor</td>\n"
+	"<td style=\"border:unset;\"></td>"
+	"</tr></table></fieldset>\n</td></tr>\n"
+	"<tr>\n<td align=\"right\"><b>Subscription:</b></td>\n<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"32\" name=\"subscribe\" type=\"text\" value=\"{{subscribe}}\" /></td>\n</tr>\n"
+	"<tr>\n<td align=\"right\"><b>Subscription Flag:</b></td>\n"
+	"<td align=\"center\">\n<fieldset id=\"SubGrp\">\n"
+	"<legend>Subscription Flags Receive</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subCMD\" type=\"checkbox\" value=\"OK\" {{#if subCMD}}checked{{/if}}/>AT-Command</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subTNC\" type=\"checkbox\" value=\"OK\" {{#if subTNC}}checked{{/if}}/>TNC</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subMsg\" type=\"checkbox\" value=\"OK\" {{#if subMsg}}checked{{/if}}/>Message</td>\n"
+	"<td style=\"border:unset;\"></td>"
+	"</tr></table></fieldset>\n</td></tr>\n"
+	"</table><br />\n"
+	"<td><input class=\"button\" id=\"submitMQTT\" name=\"commitMQTT\" type=\"submit\" value=\"Save Config\" maxlength=\"80\"/></td>\n"
+	"<input type=\"hidden\" name=\"commitMQTT\"/>\n"
+	"</form>\n";
+
 void handle_mqtt(AsyncWebServerRequest *request)
 {
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
@@ -3536,202 +3258,468 @@ void handle_mqtt(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Using dynamic memory allocation instead of String
-		char *html = allocateStringMemory(8192); // Initial buffer size, adjust as needed
-		if (!html)
-		{
-			return; // Memory allocation failed
-		}
+		JsonDocument data;
+		data["enabled"] = config.en_mqtt;
+		data["host"] = config.mqtt_host;
+		data["port"] = config.mqtt_port;
+		data["user"] = config.mqtt_user;
+		data["pass"] = config.mqtt_pass;
+		data["topic"] = config.mqtt_topic;
+		data["subscribe"] = config.mqtt_subscribe;
+		data["topicTNC"] = (bool)(config.mqtt_topic_flag & MQTT_TOPIC_TNC);
+		data["topicSts"] = (bool)(config.mqtt_topic_flag & MQTT_TOPIC_STATUS);
+		data["topicTlm"] = (bool)(config.mqtt_topic_flag & MQTT_TOPIC_TELEMETRY);
+		data["topicWX"] = (bool)(config.mqtt_topic_flag & MQTT_TOPIC_WX);
+		data["topicSensor"] = (bool)(config.mqtt_topic_flag & MQTT_TOPIC_SENSOR);
+		data["subCMD"] = (bool)(config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_CMD);
+		data["subTNC"] = (bool)(config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_TNC);
+		data["subMsg"] = (bool)(config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_MESSAGE);
 
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formVPN\") document.getElementById(\"submitMQTT\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/mqtt',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
-
-		// strcat(html, "<h2>System Setting</h2>\n");
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromMQTT\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>MQTT Configuration</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// Handle sync flag
-		if (config.en_mqtt)
-		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n");
-		}
-		else
-		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n");
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Address:</b></td>\n");
-		char temp_buffer[512];
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  size=\"30\" maxlength=\"32\" name=\"host\" type=\"text\" value=\"%s\" /></td>\n", config.mqtt_host);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Port:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"5\"  maxlength=\"5\"  name=\"port\" type=\"number\" value=\"%d\" /></td>\n", config.mqtt_port);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>User:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input maxlength=\"32\" name=\"user\" type=\"text\" value=\"%s\" /></td>\n", config.mqtt_user);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Password:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"40\" maxlength=\"63\" name=\"pass\" type=\"password\" value=\"%s\" /></td>\n", config.mqtt_pass);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Topic:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"32\" id=\"topic\" name=\"topic\" type=\"text\" value=\"%s\" /></td>\n", config.mqtt_topic);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Topic Flag:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<fieldset id=\"TopicGrp\">\n");
-		strcat(html, "<legend>Topic Flags Send out MQTT</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		// Handle topic flags
-		if (config.mqtt_topic_flag & MQTT_TOPIC_TNC)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTNC\" type=\"checkbox\" value=\"OK\" checked/>TNC</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTNC\" type=\"checkbox\" value=\"OK\" />TNC</td>\n");
-		}
-
-		if (config.mqtt_topic_flag & MQTT_TOPIC_STATUS)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSts\" type=\"checkbox\" value=\"OK\" checked/>Status</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSts\" type=\"checkbox\" value=\"OK\" />Status</td>\n");
-		}
-
-		if (config.mqtt_topic_flag & MQTT_TOPIC_TELEMETRY)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTlm\" type=\"checkbox\" value=\"OK\" checked/>Telemetry</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicTlm\" type=\"checkbox\" value=\"OK\" />Telemetry</td>\n");
-		}
-
-		if (config.mqtt_topic_flag & MQTT_TOPIC_WX)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicWX\" type=\"checkbox\" value=\"OK\" checked/>Weather</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicWX\" type=\"checkbox\" value=\"OK\" />Weather</td>\n");
-		}
-
-		if (config.mqtt_topic_flag & MQTT_TOPIC_SENSOR)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSensor\" type=\"checkbox\" value=\"OK\" checked/>Sensor</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"TopicSensor\" type=\"checkbox\" value=\"OK\" />Sensor</td>\n");
-		}
-
-		strcat(html, "<td style=\"border:unset;\"></td>");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Subscription:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"50\" maxlength=\"32\" name=\"subscribe\" type=\"text\" value=\"%s\" /></td>\n", config.mqtt_subscribe);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Subscription Flag:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<fieldset id=\"SubGrp\">\n");
-		strcat(html, "<legend>Subscription Flags Receive</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		// Handle subscription flags
-		if (config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_CMD)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subCMD\" type=\"checkbox\" value=\"OK\" checked/>AT-Command</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subCMD\" type=\"checkbox\" value=\"OK\" />AT-Command</td>\n");
-		}
-
-		if (config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_TNC)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subTNC\" type=\"checkbox\" value=\"OK\" checked/>TNC</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subTNC\" type=\"checkbox\" value=\"OK\" />TNC</td>\n");
-		}
-
-		if (config.mqtt_subscribe_flag & MQTT_SUBSCRIBE_MESSAGE)
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subMsg\" type=\"checkbox\" value=\"OK\" checked/>Message</td>\n");
-		}
-		else
-		{
-			strcat(html, "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"subMsg\" type=\"checkbox\" value=\"OK\" />Message</td>\n");
-		}
-
-		strcat(html, "<td style=\"border:unset;\"></td>");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "</table><br />\n");
-		strcat(html, "<td><input class=\"button\" id=\"submitMQTT\" name=\"commitMQTT\" type=\"submit\" value=\"Save Config\" maxlength=\"80\"/></td>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitMQTT\"/>\n");
-		strcat(html, "</form>\n");
-
-		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("MQTT", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		String html_str = renderTemplate(MQTT_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "MQTT");
 	}
 }
 #endif
+
+// v2.1.2-lu6jmf: format a minute count as a short human string (min / h / days)
+static void formatMinutesShort(char *buf, size_t bufSize, unsigned long totalMinutes)
+{
+	if (totalMinutes < 60)
+	{
+		snprintf(buf, bufSize, "%lumin", totalMinutes);
+	}
+	else if (totalMinutes < 1440)
+	{
+		unsigned long h = totalMinutes / 60;
+		unsigned long m = totalMinutes % 60;
+		if (m == 0)
+			snprintf(buf, bufSize, "%luh", h);
+		else
+			snprintf(buf, bufSize, "%luh%02lumin", h, m);
+	}
+	else
+	{
+		unsigned long d = totalMinutes / 1440;
+		unsigned long h = (totalMinutes % 1440) / 60;
+		if (h == 0)
+			snprintf(buf, bufSize, "%lud", d);
+		else
+			snprintf(buf, bufSize, "%lud%luh", d, h);
+	}
+}
+
+// v2.1.2-lu6jmf: preview of the resulting NEWS send schedule (growing-gap: msg1 immediate,
+// then gaps 2T,3T,4T,5T,... -> cumulative offsets 0, 2T, 5T, 9T, 14T, 20T, ...)
+static void buildNewsSchedulePreview(char *buf, size_t bufSize, uint16_t baseTMinutes)
+{
+	if (baseTMinutes < 5)
+		baseTMinutes = 5;
+	buf[0] = 0;
+	char part[16];
+	for (uint8_t k = 0; k <= 5; k++)
+	{
+		unsigned long offsetMin = (k == 0) ? 0UL : (unsigned long)baseTMinutes * k * (k + 3) / 2UL;
+		if (k == 0)
+			strlcpy(part, "0", sizeof(part));
+		else
+			formatMinutesShort(part, sizeof(part), offsetMin);
+		if (k > 0)
+			strlcat(buf, " -> ", bufSize);
+		strlcat(buf, part, bufSize);
+	}
+	strlcat(buf, " -> ...", bufSize);
+}
+
+static const char *MSG_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formMSG\") document.getElementById(\"submitMSG\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formBLN\") document.getElementById(\"submitBLN\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formChat\") document.getElementById(\"submitChat\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/msg',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"if(e.currentTarget.id===\"formMSG\") alert(\"Submited Successfully\");\n"
+	"if(e.currentTarget.id===\"formBLN\") alert(\"Submited Successfully\");\n"
+	"if(e.currentTarget.id===\"formChat\") { document.getElementById(\"submitChat\").disabled=false; document.getElementById(\"msg\").value=\"\"; }\n"
+	"},\n"
+	"error: function (data) {\n"
+	"if(e.currentTarget.id===\"formMSG\") alert(\"An error occurred.\");\n"
+	"if(e.currentTarget.id===\"formBLN\") alert(\"An error occurred.\");\n"
+	"if(e.currentTarget.id===\"formChat\") { alert(\"An error occurred.\"); document.getElementById(\"submitChat\").disabled=false; }\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<div style=\"text-align:right;color:#999;font-size:7pt;padding:2px 4px;\">{{buildInfo}}</div>\n"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formMSG\" method=\"post\">\n"
+	"<table width=\"90%\">\n"
+	"<th colspan=\"2\"><span><b>Message Configuration</b></span></th>\n"
+	"<tr>"
+	"<td align=\"right\"><b>Enable</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" {{#if msgEnabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>My Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input  size=\"20\" maxlength=\"9\" name=\"mycall\" type=\"text\" value=\"{{myCall}}\" /> *<i>Callsign with SSID (Ex. HS5TQA-12)</i></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"msgRf\" value=\"OK\" {{#if msgRf}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"msgInet\" value=\"OK\" {{#if msgInet}}checked{{/if}}/>Internet </td></tr>\n"
+	"<tr>"
+	"<td align=\"right\"><b>Encryption</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"encrypt\" value=\"OK\" {{#if msgEncrypt}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>AES Key:</b></td>\n"
+	"<td style=\"text-align: left;\"><input  size=\"40\" maxlength=\"33\" name=\"key\" type=\"text\" value=\"{{key}}\" /> *<i>ASCII HEX 16Byte</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Send Retry:</b></td>\n"
+	"<td style=\"text-align: left;\"><input  min=\"0\" max=\"99\"   name=\"retry\" type=\"number\" value=\"{{retry}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Send Timeout:</b></td>\n"
+	"<td style=\"text-align: left;\"><input  min=\"1\" max=\"9999\"   name=\"timeout\" type=\"number\" value=\"{{timeout}}\" /> Sec.</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"path\" id=\"path\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitMSG'  name=\"commitMSG\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitMSG\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br /><br />"
+	"<table width=\"90%\">\n"
+	"<th style=\"background-color: #070ac2;\">CHAT MESSAGE</th>\n"
+	"<tr><td>\n"
+	"<table id=\"chatMsg\">\n"
+	"{{chatMessageHtml}}"
+	"</table>\n"
+	"</td></tr><tr><td colspan=\"5\">"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formChat\" method=\"post\">\n"
+	"<table>\n"
+	"<tr>\n"
+	"<td align=\"left\"><b>TO:</b><input size=\"10\" name=\"toCall\" id=\"toCall\" type=\"text\" value=\"\" oninput=\"this.value=this.value.toUpperCase();\" /> <b>MSG:</b><input size=\"80\" name=\"msg\" id=\"msg\" type=\"text\" value=\"\" /></td>\n"
+	"<td align=\"right\">\n"
+	"<input class=\"button\" id=\"submitChat\" name=\"commitChat\" type=\"submit\" value=\"Send\"/>\n"
+	"<input type=\"hidden\" name=\"commitChat\"/>\n"
+	"</td></tr></table>\n"
+	"</form><br />\n"
+	"</td></tr></table><br />\n"
+	"<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formBLN\" method=\"post\">\n"
+	"<table width=\"90%\" style=\"table-layout:fixed;border-collapse:collapse;\">\n"
+	"<th colspan=\"7\" style=\"background-color: #070ac2;\"><span><b>Bulletins: BLN1-BLN4 Alerts, NEWS5-NEWS9</b></span></th>\n"
+	"<tr><td colspan=\"7\"><i>Uses the same TX Channel/PATH as Message Configuration above.</i></td></tr>\n"
+	"<tr>"
+	"<td align=\"center\" style=\"width:6%;\"><b>#</b></td>"
+	"<td align=\"center\" style=\"width:8%;\"><b>Enable</b></td>"
+	"<td align=\"center\" style=\"width:38%;\"><b>Text</b></td>"
+	"<td align=\"center\" style=\"width:14%;\"><b>Interval</b></td>"
+	"<td align=\"center\" style=\"width:12%;\"><b>Limit</b><br /><i style=\"font-weight:normal;font-size:8pt;\">0 = unlimited</i></td>"
+	"<td align=\"center\" style=\"width:14%;\"><b>Active for</b></td>"
+	"<td align=\"center\" style=\"width:8%;\"><b>Sent</b></td>"
+	"</tr>\n"
+	"{{#each blnRows}}<tr>\n"
+	"{{#if isNews}}<td align=\"center\"><b>NEWS{{num}}</b></td>\n"
+	"{{else}}<td align=\"center\"><b>BLN{{num}}</b></td>\n"
+	"{{/if}}"
+	"<td align=\"center\"><label class=\"switch\"><input type=\"checkbox\" name=\"blnEn{{num}}\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"<td style=\"text-align: left;\"><input id=\"blnTxt{{num}}\" style=\"width:96%;box-sizing:border-box;\" maxlength=\"{{maxLen}}\" name=\"blnText{{num}}\" type=\"text\" value=\"{{text}}\" oninput=\"var n=this.maxLength-this.value.length;var c=document.getElementById('blnCnt{{num}}');c.textContent=n+' left';c.style.color=(n<0)?'red':'#2e7d32';\" /><br />"
+	"<span id=\"blnCnt{{num}}\" style=\"font-size:8pt;color:{{charsLeftColor}};\">{{charsLeft}} left</span></td>\n"
+	"<td style=\"text-align: left;\"><select style=\"width:96%;box-sizing:border-box;\" name=\"blnInv{{num}}\">{{#each intervalOptions}}<option value=\"{{value}}\"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}</select></td>\n"
+	"<td style=\"text-align: left;\"><input style=\"width:90%;box-sizing:border-box;\" min=\"0\" max=\"65535\" name=\"blnLim{{num}}\" type=\"number\" value=\"{{limit}}\" /></td>\n"
+	"<td style=\"text-align: left;\"><select style=\"width:96%;box-sizing:border-box;\" name=\"blnDur{{num}}\">{{#each durationOptions}}<option value=\"{{value}}\"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}</select></td>\n"
+	"<td align=\"center\">{{sentCount}}</td>\n"
+	"</tr>\n"
+	"{{#if isNews}}<tr><td colspan=\"2\"></td><td colspan=\"5\" style=\"text-align:left;font-size:7pt;color:#555;padding-top:0;padding-bottom:4px;\">sends: {{schedPreview}}</td></tr>\n"
+	"{{/if}}"
+	"{{/each}}"
+	"<tr><td colspan=\"7\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitBLN' name=\"commitBLN\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitBLN\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />\n"
+	"<div style=\"margin:8px 0;padding:6px;background:#fff3cd;border:1px solid #ffe69c;font-size:9pt;\">Objects (Object1-Object4) moved to their own page - see the <b>OBJ</b> tab. They use the same TX Channel/PATH configured above in Message Configuration.</div>\n";
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Objects split out of the MSG page into
+// its own page/tab. Same fields, same commitObj POST contract, just no longer
+// competing with BLN/News/Chat for space on one already-huge page.
+static const char *OBJECT_TEMPLATE = R"OBJHTML(<script type="text/javascript">
+$('form').submit(function (e) {
+e.preventDefault();
+var data = new FormData(e.currentTarget);
+document.getElementById("submitObj").disabled=true;
+$.ajax({
+url: '/object',
+type: 'POST',
+data: data,
+contentType: false,
+processData: false,
+success: function (data) {
+alert("Submited Successfully");
+document.getElementById("submitObj").disabled=false;
+},
+error: function (data) {
+alert("An error occurred.");
+document.getElementById("submitObj").disabled=false;
+}
+});
+});
+</script>
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="formObj" method="post">
+<table width="90%" style="border-collapse:collapse;">
+<th colspan="2" style="background-color: #070ac2;"><span><b>Objects: Object1-Object4</b></span></th>
+<tr><td colspan="2"><i>Uses the same TX Channel/PATH as Message Configuration (MSG tab).</i></td></tr>
+{{#each objRows}}<tr><td colspan="2" style="background-color:#eef0f4;"><b>Object{{num}}</b></td></tr>
+<tr><td align="right"><b>Enable:</b></td><td align="left"><label class="switch"><input type="checkbox" name="objEn{{num}}" value="OK"{{#if enabled}} checked{{/if}}><span class="slider round"></span></label></td></tr>
+<tr><td align="right"><b>Item/Obj Name:</b></td><td align="left"><input maxlength="9" name="objName{{num}}" type="text" value="{{name}}" />{{#if firstRow}} <i>3-9 character</i>{{/if}}</td></tr>
+<tr><td align="right"><b>Latitude / Longitude:</b></td><td align="left"><input style="width:120px;" step="any" name="objLat{{num}}" type="number" value="{{lat}}" /> <input style="width:120px;" step="any" name="objLon{{num}}" type="number" value="{{lon}}" />{{#if firstRow}} <i>independent of the digi's own position</i>{{/if}}</td></tr>
+<tr><td align="right"><b>Symbol:</b></td><td align="left">Table:<input maxlength="1" size="1" id="obj{{num}}Table" name="obj{{num}}Table" type="text" value="{{symTable}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> Symbol:<input maxlength="1" size="1" id="obj{{num}}Symbol" name="obj{{num}}Symbol" type="text" value="{{symSymbol}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> <img border="1" style="vertical-align: middle;" id="obj{{num}}ImgSymbol" onclick="openWindowSymbolObj({{idx}});" src="http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png">{{#if firstRow}} <i>*Click icon or type Table/Symbol directly</i>{{/if}}</td></tr>
+<tr><td align="right"><b>Text/Comment:</b></td><td align="left"><input style="width:96%;box-sizing:border-box;" maxlength="{{maxLen}}" name="objText{{num}}" type="text" value="{{text}}" oninput="var n=this.maxLength-this.value.length;var c=document.getElementById('objCnt{{num}}');c.textContent=n+' left';c.style.color=(n<0)?'red':'#2e7d32';" /><br /><span id="objCnt{{num}}" style="font-size:8pt;color:{{charsLeftColor}};">{{charsLeft}} left</span>{{#if firstRow}} <i style="font-size:8pt;">(own buffer, not shared)</i>{{/if}}</td></tr>
+<tr><td align="right"><b>Interval:</b></td><td align="left"><input type="radio" name="objMode{{num}}" value="0"{{#if fixedMode}} checked{{/if}}> Fixed: <select name="objInv{{num}}">{{#each intervalOptions}}<option value="{{value}}"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}</select> + max sends <input style="width:60px;" min="0" max="65535" name="objLim{{num}}" type="number" value="{{limit}}" /><br /><input type="radio" name="objMode{{num}}" value="1"{{#if fixedMode}}{{else}} checked{{/if}}> Active for: <select name="objActFor{{num}}">{{#each afOptions}}<option value="{{value}}"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}{{#if firstRow}}</select><br /><i>either mode (Permanent off): never exceeds 72h total send time</i></td></tr>
+{{else}}</select></td></tr>
+{{/if}}
+<tr><td align="right"><b>Permanent / Never disable:</b></td><td align="left"><label class="switch"><input type="checkbox" name="objPerm{{num}}" value="OK"{{#if permanent}} checked{{/if}}><span class="slider round"></span></label>{{#if firstRow}} <i>if checked, ignores Interval and the 72h cap entirely</i>{{/if}}</td></tr>
+{{#if firstRow}}<tr><td align="right"><b>Timestamp:</b></td><td align="left"><i>always UTC (zulu), automatic - not user configurable</i></td></tr>
+{{else}}<tr><td align="right"><b>Timestamp:</b></td><td align="left"><i>always UTC, automatic</i></td></tr>
+{{/if}}
+{{/each}}
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitObj' name="commitObj"> Apply Change </button></div>
+<input type="hidden" name="commitObj"/>
+</td></tr></table><br />
+</form><br />
+<script type="text/javascript">
+function openWindowSymbolObj(sel) {
+window.open("/symbol?sel="+sel.toString(), null, "height=400,width=400,status=no,toolbar=no,menubar=no,location=no");
+}
+function setValue(sel,symbol,table) {
+var txtsymbol=document.getElementById('obj'+(sel+1)+'Symbol');
+var txttable=document.getElementById('obj'+(sel+1)+'Table');
+var imgicon=document.getElementById('obj'+(sel+1)+'ImgSymbol');
+txtsymbol.value = String.fromCharCode(symbol);
+if(table==1){
+ txttable.value='/';
+}else if(table==2){
+ txttable.value='\\';
+}
+imgicon.src = "http://aprs.nakhonthai.net/symbols/icons/"+symbol.toString()+'-'+table.toString()+'.png';
+}
+function objSymRefresh(sel) {
+var txtsymbol=document.getElementById('obj'+(sel+1)+'Symbol');
+var txttable=document.getElementById('obj'+(sel+1)+'Table');
+var imgicon=document.getElementById('obj'+(sel+1)+'ImgSymbol');
+var sym=txtsymbol.value.charCodeAt(0);
+var tbl=(txttable.value=='\\')?2:1;
+if(!isNaN(sym)&&sym>0){
+ imgicon.src = "http://aprs.nakhonthai.net/symbols/icons/"+sym.toString()+'-'+tbl.toString()+'.png';
+}
+}
+</script>
+)OBJHTML";
+
+void handle_object(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+
+	if (request->hasArg("commitObj"))
+	{
+		// v2.1-lu6jmf: Object1-Object4
+		bool objEn[4] = {false};
+		char objName[4][10];
+		double objLat[4] = {0}, objLon[4] = {0};
+		char objSymbol[4][3];
+		char objText[4][STATUS_SIZE];
+		uint8_t objMode[4] = {0};
+		uint16_t objInterval[4], objLimit[4] = {0};
+		uint8_t objActiveFor[4] = {0};
+		bool objPermanent[4] = {false};
+		for (uint8_t oi = 0; oi < 4; oi++)
+		{
+			// LU6JMF fix (Set/2026): pre-seed every field from the current config,
+			// not just symbol/lat/lon/interval. Without this, any commitObj request
+			// that doesn't carry literally every field for every slot (e.g. another
+			// device/tab submitting the form) silently wipes name/text/limit/
+			// active_for back to defaults for the slots it didn't include.
+			// NOTE: objEn/objPermanent stay default-false (declared above) on purpose -
+			// they're checkboxes, and an unchecked checkbox is simply absent from the
+			// POST body (standard HTML behavior). Pre-seeding those two from config
+			// would make it impossible to ever uncheck them via a normal full submit.
+			strlcpy(objName[oi], config.obj_name[oi], sizeof(objName[oi]));
+			strlcpy(objText[oi], config.obj_text[oi], sizeof(objText[oi]));
+			objSymbol[oi][0] = config.obj_symbol[oi][0] ? config.obj_symbol[oi][0] : '/';
+			objSymbol[oi][1] = config.obj_symbol[oi][1] ? config.obj_symbol[oi][1] : 'r';
+			objSymbol[oi][2] = 0;
+			objLat[oi] = config.obj_lat[oi];
+			objLon[oi] = config.obj_lon[oi];
+			objMode[oi] = config.obj_mode[oi];
+			objInterval[oi] = config.obj_interval[oi] ? config.obj_interval[oi] : 900;
+			objLimit[oi] = config.obj_limit[oi];
+			objActiveFor[oi] = config.obj_activefor[oi];
+		}
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			String argName = request->argName(i);
+			for (uint8_t oi = 0; oi < 4; oi++)
+			{
+				char f[16];
+				snprintf(f, sizeof(f), "objEn%d", oi + 1);
+				if (argName == f && request->arg(i) == "OK")
+					objEn[oi] = true;
+				snprintf(f, sizeof(f), "objName%d", oi + 1);
+				if (argName == f)
+					strlcpy(objName[oi], request->arg(i).c_str(), sizeof(objName[oi]));
+				snprintf(f, sizeof(f), "objLat%d", oi + 1);
+				if (argName == f)
+					objLat[oi] = request->arg(i).toFloat(); // Arduino String has no toDouble()
+				snprintf(f, sizeof(f), "objLon%d", oi + 1);
+				if (argName == f)
+					objLon[oi] = request->arg(i).toFloat();
+				snprintf(f, sizeof(f), "obj%dTable", oi + 1);
+				if (argName == f && request->arg(i).length() > 0)
+					objSymbol[oi][0] = request->arg(i)[0];
+				snprintf(f, sizeof(f), "obj%dSymbol", oi + 1);
+				if (argName == f && request->arg(i).length() > 0)
+					objSymbol[oi][1] = request->arg(i)[0];
+				snprintf(f, sizeof(f), "objText%d", oi + 1);
+				if (argName == f)
+					strlcpy(objText[oi], request->arg(i).c_str(), sizeof(objText[oi]));
+				snprintf(f, sizeof(f), "objMode%d", oi + 1);
+				if (argName == f)
+					objMode[oi] = request->arg(i).toInt();
+				snprintf(f, sizeof(f), "objInv%d", oi + 1);
+				if (argName == f && isValidNumber(request->arg(i)))
+					objInterval[oi] = request->arg(i).toInt();
+				snprintf(f, sizeof(f), "objLim%d", oi + 1);
+				if (argName == f && isValidNumber(request->arg(i)))
+					objLimit[oi] = request->arg(i).toInt();
+				snprintf(f, sizeof(f), "objActFor%d", oi + 1);
+				if (argName == f && isValidNumber(request->arg(i)))
+					objActiveFor[oi] = request->arg(i).toInt();
+				snprintf(f, sizeof(f), "objPerm%d", oi + 1);
+				if (argName == f && request->arg(i) == "OK")
+					objPermanent[oi] = true;
+			}
+		}
+		for (uint8_t oi = 0; oi < 4; oi++)
+		{
+			config.obj_en[oi] = objEn[oi];
+			strlcpy(config.obj_name[oi], objName[oi], sizeof(config.obj_name[oi]));
+			config.obj_lat[oi] = objLat[oi];
+			config.obj_lon[oi] = objLon[oi];
+			config.obj_symbol[oi][0] = objSymbol[oi][0];
+			config.obj_symbol[oi][1] = objSymbol[oi][1];
+			config.obj_symbol[oi][2] = 0;
+			strlcpy(config.obj_text[oi], objText[oi], sizeof(config.obj_text[oi]));
+			config.obj_mode[oi] = objMode[oi];
+			config.obj_interval[oi] = objInterval[oi];
+			config.obj_limit[oi] = objLimit[oi];
+			config.obj_activefor[oi] = objActiveFor[oi];
+			config.obj_permanent[oi] = objPermanent[oi];
+		}
+		char *html = allocateStringMemory(256);
+		if (html)
+		{
+			if (saveConfiguration("/default.cfg", config))
+			{
+				strcpy(html, "Objects updated");
+				request->send(200, "text/html", html);
+			}
+			else
+			{
+				strcpy(html, "Save config failed.");
+				request->send(501, "text/html", html);
+			}
+			free(html);
+		}
+	}
+	else
+	{
+		esp_task_wdt_reset();
+		JsonDocument data;
+
+		static const uint16_t objIvlOpts[3] = {900, 1800, 3600};
+		static const char *objIvlLabels[3] = {"15 min", "30 min", "60 min"};
+		static const uint8_t objAfOpts[4] = {24, 36, 48, 72};
+
+		JsonArray objRows = data["objRows"].to<JsonArray>();
+		for (uint8_t oi = 0; oi < 4; oi++)
+		{
+			JsonObject o = objRows.add<JsonObject>();
+			o["num"] = oi + 1;
+			o["idx"] = oi;
+			o["firstRow"] = (oi == 0);
+			o["enabled"] = config.obj_en[oi];
+			o["name"] = config.obj_name[oi];
+
+			char buf[32];
+			snprintf(buf, sizeof(buf), "%.6f", config.obj_lat[oi]);
+			o["lat"] = buf;
+			snprintf(buf, sizeof(buf), "%.6f", config.obj_lon[oi]);
+			o["lon"] = buf;
+
+			char objTableCh = config.obj_symbol[oi][0] ? config.obj_symbol[oi][0] : '/';
+			char objSymCh = config.obj_symbol[oi][1] ? config.obj_symbol[oi][1] : 'r';
+			int objTableNum = (objTableCh == '\\') ? 2 : 1;
+			char cbuf[2];
+			cbuf[0] = objTableCh;
+			cbuf[1] = 0;
+			o["symTable"] = cbuf;
+			cbuf[0] = objSymCh;
+			cbuf[1] = 0;
+			o["symSymbol"] = cbuf;
+			o["symImgNum"] = (int)objSymCh;
+			o["symImgTable"] = objTableNum;
+
+			int objCharsLeft = (int)(STATUS_SIZE - 1) - (int)strlen(config.obj_text[oi]);
+			o["text"] = config.obj_text[oi];
+			o["maxLen"] = STATUS_SIZE - 1;
+			o["charsLeftColor"] = (objCharsLeft < 0) ? "red" : "#2e7d32";
+			o["charsLeft"] = objCharsLeft;
+
+			bool fixedMode = (config.obj_mode[oi] == 0);
+			o["fixedMode"] = fixedMode;
+
+			JsonArray intervalOptions = o["intervalOptions"].to<JsonArray>();
+			for (uint8_t k = 0; k < 3; k++)
+			{
+				JsonObject io = intervalOptions.add<JsonObject>();
+				io["value"] = objIvlOpts[k];
+				io["label"] = objIvlLabels[k];
+				io["selected"] = (config.obj_interval[oi] == objIvlOpts[k]);
+			}
+
+			o["limit"] = config.obj_limit[oi];
+
+			JsonArray afOptions = o["afOptions"].to<JsonArray>();
+			for (uint8_t k = 0; k < 4; k++)
+			{
+				JsonObject ao = afOptions.add<JsonObject>();
+				ao["value"] = objAfOpts[k];
+				ao["label"] = String(objAfOpts[k]) + "h";
+				ao["selected"] = (config.obj_activefor[oi] == objAfOpts[k]);
+			}
+
+			o["permanent"] = config.obj_permanent[oi];
+		}
+
+		String html_str = renderTemplate(OBJECT_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "Object");
+	}
+}
 
 void handle_msg(AsyncWebServerRequest *request)
 {
@@ -3767,14 +3755,185 @@ void handle_msg(AsyncWebServerRequest *request)
 			}
 		}
 		log_d("Chat to %s | msg %s", toCall, msg);
-		sendAPRSMessage(String(toCall), String(msg), config.msg_encrypt);
+
+		// LU6JMF - Marcelo Ferreira:
+		// Server-side duplicate guard. The client-side disabled-button fix only
+		// covers one click's own AJAX round-trip; it does not catch the browser
+		// firing two POSTs for what the user experienced as a single click/enter
+		// (seen live: two independent sendAPRSMessage() calls, same toCall+text,
+		// about a second apart). Ignore an identical toCall+msg repeated within
+		// a few seconds instead of sending it again.
+		static char lastChatTo[10] = {0};
+		static char lastChatMsg[256] = {0};
+		static unsigned long lastChatMillis = 0;
+		bool isDuplicate = (millis() - lastChatMillis < 5000) &&
+							(strcmp(toCall, lastChatTo) == 0) &&
+							(strcmp(msg, lastChatMsg) == 0) &&
+							(lastChatMillis != 0);
+
+		if (!isDuplicate)
+		{
+			sendAPRSMessage(String(toCall), String(msg), config.msg_encrypt);
+			strncpy(lastChatTo, toCall, sizeof(lastChatTo) - 1);
+			strncpy(lastChatMsg, msg, sizeof(lastChatMsg) - 1);
+			lastChatMillis = millis();
+		}
+		else
+		{
+			log_d("Chat duplicate ignored (same toCall+msg within 5s)");
+		}
+
 		// Using dynamic memory allocation instead of String
 		char *html = allocateStringMemory(64); // Small buffer for "Send completed"
 		if (html)
 		{
-			strcpy(html, "Send completed");
+			strcpy(html, isDuplicate ? "Duplicate ignored" : "Send completed");
 			request->send(200, "text/html", html); // send to someones browser when asked
 			free(html);							   // Free the allocated memory
+		}
+	}
+	else if (request->hasArg("commitBLN"))
+	{
+		bool blnEn[9] = {false};
+		char blnText[9][STATUS_SIZE];
+		uint16_t blnInterval[9];
+		uint16_t blnLimit[9];
+		uint8_t blnDuration[9]; // LU6JMF - Marcelo Ferreira: 24/36/48/72h campaign lifetime (replaces bln_activefor)
+		for (uint8_t bi = 0; bi < 9; bi++)
+		{
+			// LU6JMF fix (Set/2026): pre-seed text from the current config, same as
+			// commitObj. Without this, a commitBLN request that doesn't carry every
+			// field for every slot (e.g. another device/tab submitting the form)
+			// silently wipes the bulletin/news text back to empty for the slots it
+			// didn't include.
+			// NOTE: blnEn stays default-false (declared above) on purpose - it's a
+			// checkbox, and an unchecked checkbox is simply absent from the POST
+			// body (standard HTML behavior). Pre-seeding it from config would make
+			// it impossible to ever uncheck it via a normal full submit.
+			strlcpy(blnText[bi], config.bln_text[bi], sizeof(blnText[bi]));
+			blnInterval[bi] = config.bln_interval[bi];
+			blnLimit[bi] = config.bln_limit[bi];
+			blnDuration[bi] = config.bln_duration[bi];
+		}
+
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			String argName = request->argName(i);
+			for (uint8_t bi = 0; bi < 9; bi++)
+			{
+				char fieldEn[10], fieldText[10], fieldInt[12], fieldLimit[12], fieldDuration[12];
+				snprintf(fieldEn, sizeof(fieldEn), "blnEn%d", bi + 1);
+				snprintf(fieldText, sizeof(fieldText), "blnText%d", bi + 1);
+				snprintf(fieldInt, sizeof(fieldInt), "blnInv%d", bi + 1);
+				snprintf(fieldLimit, sizeof(fieldLimit), "blnLim%d", bi + 1);
+				snprintf(fieldDuration, sizeof(fieldDuration), "blnDur%d", bi + 1);
+
+				if (argName == fieldEn)
+				{
+					if (request->arg(i) == "OK")
+						blnEn[bi] = true;
+				}
+				if (argName == fieldText)
+				{
+					strlcpy(blnText[bi], request->arg(i).c_str(), sizeof(blnText[bi]));
+				}
+				if (argName == fieldInt)
+				{
+					// LU6JMF - Marcelo Ferreira: interval now stored in minutes.
+					if (isValidNumber(request->arg(i)))
+						blnInterval[bi] = request->arg(i).toInt();
+				}
+				if (argName == fieldLimit)
+				{
+					// Left blank by the user = unlimited (0); a number = hard stop after that many sends
+					if (isValidNumber(request->arg(i)))
+						blnLimit[bi] = request->arg(i).toInt();
+					else
+						blnLimit[bi] = 0;
+				}
+				if (argName == fieldDuration)
+				{
+					if (isValidNumber(request->arg(i)))
+						blnDuration[bi] = request->arg(i).toInt();
+				}
+			}
+		}
+
+		for (uint8_t bi = 0; bi < 9; bi++)
+		{
+			const bool wasEnabled = config.bln_en[bi];
+			const bool turningOn = (!wasEnabled && blnEn[bi]);
+
+			// LU6JMF - Marcelo Ferreira:
+			// Normalize user input before comparing/persisting campaign settings.
+			uint16_t normalizedInterval = blnInterval[bi];
+			if (normalizedInterval == 0)
+				normalizedInterval = 30;
+			if (normalizedInterval > 1440)
+				normalizedInterval = 1440;
+
+			uint8_t normalizedDuration = blnDuration[bi];
+			if (normalizedDuration != 24 &&
+			    normalizedDuration != 36 &&
+			    normalizedDuration != 48 &&
+			    normalizedDuration != 72)
+			{
+				normalizedDuration = 72;
+			}
+
+			const bool textChanged =
+				(strncmp(config.bln_text[bi], blnText[bi], sizeof(config.bln_text[bi])) != 0);
+			const bool intervalChanged = (config.bln_interval[bi] != normalizedInterval);
+			const bool limitChanged = (config.bln_limit[bi] != blnLimit[bi]);
+			const bool durationChanged = (config.bln_duration[bi] != normalizedDuration);
+
+			const bool restartCampaign =
+				blnEn[bi] &&
+				(turningOn || textChanged || intervalChanged || limitChanged || durationChanged);
+
+			config.bln_en[bi] = blnEn[bi];
+			strlcpy(config.bln_text[bi], blnText[bi], sizeof(config.bln_text[bi]));
+			config.bln_interval[bi] = normalizedInterval;
+			config.bln_limit[bi] = blnLimit[bi];
+			config.bln_duration[bi] = normalizedDuration;
+
+			if (!blnEn[bi])
+			{
+				// Disabled means there is no active campaign.
+				config.bln_started_at[bi] = 0;
+				config.bln_sent_total[bi] = 0;
+				blnSentCount[bi] = 0;
+				blnRestartPending[bi] = false;
+			}
+			else if (restartCampaign)
+			{
+				// taskAPRS owns the exact calendar start and immediate TX1.
+				config.bln_started_at[bi] = 0;
+				config.bln_sent_total[bi] = 0;
+				blnSentCount[bi] = 0;
+				blnRestartPending[bi] = true;
+			}
+			else
+			{
+				// Keep web display synchronized with persistent campaign state.
+				blnSentCount[bi] = config.bln_sent_total[bi];
+			}
+		}
+
+		char *html = allocateStringMemory(256);
+		if (html)
+		{
+			if (saveConfiguration("/default.cfg", config))
+			{
+				strcpy(html, "Setup completed successfully");
+				request->send(200, "text/html", html);
+			}
+			else
+			{
+				strcpy(html, "Save config failed.");
+				request->send(501, "text/html", html);
+			}
+			free(html);
 		}
 	}
 	else if (request->hasArg("commitMSG"))
@@ -3884,184 +4043,399 @@ void handle_msg(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Using dynamic memory allocation instead of String
-		char *html = allocateStringMemory(8192); // Initial buffer size, adjust as needed
-		if (!html)
-		{
-			return; // Memory allocation failed
-		}
+		esp_task_wdt_reset(); // feed watchdog: handle_msg runs on the async_tcp task itself,
+		// and this is the largest page in the firmware (BLN/News x9, Objects x4, chat table) -
+		// can take long enough under heap pressure to trip the TWDT if never fed.
+		JsonDocument data;
 
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formMSG\") document.getElementById(\"submitMSG\").disabled=true;\n");
-		// strcat(html, "if(e.currentTarget.id===\"formChat\") document.getElementById(\"submitI2C0\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/msg',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "if(e.currentTarget.id===\"formMSG\") alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "if(e.currentTarget.id===\"formMSG\") alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
+		// v2.1.2-lu6jmf: discreet build marker so it is unmistakable in the browser whether a
+		// given reflash actually took. Also carries the last reset reason here (not on the
+		// main DashBoard) so it doesn't alarm non-technical users with terms like PANIC/WDT/
+		// BROWNOUT - stays available for troubleshooting without being front-and-center.
+		char buildInfo[160];
+		snprintf(buildInfo, sizeof(buildInfo), "build " __DATE__ " " __TIME__ " | reset: %s", lastResetReasonStr);
+		data["buildInfo"] = buildInfo;
 
-		// strcat(html, "if (!!window.EventSource) {";
-		// strcat(html, "var source = new EventSource('/eventMsg');");
+		data["msgEnabled"] = config.msg_enable;
+		data["myCall"] = config.msg_mycall;
+		data["msgRf"] = config.msg_rf;
+		data["msgInet"] = config.msg_inet;
+		data["msgEncrypt"] = config.msg_encrypt;
+		data["key"] = config.msg_key;
+		data["retry"] = config.msg_retry;
+		data["timeout"] = config.msg_interval;
 
-		// strcat(html, "source.addEventListener('open', function(e) {";
-		// strcat(html, "console.log(\"Events MSG Connected\");";
-		// strcat(html, "}, false);";
-		// strcat(html, "source.addEventListener('error', function(e) {";
-		// strcat(html, "if (e.target.readyState != EventSource.OPEN) {";
-		// strcat(html, "console.log(\"Events MSG Disconnected\");";
-		// strcat(html, "}\n}, false);";
-		// strcat(html, "source.addEventListener('chatMsg', function(e) {";
-		// // strcat(html, "console.log(\"lastHeard\", e.data);";
-		// strcat(html, "var lh=document.getElementById(\"chatMsg\");";
-		// strcat(html, "if(lh != null) {lh.innerHTML = e.data;}";
-		// strcat(html, "}, false);\n}";
-		strcat(html, "</script>\n");
-
-		// strcat(html, "<h2>System Setting</h2>\n");
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formMSG\" method=\"post\">\n");
-		strcat(html, "<table width=\"90%\">\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Message Configuration</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// Handle sync flag
-		if (config.msg_enable)
-		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n");
-		}
-		else
-		{
-			strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"enable\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n");
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>My Callsign:</b></td>\n");
-		char temp_buffer[512];
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  size=\"20\" maxlength=\"9\" name=\"mycall\" type=\"text\" value=\"%s\" /> *<i>Callsign with SSID (Ex. HS5TQA-12)</i></td>\n", config.msg_mycall);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		// Handle RF and Internet flags
-		if (config.msg_rf && config.msg_inet)
-		{
-			strcat(html, "<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"msgRf\" value=\"OK\" checked/>RF <input type=\"checkbox\" name=\"msgInet\" value=\"OK\" checked/>Internet </td></tr>\n");
-		}
-		else if (config.msg_rf)
-		{
-			strcat(html, "<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"msgRf\" value=\"OK\" checked/>RF <input type=\"checkbox\" name=\"msgInet\" value=\"OK\" />Internet </td></tr>\n");
-		}
-		else if (config.msg_inet)
-		{
-			strcat(html, "<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"msgRf\" value=\"OK\" />RF <input type=\"checkbox\" name=\"msgInet\" value=\"OK\" checked/>Internet </td></tr>\n");
-		}
-		else
-		{
-			strcat(html, "<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"msgRf\" value=\"OK\" />RF <input type=\"checkbox\" name=\"msgInet\" value=\"OK\" />Internet </td></tr>\n");
-		}
-
-		strcat(html, "<tr>");
-		if (config.msg_encrypt)
-		{
-			strcat(html, "<td align=\"right\"><b>Encryption</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"encrypt\" value=\"OK\" checked><span class=\"slider round\"></span></label></td>\n");
-		}
-		else
-		{
-			strcat(html, "<td align=\"right\"><b>Encryption</b></td>\n");
-			strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"encrypt\" value=\"OK\" ><span class=\"slider round\"></span></label></td>\n");
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>AES Key:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  size=\"40\" maxlength=\"33\" name=\"key\" type=\"text\" value=\"%s\" /> *<i>ASCII HEX 16Byte</i></td>\n", config.msg_key);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Send Retry:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  min=\"0\" max=\"99\"   name=\"retry\" type=\"number\" value=\"%d\" /></td>\n", config.msg_retry);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Send Timeout:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input  min=\"1\" max=\"9999\"   name=\"timeout\" type=\"number\" value=\"%d\" /> Sec.</td>\n", config.msg_interval);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"path\" id=\"path\">\n");
+		JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
 		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
 		{
-			snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" ", pthIdx);
-			strcat(html, temp_buffer);
-			if (config.msg_path == pthIdx)
-			{
-				strcat(html, "selected>");
-			}
-			else
-			{
-				strcat(html, ">");
-			}
-			snprintf(temp_buffer, sizeof(temp_buffer), "%s</option>\n", PATH_NAME[pthIdx]);
-			strcat(html, temp_buffer);
+			JsonObject o = pathOptions.add<JsonObject>();
+			o["value"] = pthIdx;
+			o["label"] = PATH_NAME[pthIdx];
+			o["selected"] = (config.msg_path == pthIdx);
 		}
-		strcat(html, "</select></td>\n");
 
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitMSG'  name=\"commitMSG\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitMSG\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br /><br />");
+		data["chatMessageHtml"] = event_chatMessage(true);
+		esp_task_wdt_reset();
 
-		strcat(html, "<table width=\"90%\">\n");
-		strcat(html, "<th style=\"background-color: #070ac2;\">CHAT MESSAGE</th>\n");
+		static const uint16_t blnIntervalOpts[5] = {5, 10, 15, 30, 60};
+		static const char *blnIntervalLabels[5] = {"5 min", "10 min", "15 min", "30 min", "60 min"};
+		static const uint8_t blnDurOpts[4] = {24, 36, 48, 72};
 
-		strcat(html, "<tr><td>\n");
-		strcat(html, "<table id=\"chatMsg\">\n");
-		strcat(html, event_chatMessage(true).c_str());
-		strcat(html, "</table>\n");
+		JsonArray blnRows = data["blnRows"].to<JsonArray>();
+		for (uint8_t bi = 0; bi < 9; bi++)
+		{
+			JsonObject r = blnRows.add<JsonObject>();
+			r["num"] = bi + 1;
+			r["isNews"] = (bi >= 4);
+			r["enabled"] = config.bln_en[bi];
+			r["text"] = config.bln_text[bi];
+			r["maxLen"] = STATUS_SIZE - 1;
 
-		strcat(html, "</td></tr><tr><td colspan=\"5\">");
+			int blnCharsLeft = (int)(STATUS_SIZE - 1) - (int)strlen(config.bln_text[bi]);
+			r["charsLeftColor"] = (blnCharsLeft < 0) ? "red" : "#2e7d32";
+			r["charsLeft"] = blnCharsLeft;
 
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formChat\" method=\"post\">\n");
-		strcat(html, "<table>\n");
+			JsonArray intervalOptions = r["intervalOptions"].to<JsonArray>();
+			for (uint8_t k = 0; k < 5; k++)
+			{
+				JsonObject o = intervalOptions.add<JsonObject>();
+				o["value"] = blnIntervalOpts[k];
+				o["label"] = blnIntervalLabels[k];
+				o["selected"] = (config.bln_interval[bi] == blnIntervalOpts[k]);
+			}
 
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"left\"><b>TO:</b><input size=\"10\" name=\"toCall\" id=\"toCall\" type=\"text\" value=\"\" oninput=\"this.value=this.value.toUpperCase();\" /> <b>MSG:</b><input size=\"80\" name=\"msg\" id=\"msg\" type=\"text\" value=\"\" /></td>\n");
-		strcat(html, "<td align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitChat\" name=\"commitChat\" type=\"submit\" value=\"Send\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitChat\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form><br />\n");
+			r["limit"] = config.bln_limit[bi];
 
-		strcat(html, "</td></tr></table>");
+			JsonArray durationOptions = r["durationOptions"].to<JsonArray>();
+			for (uint8_t k = 0; k < 4; k++)
+			{
+				JsonObject o = durationOptions.add<JsonObject>();
+				o["value"] = blnDurOpts[k];
+				o["label"] = String(blnDurOpts[k]) + "h";
+				o["selected"] = (config.bln_duration[bi] == blnDurOpts[k]);
+			}
 
-		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("MSG", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+			r["sentCount"] = blnSentCount[bi];
+
+			if (bi >= 4)
+			{
+				uint16_t baseTMin = config.bln_interval[bi];
+				if (baseTMin < 5)
+					baseTMin = 5;
+				char schedPreview[220];
+				buildNewsSchedulePreview(schedPreview, sizeof(schedPreview), baseTMin);
+				r["schedPreview"] = schedPreview;
+			}
+		}
+
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(MSG_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks).
+		// v2.1.3-lu6jmf: bumped 28000->36000 - BLN Active-for/schedule-preview rows and the
+		// Objects section pushed real content past 28000, forcing a mid-stream realloc that
+		// could fail under heap fragmentation and truncate the page (seen live: cut off
+		// partway through Object4, Apply button + <script> with setValue() never sent).
+		sendHtmlChunked(request, html_str, "MSG");
 	}
 }
+
+static const char *MOD_TEMPLATE = R"MODHTML(<script type="text/javascript">
+$('form').submit(function (e) {
+e.preventDefault();
+var data = new FormData(e.currentTarget);
+if(e.currentTarget.id==="formUART0") document.getElementById("submitURAT0").disabled=true;
+if(e.currentTarget.id==="formUART1") document.getElementById("submitURAT1").disabled=true;
+if(e.currentTarget.id==="formUART1") document.getElementById("submitURAT1").disabled=true;
+if(e.currentTarget.id==="formGNSS") document.getElementById("submitGNSS").disabled=true;
+if(e.currentTarget.id==="formMODBUS") document.getElementById("submitMODBUS").disabled=true;
+if(e.currentTarget.id==="formTNC") document.getElementById("submitTNC").disabled=true;
+if(e.currentTarget.id==="formRF") document.getElementById("submitRF").disabled=true;
+if(e.currentTarget.id==="formI2C0") document.getElementById("submitI2C0").disabled=true;
+if(e.currentTarget.id==="formI2C1") document.getElementById("submitI2C1").disabled=true;
+if(e.currentTarget.id==="formCOUNT0") document.getElementById("submitCOUNT0").disabled=true;
+if(e.currentTarget.id==="formCOUNT1") document.getElementById("submitCOUNT1").disabled=true;
+{{#if pppos}}if(e.currentTarget.id==="formPPPoS") document.getElementById("submitPPPoS").disabled=true;
+{{/if}}$.ajax({
+url: '/mod',
+type: 'POST',
+data: data,
+contentType: false,
+processData: false,
+success: function (data) {
+alert("Submited Successfully\nRequire hardware REBOOT!");
+},
+error: function (data) {
+alert("An error occurred.");
+}
+});
+});
+</script>
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="32%" style="border:unset;">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromUART0" method="post">
+<table>
+<th colspan="2"><span><b>UART0 Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if uart0En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>RX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="rx" type="number" value="{{uart0Rx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>TX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="tx" type="number" value="{{uart0Tx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>RTS/DE GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="rts" type="number" value="{{uart0Rts}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Baudrate:</b></td>
+<td style="text-align: left;">
+<select name="baudrate" id="baudrate">
+{{#each uart0Baud}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} </option>
+{{/each}}</select> bps
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitUART0" name="commitUART0" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitUART0"/>
+</td></tr></table>
+</form><br />
+</td><td width="32%" style="border:unset;">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromUART1" method="post">
+<table>
+<th colspan="2"><span><b>UART1 Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if uart1En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>RX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="rx" type="number" value="{{uart1Rx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>TX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="tx" type="number" value="{{uart1Tx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>RTS/DE GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="rts" type="number" value="{{uart1Rts}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Baudrate:</b></td>
+<td style="text-align: left;">
+<select name="baudrate" id="baudrate">
+{{#each uart1Baud}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} </option>
+{{/each}}</select> bps
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitUART1" name="commitUART1" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitUART1"/>
+</td></tr></table>
+</form><br />
+</td></tr></table>
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromRF" method="post">
+<table>
+<th colspan="2"><span><b>RF GPIO Modify</b></span></th>
+<tr>
+<tr>
+<td align="right"><b>ADC Attenuation:</b></td>
+<td style="text-align: left;">
+<select name="atten" id="atten">
+{{#each attenOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select> DC-Offset: {{adcOffset}} mV
+</td>
+</tr>
+<tr>
+<td align="right"><b>UART Baudrate:</b></td>
+<td style="text-align: left;">
+<select name="baudrate" id="baudrate">
+{{#each rfBaud}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} </option>
+{{/each}}</select> bps
+</td>
+</tr>
+<tr>
+<td align="right"><b>UART RX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="rx" type="number" value="{{rfRx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>UART TX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="tx" type="number" value="{{rfTx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>PD GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="pd" type="number" value="{{rfPdGpio}}" /> Active:<input type="radio" name="pd_active" value="0" {{#if rfPdHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="pd_active" value="1" {{#if rfPdHigh}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr>
+<td align="right"><b>H/L GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="pwr" type="number" value="{{rfPwrGpio}}" /> Active:<input type="radio" name="pwr_active" value="0" {{#if rfPwrHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="pwr_active" value="1" {{#if rfPwrHigh}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr>
+<td align="right"><b>SQL GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="sql" type="number" value="{{rfSqlGpio}}" /> Active:<input type="radio" name="sql_active" value="0" {{#if rfSqlHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="sql_active" value="1" {{#if rfSqlHigh}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr>
+<td align="right"><b>PTT GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}"  name="ptt" type="number" value="{{rfPttGpio}}" /> Active:<input type="radio" name="ptt_active" value="0" {{#if rfPttHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="ptt_active" value="1" {{#if rfPttHigh}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitRF" name="commitRF" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitRF"/>
+</td></tr></table>
+</form>
+</td></tr></table>
+<br />
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromTNC" method="post">
+<table>
+<th colspan="2"><span><b>External TNC Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if tncEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>PORT:</b></td>
+<td style="text-align: left;">
+<select name="channel" id="channel">
+{{#each tncPortOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<tr>
+<td align="right"><b>MODE:</b></td>
+<td style="text-align: left;">
+<select name="mode" id="mode">
+{{#each tncModeOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitTNC" name="commitTNC" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitTNC"/>
+</td></tr></table>
+</form>
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromTCPKISS" method="post">
+<table>
+<th colspan="2"><span><b>TCP KISS Server Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if tcpKissEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>PORT 1:</b></td>
+<td style="text-align: left;"><input type="text" name="port1" value="{{tcpKissPort1}}" maxlength="5" size="6"/></td>
+</tr>
+<tr>
+<td align="right"><b>PORT 2:</b></td>
+<td style="text-align: left;"><input type="text" name="port2" value="{{tcpKissPort2}}" maxlength="5" size="6"/></td>
+</tr>
+<tr><td colspan="2" align="center"><b>Status:</b></td></tr>
+<tr><td colspan="2" align="center">{{tcpKissStatus1}}</td></tr>
+<tr><td colspan="2" align="center">{{tcpKissStatus2}}</td></tr>
+<tr><td colspan="2" style="word-wrap:break-word;white-space:normal;"><p style="font-size:9pt;margin:4px 0;">Lets PC software (Xastir, APRSIS32, etc) use this device as a KISS TNC over the local network - no cable needed. No password - anyone on this WiFi network can transmit through the radio via these ports while enabled. Port number changes need a reboot to take effect; the Enable switch does not.</p></td></tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitTCPKISS" name="commitTCPKISS" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitTCPKISS"/>
+</td></tr></table>
+</form>
+</td></tr></table>
+<br />
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form id='formATCommand' method="POST" action='#' enctype='multipart/form-data'>
+<table>
+<th colspan="2"><span><b>AT-COMMAND CHANNEL</b></span></th>
+<tr>
+<td width="150" align="right"><b>MQTT:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="mqtt" value="OK" {{#if cmdMqtt}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>MESSAGE:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="msg" value="OK" {{#if cmdMsg}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>BLUETOOTH:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="bluetooth" value="OK" {{#if cmdBluetooth}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>UART PORT:</b></td>
+<td style="text-align: left;">
+<select name="uart" id="cmdUart">
+{{#each cmdUartOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitCMD'  name="commit"> Apply Change </button></div>
+<input type="hidden" name="commitCMD"/>
+</td></tr></table><br />
+</form><br />
+{{#if pppos}}<br />
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form id='formPPPoS' method="POST" action='#' enctype='multipart/form-data'>
+<table>
+<th colspan="2"><span><b>PPP Over Serial (GSM/4G-LTE)</b></span></th>
+<tr>
+<td align="right"><b>Enable:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="pppEn" value="OK" {{#if pppEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<td align="right"><b>GNSS:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="pppGnss" value="OK" {{#if pppGnss}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>NAPT:</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="pppNapt" value="OK" {{#if pppNapt}}checked{{/if}}><span class="slider round"></span></label> *WiFi NAT</td>
+</tr>
+<tr>
+<td align="right"><b>APN:</b></td>
+<td style="text-align: left;"><input maxlength="20" name="pppAPN" type="text" value="{{pppApn}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>PIN:</b></td>
+<td style="text-align: left;"><input min="0" max="999999" name="pppPin" type="number" value="{{pppPin}}" /> <i>*PIN of SIM</i></td>
+</tr>
+<tr>
+<td align="right"><b>RX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="50" name="rx" type="number" value="{{pppRx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>TX GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="50" name="tx" type="number" value="{{pppTx}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>RESET GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="50"  name="rst" type="number" value="{{pppRstGpio}}" /> Active:<input type="radio" name="rst_active" value="0" {{#if pppRstHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="rst_active" value="1" {{#if pppRstHigh}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<td align="right"><b>RESET DELAY:</b></td>
+<td style="text-align: left;"><input min="0" max="999999" name="rstDly" type="number" value="{{pppRstDelay}}" /> mSec.</td>
+</tr>
+<tr>
+<tr>
+<td align="right"><b>PORT:</b></td>
+<td style="text-align: left;">
+<select name="port" id="port">
+{{#each pppPortOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<tr>
+<td align="right"><b>Baudrate:</b></td>
+<td style="text-align: left;">
+<select name="baudrate" id="baudrate">
+{{#each pppBaud}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} </option>
+{{/each}}</select> bps
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitPPPoS'  name="commitPPPoS"> Apply Change </button></div>
+<input type="hidden" name="commitPPPoS"/>
+</td></tr></table><br />
+</form>
+</td></tr></table>
+{{/if}})MODHTML";
 
 void handle_mod(AsyncWebServerRequest *request)
 {
@@ -4071,67 +4445,7 @@ void handle_mod(AsyncWebServerRequest *request)
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
-	if (request->hasArg("commitGNSS"))
-	{
-		bool En = false;
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
-			// Serial.print("SERVER ARGS ");
-			// Serial.print(request->argName(i));
-			// Serial.print("=");
-			// Serial.println(request->arg(i));
-
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					// if (isValidNumber(request->arg(i)))
-					if (String(request->arg(i)) == "OK")
-						En = true;
-				}
-			}
-
-			if (request->argName(i) == "atc")
-			{
-				if (request->arg(i) != "")
-				{
-					strcpy(config.gnss_at_command, request->arg(i).c_str());
-				}
-				else
-				{
-					memset(config.gnss_at_command, 0, sizeof(config.gnss_at_command));
-				}
-			}
-
-			if (request->argName(i) == "Host")
-			{
-				if (request->arg(i) != "")
-				{
-					strcpy(config.gnss_tcp_host, request->arg(i).c_str());
-				}
-			}
-
-			if (request->argName(i) == "Port")
-			{
-				if (isValidNumber(request->arg(i)))
-				{
-					config.gnss_tcp_port = request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "channel")
-			{
-				if (isValidNumber(request->arg(i)))
-				{
-					config.gnss_channel = request->arg(i).toInt();
-				}
-			}
-		}
-
-		config.gnss_enable = En;
-		saveConfig(request);
-	}
-	else if (request->hasArg("commitUART0"))
+	if (request->hasArg("commitUART0"))
 	{
 		bool En = false;
 		for (uint8_t i = 0; i < request->args(); i++)
@@ -4179,17 +4493,9 @@ void handle_mod(AsyncWebServerRequest *request)
 		}
 
 		config.uart0_enable = En;
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
 	}
 	else if (request->hasArg("commitUART1"))
 	{
@@ -4240,77 +4546,76 @@ void handle_mod(AsyncWebServerRequest *request)
 		}
 
 		config.uart1_enable = En;
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
 	}
-	else if (request->hasArg("commitMODBUS"))
-	{
-		bool En = false;
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
+	// else if (request->hasArg("commitUART2"))
+	// {
+	// 	bool En = false;
+	// 	for (uint8_t i = 0; i < request->args(); i++)
+	// 	{
+	// 		// Serial.print("SERVER ARGS ");
+	// 		// Serial.print(request->argName(i));
+	// 		// Serial.print("=");
+	// 		// Serial.println(request->arg(i));
 
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					// if (isValidNumber(request->arg(i)))
-					if (String(request->arg(i)) == "OK")
-						En = true;
-				}
-			}
+	// 		if (request->argName(i) == "Enable")
+	// 		{
+	// 			if (request->arg(i) != "")
+	// 			{
+	// 				if (String(request->arg(i)) == "OK")
+	// 					En = true;
+	// 			}
+	// 		}
 
-			if (request->argName(i) == "channel")
-			{
-				if (isValidNumber(request->arg(i)))
-				{
-					config.modbus_channel = request->arg(i).toInt();
-				}
-			}
+	// 	// 	if (request->argName(i) == "baudrate")
+	// 	// 	{
+	// 	// 		if (isValidNumber(request->arg(i)))
+	// 	// 		{
+	// 	// 			config.uart2_baudrate = request->arg(i).toInt();
+	// 	// 		}
+	// 	// 	}
 
-			if (request->argName(i) == "address")
-			{
-				if (isValidNumber(request->arg(i)))
-				{
-					config.modbus_address = request->arg(i).toInt();
-				}
-			}
+	// 	// 	if (request->argName(i) == "rx")
+	// 	// 	{
+	// 	// 		if (isValidNumber(request->arg(i)))
+	// 	// 		{
+	// 	// 			config.uart2_rx_gpio = request->arg(i).toInt();
+	// 	// 		}
+	// 	// 	}
 
-			if (request->argName(i) == "de")
-			{
-				if (request->arg(i) != "")
-				{
-					config.modbus_de_gpio = request->arg(i).toInt();
-				}
-			}
-		}
+	// 	// 	if (request->argName(i) == "tx")
+	// 	// 	{
+	// 	// 		if (isValidNumber(request->arg(i)))
+	// 	// 		{
+	// 	// 			config.uart2_tx_gpio = request->arg(i).toInt();
+	// 	// 		}
+	// 	// 	}
 
-		config.modbus_enable = En;
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
-	}
+	// 	// 	if (request->argName(i) == "rts")
+	// 	// 	{
+	// 	// 		if (isValidNumber(request->arg(i)))
+	// 	// 		{
+	// 	// 			config.uart2_rts_gpio = request->arg(i).toInt();
+	// 	// 		}
+	// 	// 	}
+	// 	// }
+
+	// 	// config.uart2_enable = En;
+	// 	saveConfiguration("/default.cfg", config);
+	// 	String html = "OK";
+	// 	request->send(200, "text/html", html);
+	// }
 	else if (request->hasArg("commitTNC"))
 	{
 		bool En = false;
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
 
 			if (request->argName(i) == "Enable")
 			{
@@ -4340,169 +4645,50 @@ void handle_mod(AsyncWebServerRequest *request)
 		}
 
 		config.ext_tnc_enable = En;
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
 	}
-	else if (request->hasArg("commitONEWIRE"))
+	else if (request->hasArg("commitTCPKISS"))
 	{
+		// TCP KISS Server - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
 		bool En = false;
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
-
 			if (request->argName(i) == "Enable")
 			{
 				if (request->arg(i) != "")
 				{
-					// if (isValidNumber(request->arg(i)))
 					if (String(request->arg(i)) == "OK")
 						En = true;
 				}
 			}
-
-			if (request->argName(i) == "data")
+			if (request->argName(i) == "port1")
 			{
-				if (request->arg(i) != "")
+				if (isValidNumber(request->arg(i)))
 				{
-					config.onewire_gpio = request->arg(i).toInt();
+					int p = request->arg(i).toInt();
+					if (p > 0 && p < 65536)
+						config.tcp_kiss_port1 = (uint16_t)p;
+				}
+			}
+			if (request->argName(i) == "port2")
+			{
+				if (isValidNumber(request->arg(i)))
+				{
+					int p = request->arg(i).toInt();
+					if (p > 0 && p < 65536)
+						config.tcp_kiss_port2 = (uint16_t)p;
 				}
 			}
 		}
-
-		config.onewire_enable = En;
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
+		config.tcp_kiss_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
 	}
 	else if (request->hasArg("commitRF"))
 	{
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
-
-			if (request->argName(i) == "rx_active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_rx_active = (bool)request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "tx_active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_tx_active = (bool)request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rst_active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_reset_active = (bool)request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "nss_active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_nss_active = (bool)request->arg(i).toInt();
-				}
-			}
-
-			if (request->argName(i) == "rf_rx_gpio")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_rx_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_tx_gpio")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_tx_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_dio1")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_dio1_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_reset")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_reset_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_dio0")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_dio0_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_nss")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_nss_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_sclk")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_sclk_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_miso")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_miso_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "rf_mosi")
-			{
-				if (request->arg(i) != "")
-				{
-					config.rf_mosi_gpio = request->arg(i).toInt();
-				}
-			}
-		}
-		String html;
-		if (saveConfiguration("/default.cfg", config))
-		{
-			html = "Setup completed successfully";
-			request->send(200, "text/html", html); // send to someones browser when asked
-		}
-		else
-		{
-			html = "Save config failed.";
-			request->send(501, "text/html", html); // Not Implemented
-		}
-	}
-	else if (request->hasArg("commitI2C0"))
-	{
-		bool En = false;
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
 			// Serial.print("SERVER ARGS ");
@@ -4510,151 +4696,106 @@ void handle_mod(AsyncWebServerRequest *request)
 			// Serial.print("=");
 			// Serial.println(request->arg(i));
 
-			if (request->argName(i) == "Enable")
+			if (request->argName(i) == "sql_active")
 			{
 				if (request->arg(i) != "")
 				{
-					if (String(request->arg(i)) == "OK")
-						En = true;
+					config.rf_sql_active = (bool)request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "pd_active")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_pd_active = (bool)request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "pwr_active")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_pwr_active = (bool)request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "ptt_active")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_ptt_active = (bool)request->arg(i).toInt();
 				}
 			}
 
-			if (request->argName(i) == "sda")
+			if (request->argName(i) == "baudrate")
 			{
 				if (request->arg(i) != "")
 				{
-					config.i2c_sda_pin = request->arg(i).toInt();
+					config.rf_baudrate = request->arg(i).toInt();
 				}
 			}
-			if (request->argName(i) == "sck")
+
+			if (request->argName(i) == "rx")
 			{
 				if (request->arg(i) != "")
 				{
-					config.i2c_sck_pin = request->arg(i).toInt();
+					config.rf_rx_gpio = request->arg(i).toInt();
 				}
 			}
-			if (request->argName(i) == "freq")
+
+			if (request->argName(i) == "tx")
 			{
 				if (request->arg(i) != "")
 				{
-					config.i2c_freq = request->arg(i).toInt();
+					config.rf_tx_gpio = request->arg(i).toInt();
+				}
+			}
+
+			if (request->argName(i) == "pd")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_pd_gpio = request->arg(i).toInt();
+				}
+			}
+
+			if (request->argName(i) == "pwr")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_pwr_gpio = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "ptt")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_ptt_gpio = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "sql")
+			{
+				if (request->arg(i) != "")
+				{
+					config.rf_sql_gpio = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "atten")
+			{
+				if (request->arg(i) != "")
+				{
+					config.adc_atten = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "offset")
+			{
+				if (request->arg(i) != "")
+				{
+					config.adc_dc_offset = request->arg(i).toInt();
 				}
 			}
 		}
-
-		config.i2c_enable = En;
-		saveConfig(request);
-	}
-#if SOC_I2C_NUM > 1
-	else if (request->hasArg("commitI2C1"))
-	{
-		bool En = false;
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
-
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-						En = true;
-				}
-			}
-
-			if (request->argName(i) == "sda")
-			{
-				if (request->arg(i) != "")
-				{
-					config.i2c1_sda_pin = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "sck")
-			{
-				if (request->arg(i) != "")
-				{
-					config.i2c1_sck_pin = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "freq")
-			{
-				if (request->arg(i) != "")
-				{
-					config.i2c1_freq = request->arg(i).toInt();
-				}
-			}
-		}
-
-		config.i2c1_enable = En;
-		saveConfig(request);
-	}
-#endif
-	else if (request->hasArg("commitCOUNTER0"))
-	{
-		bool En = false;
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
-
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-						En = true;
-				}
-			}
-
-			if (request->argName(i) == "gpio")
-			{
-				if (request->arg(i) != "")
-				{
-					config.counter0_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.counter0_active = (bool)request->arg(i).toInt();
-				}
-			}
-		}
-
-		config.counter0_enable = En;
-		saveConfig(request);
-	}
-	else if (request->hasArg("commitCOUNTER1"))
-	{
-		bool En = false;
-		for (uint8_t i = 0; i < request->args(); i++)
-		{
-
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-						En = true;
-				}
-			}
-
-			if (request->argName(i) == "gpio")
-			{
-				if (request->arg(i) != "")
-				{
-					config.counter1_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.counter1_active = (bool)request->arg(i).toInt();
-				}
-			}
-		}
-
-		config.counter0_enable = En;
-		saveConfig(request);
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
 	}
 	else if (request->hasArg("commitCMD"))
 	{
@@ -4708,7 +4849,17 @@ void handle_mod(AsyncWebServerRequest *request)
 		config.at_cmd_mqtt = mqtt;
 		config.at_cmd_msg = msg;
 		config.at_cmd_bluetooth = bluetooth;
-		saveConfig(request);
+		String html;
+		if (saveConfiguration("/default.cfg", config))
+		{
+			html = "Setup completed successfully";
+			request->send(200, "text/html", html); // send to someones browser when asked
+		}
+		else
+		{
+			html = "Save config failed.";
+			request->send(501, "text/html", html); // Not Implemented
+		}
 	}
 #ifdef PPPOS
 	else if (request->hasArg("commitPPPoS"))
@@ -4842,965 +4993,982 @@ void handle_mod(AsyncWebServerRequest *request)
 			{
 				config.uart1_enable = false;
 			}
-			else if (config.ppp_serial == 2)
-			{
-				config.uart2_enable = false;
-			}
+			// else if (config.ppp_serial == 2)
+			// {
+			// 	config.uart2_enable = false;
+			// }
 		}
-		saveConfig(request);
+		char *html = allocateStringMemory(256); // Small buffer for success/failure message
+		if (html != NULL)
+		{
+			if (saveConfiguration("/default.cfg", config))
+			{
+				strcpy(html, "Setup completed successfully");
+				request->send(200, "text/html", html); // send to someones browser when asked
+			}
+			else
+			{
+				strcpy(html, "Save config failed.");
+				request->send(501, "text/html", html); // Not Implemented
+			}
+			free(html);
+		}
 	}
 #endif
 	else
 	{
-		// Allocate memory for the HTML string
-		char temp_buffer[300];
-		char *html = allocateStringMemory(22000); // Start with 8KB, adjust as needed
-		if (html == NULL)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
+		esp_task_wdt_reset(); // feed watchdog: handle_mod runs on the async_tcp task itself,
+		// and this monolithic page can take long enough under heap pressure to trip the TWDT.
+		JsonDocument data;
+		int gpioMax = GPIO_NUM_MAX;
+		data["gpioMax"] = gpioMax;
 
-		// Initialize the HTML string with the JavaScript code
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formUART0\") document.getElementById(\"submitURAT0\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formUART1\") document.getElementById(\"submitURAT1\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formUART1\") document.getElementById(\"submitURAT1\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formGNSS\") document.getElementById(\"submitGNSS\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formMODBUS\") document.getElementById(\"submitMODBUS\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formTNC\") document.getElementById(\"submitTNC\").disabled=true;\n");
-		// strcat(html, "if(e.currentTarget.id===\"formONEWIRE\") document.getElementById(\"submitONEWIRE\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formRF\") document.getElementById(\"submitRF\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formI2C0\") document.getElementById(\"submitI2C0\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formI2C1\") document.getElementById(\"submitI2C1\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formCOUNT0\") document.getElementById(\"submitCOUNT0\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formCOUNT1\") document.getElementById(\"submitCOUNT1\").disabled=true;\n");
-#ifdef PPPOS
-		strcat(html, "if(e.currentTarget.id===\"formPPPoS\") document.getElementById(\"submitPPPoS\").disabled=true;\n");
-#endif
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/mod',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\\nRequire hardware RESET!\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
+		data["uart0En"] = config.uart0_enable;
+		data["uart0Rx"] = config.uart0_rx_gpio;
+		data["uart0Tx"] = config.uart0_tx_gpio;
+		data["uart0Rts"] = config.uart0_rts_gpio;
+		data["uart1En"] = config.uart1_enable;
+		data["uart1Rx"] = config.uart1_rx_gpio;
+		data["uart1Tx"] = config.uart1_tx_gpio;
+		data["uart1Rts"] = config.uart1_rts_gpio;
+		data["rfBaudSel"] = config.rf_baudrate;
 
-		strcat(html, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;vertical-align:top\"><td width=\"32%\" style=\"border:unset;\">\n");
-		// strcat(html, "<h2>System Setting</h2>\n");
-		/**************UART0(USB) Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromUART0\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>UART0 Modify</b></span></th>\n");
-		strcat(html, "<tr>\n");
-
-		char enFlage[20] = "";
-		if (config.uart0_enable)
-			strcpy(enFlage, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		{
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" ") + strlen(enFlage) + strlen("\"><span class=\"slider round\"></span></label></td>\n") + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-			strcat(html, temp_html);
-			free(temp_html);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RX GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *rx_gpio_str = StringToCharPtr(String(config.uart0_rx_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\" name=\"rx\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(rx_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\" name=\"rx\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, rx_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(rx_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>TX GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *tx_gpio_str = StringToCharPtr(String(config.uart0_tx_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\" name=\"tx\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(tx_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\" name=\"tx\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, tx_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(tx_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RTS/DE GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *rts_gpio_str = StringToCharPtr(String(config.uart0_rts_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\"  name=\"rts\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(rts_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\"  name=\"rts\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, rts_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(rts_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Baudrate:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"baudrate\" id=\"baudrate\">\n");
+		JsonArray uart0Baud = data["uart0Baud"].to<JsonArray>();
+		JsonArray uart1Baud = data["uart1Baud"].to<JsonArray>();
+		JsonArray rfBaud = data["rfBaud"].to<JsonArray>();
 		for (int i = 0; i < 13; i++)
 		{
-			char *baudrate_str = StringToCharPtr(String(baudrate[i]));
-			if (config.uart0_baudrate == baudrate[i])
-			{
-				char *temp_html = allocateStringMemory(strlen("<option value=\"\" selected>  </option>\n") + 2 * strlen(baudrate_str) + 1);
-				sprintf(temp_html, "<option value=\"%s\" selected>%s </option>\n", baudrate_str, baudrate_str);
-				strcat(html, temp_html);
-				free(temp_html);
-			}
-			else
-			{
-				char *temp_html = allocateStringMemory(strlen("<option value=\"\" >  </option>\n") + 2 * strlen(baudrate_str) + 1);
-				sprintf(temp_html, "<option value=\"%s\" >%s </option>\n", baudrate_str, baudrate_str);
-				strcat(html, temp_html);
-				free(temp_html);
-			}
-			free(baudrate_str);
+			JsonObject o0 = uart0Baud.add<JsonObject>();
+			o0["value"] = baudrate[i];
+			o0["selected"] = (config.uart0_baudrate == baudrate[i]);
+			JsonObject o1 = uart1Baud.add<JsonObject>();
+			o1["value"] = baudrate[i];
+			o1["selected"] = (config.uart1_baudrate == baudrate[i]);
+			JsonObject o2 = rfBaud.add<JsonObject>();
+			o2["value"] = baudrate[i];
+			o2["selected"] = (config.rf_baudrate == baudrate[i]);
 		}
-		strcat(html, "</select> bps\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitUART0\" name=\"commitUART0\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitUART0\"/>\n");
-		strcat(html, "</td></tr></table>\n");
 
-		strcat(html, "</form><br />\n");
-		strcat(html, "</td><td width=\"32%\" style=\"border:unset;\">");
-
-		/**************UART1 Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromUART1\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>UART1 Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		if (config.uart1_enable)
-			strcpy(enFlage, "checked");
-		else
-			strcpy(enFlage, "");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		{
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" ") + strlen(enFlage) + strlen("\"><span class=\"slider round\"></span></label></td>\n") + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-			strcat(html, temp_html);
-			free(temp_html);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RX GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *rx_gpio_str = StringToCharPtr(String(config.uart1_rx_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\" name=\"rx\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(rx_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\" name=\"rx\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, rx_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(rx_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>TX GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *tx_gpio_str = StringToCharPtr(String(config.uart1_tx_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\" name=\"tx\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(tx_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\" name=\"tx\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, tx_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(tx_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RTS/DE GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *rts_gpio_str = StringToCharPtr(String(config.uart1_rts_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\"  name=\"rts\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(rts_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\"  name=\"rts\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, rts_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(rts_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Baudrate:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"baudrate\" id=\"baudrate\">\n");
-		for (int i = 0; i < 13; i++)
-		{
-			char *baudrate_str = StringToCharPtr(String(baudrate[i]));
-			if (config.uart1_baudrate == baudrate[i])
-			{
-				char *temp_html = allocateStringMemory(strlen("<option value=\"\" selected>  </option>\n") + 2 * strlen(baudrate_str) + 1);
-				sprintf(temp_html, "<option value=\"%s\" selected>%s </option>\n", baudrate_str, baudrate_str);
-				strcat(html, temp_html);
-				free(temp_html);
-			}
-			else
-			{
-				char *temp_html = allocateStringMemory(strlen("<option value=\"\" >  </option>\n") + 2 * strlen(baudrate_str) + 1);
-				sprintf(temp_html, "<option value=\"%s\" >%s </option>\n", baudrate_str, baudrate_str);
-				strcat(html, temp_html);
-				free(temp_html);
-			}
-			free(baudrate_str);
-		}
-		strcat(html, "</select> bps\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitUART1\" name=\"commitUART1\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitUART1\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "</form><br />\n");
-		// html += "</td><td width=\"32%\" style=\"border:unset;\">";
-
-		/**************UART2 Modify******************/
-		// html += "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromUART2\" method=\"post\">\n";
-		// html += "<table>\n";
-		// html += "<th colspan=\"2\"><span><b>UART2 Modify</b></span></th>\n";
-		// html += "<tr>";
-
-		// enFlage = "";
-		// if (config.uart2_enable)
-		// 	enFlage = "checked";
-		// html += "<td align=\"right\"><b>Enable</b></td>\n";
-		// html += "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" " + enFlage + "><span class=\"slider round\"></span></label></td>\n";
-		// html += "</tr>\n";
-
-		// html += "<tr>\n";
-		// html += "<td align=\"right\"><b>RX GPIO:</b></td>\n";
-		// html += "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"rx\" type=\"number\" value=\"" + String(config.uart2_rx_gpio) + "\" /></td>\n";
-		// html += "</tr>\n";
-
-		// html += "<tr>\n";
-		// html += "<td align=\"right\"><b>TX GPIO:</b></td>\n";
-		// html += "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"tx\" type=\"number\" value=\"" + String(config.uart2_tx_gpio) + "\" /></td>\n";
-		// html += "</tr>\n";
-
-		// html += "<tr>\n";
-		// html += "<td align=\"right\"><b>RTS/DE GPIO:</b></td>\n";
-		// html += "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rts\" type=\"number\" value=\"" + String(config.uart2_rts_gpio) + "\" /></td>\n";
-		// html += "</tr>\n";
-
-		// html += "<tr>\n";
-		// html += "<td align=\"right\"><b>Baudrate:</b></td>\n";
-		// html += "<td style=\"text-align: left;\">\n";
-		// html += "<select name=\"baudrate\" id=\"baudrate\">\n";
-		// for (int i = 0; i < 13; i++)
-		// {
-		// 	if (config.uart2_baudrate == baudrate[i])
-		// 		html += "<option value=\"" + String(baudrate[i]) + "\" selected>" + String(baudrate[i]) + " </option>\n";
-		// 	else
-		// 		html += "<option value=\"" + String(baudrate[i]) + "\" >" + String(baudrate[i]) + " </option>\n";
-		// }
-		// html += "</select> bps\n";
-		// html += "</td>\n";
-		// html += "</tr>\n";
-		// html += "<tr><td colspan=\"2\" align=\"right\">\n";
-		// html += "<input class=\"button\" id=\"submitUART2\" name=\"commitUART2\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n";
-		// html += "<input type=\"hidden\" name=\"commitUART2\"/>\n";
-		// html += "</td></tr></table>\n";
-
-		// html += "</form><br />\n";
-		// html += "</td></tr></table>\n";
-
-		strcat(html, "</td><td width=\"32%\" style=\"border:unset;\">");
-
-		/**************1-Wire Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromONEWIRE\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>1-Wire Bus Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		String syncFlage = "";
-		if (config.onewire_enable)
-			syncFlage = "checked";
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		{
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" ") + strlen(syncFlage.c_str()) + strlen("\"><span class=\"slider round\"></span></label></td>\n") + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", syncFlage.c_str());
-			strcat(html, temp_html);
-			free(temp_html);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>GPIO:</b></td>\n");
-		{
-			char *gpio_max_str = StringToCharPtr(String(GPIO_NUM_MAX));
-			char *onewire_gpio_str = StringToCharPtr(String(config.onewire_gpio));
-			char *temp_html = allocateStringMemory(strlen("<td style=\"text-align: left;\"><input min=\"-1\" max=\"\" name=\"data\" type=\"number\" value=\"\" /></td>\n") + strlen(gpio_max_str) + strlen(onewire_gpio_str) + 1);
-			sprintf(temp_html, "<td style=\"text-align: left;\"><input min=\"-1\" max=\"%s\" name=\"data\" type=\"number\" value=\"%s\" /></td>\n", gpio_max_str, onewire_gpio_str);
-			strcat(html, temp_html);
-			free(temp_html);
-			free(gpio_max_str);
-			free(onewire_gpio_str);
-		}
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitONEWIRE\" name=\"commitONEWIRE\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitONEWIRE\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form><br />\n");
-
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;vertical-align:top\"><td width=\"50%\" style=\"border:unset;vertical-align:top\">");
-		/**************RF GPIO******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromRF\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>RF GPIO Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char *LowFlag = allocateStringMemory(20);
-		char *HighFlag = allocateStringMemory(20);
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.rf_rx_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RX ANTENNA:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_rx_gpio\" type=\"number\" value=\"%d\" /> Active:<input type=\"radio\" name=\"rx_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"rx_active\" value=\"1\" %s/>HIGH </td>\n", config.rf_rx_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.rf_tx_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>TX ANTENNA:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_tx_gpio\" type=\"number\" value=\"%d\" /> Active:<input type=\"radio\" name=\"tx_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"tx_active\" value=\"1\" %s/>HIGH </td>\n", config.rf_tx_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.rf_reset_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RESET GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_reset\" type=\"number\" value=\"%d\" /> Active:<input type=\"radio\" name=\"rst_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"rst_active\" value=\"1\" %s/>HIGH </td>\n", config.rf_reset_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.rf_nss_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>NSS/CS GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_nss\" type=\"number\" value=\"%d\" /> Active:<input type=\"radio\" name=\"nss_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"nss_active\" value=\"1\" %s/>HIGH </td>\n", config.rf_nss_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>IRQ/DIO1 GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_dio1\" type=\"number\" value=\"%d\" /></td>\n", config.rf_dio1_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>BUSY/DIO0 GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_dio0\" type=\"number\" value=\"%d\" /></td>\n", config.rf_dio0_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>SCLK GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_sclk\" type=\"number\" value=\"%d\" /></td>\n", config.rf_sclk_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>MISO GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_miso\" type=\"number\" value=\"%d\" /></td>\n", config.rf_miso_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>MOSI GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rf_mosi\" type=\"number\" value=\"%d\" /></td>\n", config.rf_mosi_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitRF\" name=\"commitRF\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitRF\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-
-		strcat(html, "</td><td width=\"23%\" style=\"border:unset;\">");
-
-		/**************I2C_0 Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromI2C0\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>I2C_0(OLED) Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char *syncFlage6 = allocateStringMemory(20);
-		strcpy(syncFlage6, "");
-		if (config.i2c_enable)
-			strcpy(syncFlage6, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", syncFlage6);
-		strcat(html, temp_buffer);
-		free(syncFlage6);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>SDA GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"sda\" type=\"number\" value=\"%d\" /></td>\n", config.i2c_sda_pin);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>SCL GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"sck\" type=\"number\" value=\"%d\" /></td>\n", config.i2c_sck_pin);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Frequency:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"1000\" max=\"800000\" name=\"freq\" type=\"number\" value=\"%d\" /></td>\n", config.i2c_freq);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitI2C0\" name=\"commitI2C0\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitI2C0\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-
-		/**************Counter_0 Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromCOUNTER0\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Counter_0 Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char *syncFlage7 = allocateStringMemory(20);
-		strcpy(syncFlage7, "");
-		if (config.counter0_enable)
-			strcpy(syncFlage7, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", syncFlage7);
-		strcat(html, temp_buffer);
-		free(syncFlage7);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>INPUT GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"gpio\" type=\"number\" value=\"%d\" /></td>\n", config.counter0_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.counter0_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Active</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input type=\"radio\" name=\"active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"active\" value=\"1\" %s/>HIGH </td>\n", LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitCOUNTER0\" name=\"commitCOUNTER0\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitCOUNTER0\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-		free(LowFlag);
-		free(HighFlag);
-
-		strcat(html, "</td><td width=\"23%\" style=\"border:unset;\">");
-		/**************I2C_1 Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromI2C1\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>I2C_1 Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char *syncFlage8 = allocateStringMemory(20);
-		strcpy(syncFlage8, "");
-		if (config.i2c1_enable)
-			strcpy(syncFlage8, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", syncFlage8);
-		strcat(html, temp_buffer);
-		free(syncFlage8);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>SDA GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"sda\" type=\"number\" value=\"%d\" /></td>\n", config.i2c1_sda_pin);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>SCL GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"sck\" type=\"number\" value=\"%d\" /></td>\n", config.i2c1_sck_pin);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Frequency:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"1000\" max=\"800000\" name=\"freq\" type=\"number\" value=\"%d\" /></td>\n", config.i2c1_freq);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitI2C1\" name=\"commitI2C1\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitI2C1\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-
-		/**************Counter_1 Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromCOUNTER1\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Counter_1 Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char *syncFlage9 = allocateStringMemory(20);
-		strcpy(syncFlage9, "");
-		if (config.counter1_enable)
-			strcpy(syncFlage9, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", syncFlage9);
-		strcat(html, temp_buffer);
-		free(syncFlage9);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>INPUT GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"gpio\" type=\"number\" value=\"%d\" /></td>\n", config.counter1_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		LowFlag = allocateStringMemory(20);
-		HighFlag = allocateStringMemory(20);
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.counter1_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Active</td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input type=\"radio\" name=\"active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"active\" value=\"1\" %s/>HIGH </td>\n", LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitCOUNTER1\" name=\"commitCOUNTER1\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitCOUNTER1\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-		free(LowFlag);
-		free(HighFlag);
-
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;vertical-align:top\"><td width=\"50%\" style=\"border:unset;vertical-align:top\">");
-		/**************GNSS Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromGNSS\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>GNSS Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// char *enFlage = allocateStringMemory(20);
-		strcpy(enFlage, "");
-		if (config.gnss_enable)
-			strcpy(enFlage, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PORT:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"channel\" id=\"channel\">\n");
+		JsonArray attenOptions = data["attenOptions"].to<JsonArray>();
 		for (int i = 0; i < 5; i++)
 		{
-			if (config.gnss_channel == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, GNSS_PORT[i]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, GNSS_PORT[i]);
-			strcat(html, temp_buffer);
+			JsonObject o = attenOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = ADC_ATTEN[i];
+			o["selected"] = (config.adc_atten == i);
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
+		data["adcOffset"] = offset;
 
-		strcat(html, "<td align=\"right\"><b>AT Command:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input maxlength=\"30\" size=\"20\" id=\"atc\" name=\"atc\" type=\"text\" value=\"%s\" /></td>\n", config.gnss_at_command);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<td align=\"right\"><b>TCP Host:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input maxlength=\"20\" size=\"15\" id=\"Host\" name=\"Host\" type=\"text\" value=\"%s\" /></td>\n", config.gnss_tcp_host);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>TCP Port:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"1024\" max=\"65535\"  id=\"Port\" name=\"Port\" type=\"number\" value=\"%d\" /></td>\n", config.gnss_tcp_port);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
+		data["rfRx"] = config.rf_rx_gpio;
+		data["rfTx"] = config.rf_tx_gpio;
+		data["rfPdGpio"] = config.rf_pd_gpio;
+		data["rfPdHigh"] = config.rf_pd_active;
+		data["rfPwrGpio"] = config.rf_pwr_gpio;
+		data["rfPwrHigh"] = config.rf_pwr_active;
+		data["rfSqlGpio"] = config.rf_sql_gpio;
+		data["rfSqlHigh"] = config.rf_sql_active;
+		data["rfPttGpio"] = config.rf_ptt_gpio;
+		data["rfPttHigh"] = config.rf_ptt_active;
 
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitGNSS\" name=\"commitGNSS\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitGNSS\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "</form><br />\n");
-		// free(enFlage);
-
-		strcat(html, "</td><td width=\"23%\" style=\"border:unset;\">");
-
-		/**************MODBUS Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromMODBUS\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>MODBUS Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// enFlage = allocateStringMemory(20);
-		strcpy(enFlage, "");
-		if (config.modbus_enable)
-			strcpy(enFlage, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PORT:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"channel\" id=\"channel\">\n");
+		data["tncEn"] = config.ext_tnc_enable;
+		JsonArray tncPortOptions = data["tncPortOptions"].to<JsonArray>();
+		JsonArray cmdUartOptions = data["cmdUartOptions"].to<JsonArray>();
 		for (int i = 0; i < 5; i++)
 		{
-			if (config.modbus_channel == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, GNSS_PORT[i]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, GNSS_PORT[i]);
-			strcat(html, temp_buffer);
+			JsonObject o = tncPortOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = TNC_PORT[i];
+			o["selected"] = (config.ext_tnc_channel == i);
+			JsonObject oc = cmdUartOptions.add<JsonObject>();
+			oc["value"] = i;
+			oc["label"] = TNC_PORT[i];
+			oc["selected"] = (config.at_cmd_uart == i);
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Address:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"address\" type=\"number\" value=\"%d\" /></td>\n", config.modbus_address);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>DE:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"de\" type=\"number\" value=\"%d\" /></td>\n", config.modbus_de_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitMODBUS\" name=\"commitMODBUS\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitMODBUS\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-		// free(enFlage);
-
-		strcat(html, "</td><td width=\"23%\" style=\"border:unset;\">");
-
-		/**************External TNC Modify******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"fromTNC\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>External TNC Modify</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		// enFlage = allocateStringMemory(20);
-		strcpy(enFlage, "");
-		if (config.ext_tnc_enable)
-			strcpy(enFlage, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PORT:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"channel\" id=\"channel\">\n");
-		for (int i = 0; i < 5; i++)
-		{
-			if (config.ext_tnc_channel == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, TNC_PORT[i]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, TNC_PORT[i]);
-			strcat(html, temp_buffer);
-		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>MODE:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mode\" id=\"mode\">\n");
+		JsonArray tncModeOptions = data["tncModeOptions"].to<JsonArray>();
 		for (int i = 0; i < 4; i++)
 		{
-			if (config.ext_tnc_mode == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, TNC_MODE[i]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, TNC_MODE[i]);
-			strcat(html, temp_buffer);
+			JsonObject o = tncModeOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = TNC_MODE[i];
+			o["selected"] = (config.ext_tnc_mode == i);
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
 
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<input class=\"button\" id=\"submitTNC\" name=\"commitTNC\" type=\"submit\" value=\"Apply\" maxlength=\"80\"/>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitTNC\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form>\n");
-		// free(enFlage);
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "<br />\n");
-
-		strcat(html, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;vertical-align:top\"><td width=\"50%\" style=\"border:unset;vertical-align:top\">");
-
-		/************************ AT-COMMAND **************************/
-		strcat(html, "<form id='formATCommand' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>AT-COMMAND CHANNEL</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td width=\"150\" align=\"right\"><b>MQTT:</b></td>\n");
-		char *cmdFlag = allocateStringMemory(20);
-		strcpy(cmdFlag, "");
-		if (config.at_cmd_mqtt)
-			strcpy(cmdFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"mqtt\" value=\"OK\" ");
-		strcat(html, cmdFlag);
-		strcat(html, "><span class=\"slider round\"></span></label></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>MESSAGE:</b></td>\n");
-		strcpy(cmdFlag, "");
-		if (config.at_cmd_msg)
-			strcpy(cmdFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"msg\" value=\"OK\" ");
-		strcat(html, cmdFlag);
-		strcat(html, "><span class=\"slider round\"></span></label></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>BLUETOOTH:</b></td>\n");
-		strcpy(cmdFlag, "");
-		if (config.at_cmd_bluetooth)
-			strcpy(cmdFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"bluetooth\" value=\"OK\" ");
-		strcat(html, cmdFlag);
-		strcat(html, "><span class=\"slider round\"></span></label></td>\n");
-		strcat(html, "</tr>\n");
-		free(cmdFlag);
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>UART PORT:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"uart\" id=\"cmdUart\">\n");
-		for (int i = 0; i < 5; i++)
+		data["tcpKissEn"] = config.tcp_kiss_enable;
+		data["tcpKissPort1"] = config.tcp_kiss_port1;
+		data["tcpKissPort2"] = config.tcp_kiss_port2;
 		{
-			if (config.at_cmd_uart == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, TNC_PORT[i]);
+			String tcpKissStatus1 = "Port " + String(config.tcp_kiss_port1) + ": ";
+			if (tcpKissClient1 && tcpKissClient1.connected())
+				tcpKissStatus1 += "connected (" + tcpKissClient1.remoteIP().toString() + ") RX:" + String(tcpKissRxCount[0]) + " TX:" + String(tcpKissTxCount[0]);
 			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, TNC_PORT[i]);
-			strcat(html, temp_buffer);
+				tcpKissStatus1 += "idle";
+			String tcpKissStatus2 = "Port " + String(config.tcp_kiss_port2) + ": ";
+			if (tcpKissClient2 && tcpKissClient2.connected())
+				tcpKissStatus2 += "connected (" + tcpKissClient2.remoteIP().toString() + ") RX:" + String(tcpKissRxCount[1]) + " TX:" + String(tcpKissTxCount[1]);
+			else
+				tcpKissStatus2 += "idle";
+			data["tcpKissStatus1"] = tcpKissStatus1;
+			data["tcpKissStatus2"] = tcpKissStatus2;
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
 
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitCMD'  name=\"commit\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitCMD\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
+		data["cmdMqtt"] = config.at_cmd_mqtt;
+		data["cmdMsg"] = config.at_cmd_msg;
+		data["cmdBluetooth"] = config.at_cmd_bluetooth;
 
 #ifdef PPPOS
-		strcat(html, "<br />\n");
+		data["pppos"] = true;
+		data["pppEn"] = config.ppp_enable;
+		data["pppGnss"] = config.ppp_gnss;
+		data["pppNapt"] = config.ppp_napt;
+		data["pppApn"] = config.ppp_apn;
+		data["pppPin"] = atoi(config.ppp_pin);
+		data["pppRx"] = config.ppp_rx_gpio;
+		data["pppTx"] = config.ppp_tx_gpio;
+		data["pppRstGpio"] = config.ppp_rst_gpio;
+		data["pppRstHigh"] = config.ppp_rst_active;
+		data["pppRstDelay"] = config.ppp_rst_delay;
 
-		strcat(html, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;vertical-align:top\"><td width=\"50%\" style=\"border:unset;vertical-align:top\">");
-
-		/************************ PPPoS **************************/
-
-		strcat(html, "<form id='formPPPoS' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>PPP Over Serial (GSM/4G-LTE)</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-		char *pppEnFlag = allocateStringMemory(20);
-		strcpy(pppEnFlag, "");
-		if (config.ppp_enable)
-			strcpy(pppEnFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"pppEn\" value=\"OK\" ");
-		strcat(html, pppEnFlag);
-		strcat(html, "><span class=\"slider round\"></span></label></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<td align=\"right\"><b>GNSS:</b></td>\n");
-		strcpy(pppEnFlag, "");
-		if (config.ppp_gnss)
-			strcpy(pppEnFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"pppGnss\" value=\"OK\" ");
-		strcat(html, pppEnFlag);
-		strcat(html, "><span class=\"slider round\"></span></label></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>NAPT:</b></td>\n");
-		strcpy(pppEnFlag, "");
-		if (config.ppp_napt)
-			strcpy(pppEnFlag, "checked");
-		strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"pppNapt\" value=\"OK\" ");
-		strcat(html, pppEnFlag);
-		strcat(html, "><span class=\"slider round\"></span></label> *WiFi NAT</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>APN:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input maxlength=\"20\" name=\"pppAPN\" type=\"text\" value=\"%s\" /></td>\n", config.ppp_apn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-
-		strcat(html, "<td align=\"right\"><b>PIN:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"0\" max=\"999999\" name=\"pppPin\" type=\"number\" value=\"%s\" /> <i>*PIN of SIM</i></td>\n", config.ppp_pin);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-
-		strcat(html, "<td align=\"right\"><b>RX GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"rx\" type=\"number\" value=\"%d\" /></td>\n", config.ppp_rx_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>TX GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\" name=\"tx\" type=\"number\" value=\"%d\" /></td>\n", config.ppp_tx_gpio);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		LowFlag = allocateStringMemory(20);
-		HighFlag = allocateStringMemory(20);
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.ppp_rst_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RESET GPIO:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"rst\" type=\"number\" value=\"%d\" /> Active:<input type=\"radio\" name=\"rst_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"rst_active\" value=\"1\" %s/>HIGH </td>\n", config.ppp_rst_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RESET DELAY:</b></td>\n");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"0\" max=\"999999\" name=\"rstDly\" type=\"number\" value=\"%d\" /> mSec.</td>\n", config.ppp_rst_delay);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PORT:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"port\" id=\"port\">\n");
+		JsonArray pppPortOptions = data["pppPortOptions"].to<JsonArray>();
 		for (int i = 0; i < 2; i++)
 		{
-			if (config.ppp_serial == i)
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, GNSS_PORT[i + 1]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, GNSS_PORT[i + 1]);
-			strcat(html, temp_buffer);
+			JsonObject o = pppPortOptions.add<JsonObject>();
+			o["value"] = i;
+			o["label"] = GNSS_PORT[i + 1];
+			o["selected"] = (config.ppp_serial == i);
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Baudrate:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"baudrate\" id=\"baudrate\">\n");
+		JsonArray pppBaud = data["pppBaud"].to<JsonArray>();
 		for (int i = 0; i < 13; i++)
 		{
-			if (config.ppp_serial_baudrate == baudrate[i])
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%d </option>\n", baudrate[i], baudrate[i]);
-			else
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%d </option>\n", baudrate[i], baudrate[i]);
-			strcat(html, temp_buffer);
+			JsonObject o = pppBaud.add<JsonObject>();
+			o["value"] = baudrate[i];
+			o["selected"] = (config.ppp_serial_baudrate == baudrate[i]);
 		}
-		strcat(html, "</select> bps\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitPPPoS'  name=\"commitPPPoS\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitPPPoS\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form>");
-		free(pppEnFlag);
-		free(LowFlag);
-		free(HighFlag);
-
-		strcat(html, "</td></tr></table>\n");
+#else
+		data["pppos"] = false;
 #endif
-		const char *dataType = "text/html";
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("MOD", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+
+		String html_str = renderTemplate(MOD_TEMPLATE, data.as<JsonVariant>());
+		// Streamed response: avoids a single large calloc() for the whole page
+		// (same fix already applied to handle_igate/wx/sensor/etc after we
+		// confirmed via live heap-integrity diagnostics that the single big
+		// contiguous allocation was the reproducible trigger for a heap
+		// corruption assert under real traffic).
+		sendHtmlChunked(request, html_str, "MOD");
 	}
 }
 
+static const char *MOD2_TEMPLATE = R"MOD2HTML(<script type="text/javascript">
+$('form').submit(function (e) {
+e.preventDefault();
+var data = new FormData(e.currentTarget);
+if(e.currentTarget.id==="formGNSS") document.getElementById("submitGNSS").disabled=true;
+if(e.currentTarget.id==="formMODBUS") document.getElementById("submitMODBUS").disabled=true;
+if(e.currentTarget.id==="formI2C0") document.getElementById("submitI2C0").disabled=true;
+if(e.currentTarget.id==="formI2C1") document.getElementById("submitI2C1").disabled=true;
+if(e.currentTarget.id==="formCOUNT0") document.getElementById("submitCOUNT0").disabled=true;
+if(e.currentTarget.id==="formCOUNT1") document.getElementById("submitCOUNT1").disabled=true;
+$.ajax({
+url: '/mod2',
+type: 'POST',
+data: data,
+contentType: false,
+processData: false,
+success: function (data) {
+alert("Submited Successfully\nRequire hardware REBOOT!");
+},
+error: function (data) {
+alert("An error occurred.");
+}
+});
+});
+</script>
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromONEWIRE" method="post">
+<table>
+<th colspan="2"><span><b>1-Wire Bus Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if oneWireEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="data" type="number" value="{{oneWireGpio}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitONEWIRE" name="commitONEWIRE" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitONEWIRE"/>
+</td></tr></table>
+</form><br />
+</td></tr></table>
+<br />
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromI2C0" method="post">
+<table>
+<th colspan="2"><span><b>I2C_0(OLED) Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if i2c0En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>SDA GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="sda" type="number" value="{{i2c0Sda}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>SCK GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="sck" type="number" value="{{i2c0Sck}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Frequency:</b></td>
+<td style="text-align: left;"><input min="1000" max="800000" name="freq" type="number" value="{{i2c0Freq}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitI2C0" name="commitI2C0" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitI2C0"/>
+</td></tr></table>
+</form>
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromCOUNTER0" method="post">
+<table>
+<th colspan="2"><span><b>Counter_0 Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if counter0En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>INPUT GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="gpio" type="number" value="{{counter0Gpio}}" /></td>
+</tr>
+<tr>
+<td align="right">Active</td>
+<td style="text-align: left;"><input type="radio" name="active" value="0" {{#if counter0High}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="active" value="1" {{#if counter0High}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitCOUNTER0" name="commitCOUNTER0" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitCOUNTER0"/>
+</td></tr></table>
+</form>
+</td><td width="50%" style="border:unset;">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromI2C1" method="post">
+<table>
+<th colspan="2"><span><b>I2C_1 Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if i2c1En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>SDA GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="sda" type="number" value="{{i2c1Sda}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>SCK GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="sck" type="number" value="{{i2c1Sck}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Frequency:</b></td>
+<td style="text-align: left;"><input min="1000" max="800000" name="freq" type="number" value="{{i2c1Freq}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitI2C1" name="commitI2C1" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitI2C1"/>
+</td></tr></table>
+</form>
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromCOUNTER1" method="post">
+<table>
+<th colspan="2"><span><b>Counter_1 Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if counter1En}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>INPUT GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="gpio" type="number" value="{{counter1Gpio}}" /></td>
+</tr>
+<tr>
+<td align="right">Active</td>
+<td style="text-align: left;"><input type="radio" name="active" value="0" {{#if counter1High}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="active" value="1" {{#if counter1High}}checked="checked"{{/if}}/>HIGH </td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitCOUNTER1" name="commitCOUNTER1" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitCOUNTER1"/>
+</td></tr></table>
+</form>
+</td></tr></table>
+<br />
+<table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromGNSS" method="post">
+<table>
+<th colspan="2"><span><b>GNSS Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if gnssEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>PORT:</b></td>
+<td style="text-align: left;">
+<select name="channel" id="channel">
+{{#each gnssPortOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<td align="right"><b>AT Command:</b></td>
+<td style="text-align: left;"><input maxlength="30" size="20" id="atc" name="atc" type="text" value="{{gnssAtCommand}}" /></td>
+</tr>
+<td align="right"><b>TCP Host:</b></td>
+<td style="text-align: left;"><input maxlength="20" size="15" id="Host" name="Host" type="text" value="{{gnssTcpHost}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>TCP Port:</b></td>
+<td style="text-align: left;"><input min="1024" max="65535"  id="Port" name="Port" type="number" value="{{gnssTcpPort}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitGNSS" name="commitGNSS" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitGNSS"/>
+</td></tr></table>
+</form><br />
+</td><td width="50%" style="border:unset;">
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromMODBUS" method="post">
+<table>
+<th colspan="2"><span><b>MODBUS Modify</b></span></th>
+<tr>
+<td align="right"><b>Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="Enable" value="OK" {{#if modbusEn}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td align="right"><b>PORT:</b></td>
+<td style="text-align: left;">
+<select name="channel" id="channel">
+{{#each modbusPortOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} </option>
+{{/each}}</select>
+</td>
+</tr>
+<tr>
+<td align="right"><b>Address:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="address" type="number" value="{{modbusAddress}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>DE:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="de" type="number" value="{{modbusDeGpio}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<input class="button" id="submitMODBUS" name="commitMODBUS" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitMODBUS"/>
+</td></tr></table>
+</form>
+</td></tr></table>
+)MOD2HTML";
+
+void handle_mod2(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+
+	if (request->hasArg("commitGNSS"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					// if (isValidNumber(request->arg(i)))
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "atc")
+			{
+				if (request->arg(i) != "")
+				{
+					strcpy(config.gnss_at_command, request->arg(i).c_str());
+				}
+				else
+				{
+					memset(config.gnss_at_command, 0, sizeof(config.gnss_at_command));
+				}
+			}
+
+			if (request->argName(i) == "Host")
+			{
+				if (request->arg(i) != "")
+				{
+					strcpy(config.gnss_tcp_host, request->arg(i).c_str());
+				}
+			}
+
+			if (request->argName(i) == "Port")
+			{
+				if (isValidNumber(request->arg(i)))
+				{
+					config.gnss_tcp_port = request->arg(i).toInt();
+				}
+			}
+
+			if (request->argName(i) == "channel")
+			{
+				if (isValidNumber(request->arg(i)))
+				{
+					config.gnss_channel = request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.gnss_enable = En;
+		saveConfig(request);
+	}
+	else if (request->hasArg("commitMODBUS"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					// if (isValidNumber(request->arg(i)))
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "channel")
+			{
+				if (isValidNumber(request->arg(i)))
+				{
+					config.modbus_channel = request->arg(i).toInt();
+				}
+			}
+
+			if (request->argName(i) == "address")
+			{
+				if (isValidNumber(request->arg(i)))
+				{
+					config.modbus_address = request->arg(i).toInt();
+				}
+			}
+
+			if (request->argName(i) == "de")
+			{
+				if (request->arg(i) != "")
+				{
+					config.modbus_de_gpio = request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.modbus_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else if (request->hasArg("commitONEWIRE"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					// if (isValidNumber(request->arg(i)))
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "data")
+			{
+				if (request->arg(i) != "")
+				{
+					config.onewire_gpio = request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.onewire_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else if (request->hasArg("commitI2C0"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "sda")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c_sda_pin = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "sck")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c_sck_pin = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "freq")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c_freq = request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.i2c_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else if (request->hasArg("commitI2C1"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "sda")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c1_sda_pin = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "sck")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c1_sck_pin = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "freq")
+			{
+				if (request->arg(i) != "")
+				{
+					config.i2c1_freq = request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.i2c1_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else if (request->hasArg("commitCOUNTER0"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "gpio")
+			{
+				if (request->arg(i) != "")
+				{
+					config.counter0_gpio = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "active")
+			{
+				if (request->arg(i) != "")
+				{
+					config.counter0_active = (bool)request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.counter0_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else if (request->hasArg("commitCOUNTER1"))
+	{
+		bool En = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			// Serial.print("SERVER ARGS ");
+			// Serial.print(request->argName(i));
+			// Serial.print("=");
+			// Serial.println(request->arg(i));
+
+			if (request->argName(i) == "Enable")
+			{
+				if (request->arg(i) != "")
+				{
+					if (String(request->arg(i)) == "OK")
+						En = true;
+				}
+			}
+
+			if (request->argName(i) == "gpio")
+			{
+				if (request->arg(i) != "")
+				{
+					config.counter1_gpio = request->arg(i).toInt();
+				}
+			}
+			if (request->argName(i) == "active")
+			{
+				if (request->arg(i) != "")
+				{
+					config.counter1_active = (bool)request->arg(i).toInt();
+				}
+			}
+		}
+
+		config.counter0_enable = En;
+		saveConfiguration("/default.cfg", config);
+		String html = "OK";
+		request->send(200, "text/html", html);
+	}
+	else
+	{
+		esp_task_wdt_reset(); // feed watchdog: handle_mod2 runs on the async_tcp task itself,
+		// and this monolithic page can take long enough under heap pressure to trip the TWDT.
+		JsonDocument data;
+		int gpioMax = GPIO_NUM_MAX;
+		data["gpioMax"] = gpioMax;
+
+		data["oneWireEn"] = config.onewire_enable;
+		data["oneWireGpio"] = config.onewire_gpio;
+
+		data["i2c0En"] = config.i2c_enable;
+		data["i2c0Sda"] = config.i2c_sda_pin;
+		data["i2c0Sck"] = config.i2c_sck_pin;
+		data["i2c0Freq"] = config.i2c_freq;
+
+		data["counter0En"] = config.counter0_enable;
+		data["counter0Gpio"] = config.counter0_gpio;
+		data["counter0High"] = config.counter0_active;
+
+		data["i2c1En"] = config.i2c1_enable;
+		data["i2c1Sda"] = config.i2c1_sda_pin;
+		data["i2c1Sck"] = config.i2c1_sck_pin;
+		data["i2c1Freq"] = config.i2c1_freq;
+
+		data["counter1En"] = config.counter1_enable;
+		data["counter1Gpio"] = config.counter1_gpio;
+		data["counter1High"] = config.counter1_active;
+
+		data["gnssEn"] = config.gnss_enable;
+		data["gnssAtCommand"] = config.gnss_at_command;
+		data["gnssTcpHost"] = config.gnss_tcp_host;
+		data["gnssTcpPort"] = config.gnss_tcp_port;
+
+		data["modbusEn"] = config.modbus_enable;
+		data["modbusAddress"] = config.modbus_address;
+		data["modbusDeGpio"] = config.modbus_de_gpio;
+
+		JsonArray gnssPortOptions = data["gnssPortOptions"].to<JsonArray>();
+		JsonArray modbusPortOptions = data["modbusPortOptions"].to<JsonArray>();
+		for (int i = 0; i < 5; i++)
+		{
+			JsonObject og = gnssPortOptions.add<JsonObject>();
+			og["value"] = i;
+			og["label"] = GNSS_PORT[i];
+			og["selected"] = (config.gnss_channel == i);
+			JsonObject om = modbusPortOptions.add<JsonObject>();
+			om["value"] = i;
+			om["label"] = GNSS_PORT[i];
+			om["selected"] = (config.modbus_channel == i);
+		}
+
+		String html_str = renderTemplate(MOD2_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "MOD2");
+	}
+}
+
+static const char *SYSTEM_TEMPLATE = R"SYSHTML(<script type="text/javascript">
+$('form').submit(function (e) {
+e.preventDefault();
+var data = new FormData(e.currentTarget);
+if(e.currentTarget.id==="formHostName") document.getElementById("updateHostName").disabled=true;
+if(e.currentTarget.id==="formTime") document.getElementById("updateTime").disabled=true;
+if(e.currentTarget.id==="formNTP") document.getElementById("updateTimeNtp").disabled=true;
+if(e.currentTarget.id==="formTimeZone") document.getElementById("updateTimeZone").disabled=true;
+if(e.currentTarget.id==="formReboot") document.getElementById("REBOOT").disabled=true;
+if(e.currentTarget.id==="formDisp") document.getElementById("submitDISP").disabled=true;
+if(e.currentTarget.id==="formWebAuth") document.getElementById("submitWebAuth").disabled=true;
+if(e.currentTarget.id==="formPWR") document.getElementById("submitPWR").disabled=true;
+if(e.currentTarget.id==="formPath") document.getElementById("submitPath").disabled=true;
+$.ajax({
+url: '/system',
+type: 'POST',
+data: data,
+contentType: false,
+processData: false,
+success: function (data) {
+alert("Submited Successfully");
+},
+error: function (data) {
+alert("An error occurred.");
+}
+});
+});
+</script>
+<table>
+<th colspan="2"><span><b>System Setting</b></span></th>
+<tr>
+<td style="text-align: right;">Host Name:</td>
+<td style="text-align: left;"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formHostName" method="post"><input name="SetHostName" type="text" value="{{hostName}}" />
+<button type='submit' id='updateHostName'  name="updateHostName"> Apply </button>
+<input type="hidden" name="updateHostName"/></form>
+</td>
+</tr>
+<tr>
+<td style="text-align: right;">LOCAL DATE/TIME </td>
+<td style="text-align: left;"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formTime" method="post">
+<input name="SetTime" type="text" value="{{setTime}}" />
+<span class="input-group-addon">
+<span class="glyphicon glyphicon-calendar">
+</span></span>
+<button type='submit' id='updateTime'  name="commit"> Time Update </button>
+<input type="hidden" name="updateTime"/></form>
+</td>
+</tr>
+<tr>
+<td style="text-align: right;">NTP Host </td>
+<td style="text-align: left;"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formNTP" method="post"><input name="SetTimeNtp" type="text" value="{{ntpHost}}" />
+<button type='submit' id='updateTimeNtp'  name="commit"> NTP Update </button>
+<input type="hidden" name="updateTimeNtp"/></form>
+</td>
+</tr>
+<tr>
+<td style="text-align: right;">Auto REBOOT:</td>
+<td style="text-align: left;"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formAutoReset" method="post"><input  min="0" max="65535"  name="SetAutoReset" type="number" value="{{resetTimeout}}" /> Minutes
+<button type='submit' id='updateAutoReset'  name="commit"> Update </button> *<i>0=No reset</i>
+<input type="hidden" name="updateAutoReset"/></form>
+</td>
+</tr>
+<tr>
+<td style="text-align: right;">Time Zone </td>
+<td style="text-align: left;"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formTimeZone" method="post">
+<select name="SetTimeZone" id="SetTimeZone">
+{{#each tzOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{label}} Sec</option>
+{{/each}}</select><button type='submit' id='updateTimeZone'  name="commit"> TZ Update </button>
+<input type="hidden" name="updateTimeZone"/></form>
+</td>
+</tr>
+<tr>
+<td style="text-align: right;">SYSTEM CONTROL </td>
+<td style="text-align: left;"><table><tr><td width="100"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formReboot" method="post"> <button type='submit' id='REBOOT'  name="commit" style="background-color:red;color:white"> REBOOT </button>
+ <input type="hidden" name="REBOOT"/></form></td><td width="100"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formFactory" method="post"> <button type='submit' id='Factory'  name="commit" style="background-color:orange;color:white"> Factory Reset </button>
+ <input type="hidden" name="Factory"/></form></td><td width="100"><form accept-charset="UTF-8" action="#" enctype='multipart/form-data' id="formLoad" method="post"> <button type='submit' id='LoadCFG'  name="commit" style="background-color:green;color:white"> Load Default </button>
+ <input type="hidden" name="LoadCFG"/></form></td></tr></table></td>
+</tr></table><br /><br />
+<form id='formWebAuth' method="POST" action='#' enctype='multipart/form-data'>
+<table>
+<th colspan="2"><span><b>Web Authentication</b></span></th>
+<tr>
+<td align="right"><b>Web USER:</b></td>
+<td style="text-align: left;"><input size="32" maxlength="32" class="form-control" name="webauth_user" type="text" value="{{webUser}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Web PASSWORD:</b></td>
+<td style="text-align: left;"><input size="63" maxlength="63" class="form-control" name="webauth_pass" type="password" value="{{webPass}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitWebAuth'  name="commit"> Apply Change </button></div>
+<input type="hidden" name="commitWebAuth"/>
+</td></tr></table><br />
+</form><br /><br />
+<form accept-charset="UTF-8" action="#" class="form-horizontal" id="formPWR" method="post">
+<table>
+<th colspan="2"><span><b>Display StandBy</b></span></th>
+<tr>
+<td align="right"><b>StandBy Delay:</b></td>
+<td style="text-align: left;"><input min="0" max="9999" name="stb" type="number" value="{{pwrStandbyDelay}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitPWR'  name="commitPWR"> Apply Change </button></div>
+<input type="hidden" name="commitPWR"/>
+</td></tr></table>
+</form><br /><br />
+{{#if logFile}}<form accept-charset="UTF-8" action="#" class="form-horizontal" id="formLOG" method="post">
+<table>
+<th colspan="2"><span><b>Log File</b></span></th>
+<tr>
+<td align="right"><b>Activate:</b></td>
+<td style="text-align: left;">
+<fieldset id="FilterGrp">
+<legend>Events</legend>
+<table style="text-align:unset;border-width:0px;background:unset">
+<tr style="background:unset;"><td style="border:unset;"><input class="field_checkbox" name="logTracker" type="checkbox" value="OK" {{#if logTracker}}checked{{/if}}/>Tracker</td>
+<td style="border:unset;"><input class="field_checkbox" name="logIgate" type="checkbox" value="OK" {{#if logIgate}}checked{{/if}}/>IGate</td>
+<td style="border:unset;"><input class="field_checkbox" name="logDigi" type="checkbox" value="OK" {{#if logDigi}}checked{{/if}}/>DIGI</td>
+<td style="border:unset;"><input class="field_checkbox" name="logWeather" type="checkbox" value="OK" {{#if logWeather}}checked{{/if}}/>Weather</td>
+<td style="border:unset;"></td>
+</tr></table></fieldset>
+</td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitLOG'  name="commitLOG"> Apply Change </button></div>
+<input type="hidden" name="commitLOG"/>
+</td></tr></table>
+</form><br /><br />
+{{/if}}<form id='formPath' method="POST" action='#' enctype='multipart/form-data'>
+<table>
+<th colspan="2"><span><b>PATH USER Define</b></span></th>
+<tr>
+<td align="right"><b>PATH_1:</b></td>
+<td style="text-align: left;"><input size="72" maxlength="72" class="form-control" name="path1" type="text" value="{{path1}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>PATH_2:</b></td>
+<td style="text-align: left;"><input size="72" maxlength="72" class="form-control" name="path2" type="text" value="{{path2}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>PATH_3:</b></td>
+<td style="text-align: left;"><input size="72" maxlength="72" class="form-control" name="path3" type="text" value="{{path3}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>PATH_4:</b></td>
+<td style="text-align: left;"><input size="72" maxlength="72" class="form-control" name="path4" type="text" value="{{path4}}" /></td>
+</tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitPath'  name="commitPath"> Apply Change </button></div>
+<input type="hidden" name="commitPath"/>
+</td></tr></table>
+</form><br /><br />{{#if dispSupport}}<form id='formDisp' method="POST" action='#' enctype='multipart/form-data'>
+<table>
+<th colspan="2"><span><b>Display Setting</b></span></th>
+<tr>
+<td style="text-align: right;"><b>OLED/TFT Enable</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="oledEnable" value="OK" {{#if oledEnable}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td style="text-align: right;"><b>Flip Rotate</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="dispFlip" value="OK" {{#if dispFlip}}checked{{/if}}><span class="slider round"></span></label></td>
+</tr>
+<tr>
+<td style="text-align: right;"><b>TX Display</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="txdispEnable" value="OK" {{#if txDisplay}}checked{{/if}}><span class="slider round"></span></label><label style="vertical-align: bottom;font-size: 8pt;"> <i>*All TX Packet for display affter filter.</i></label></td>
+</tr>
+<tr>
+<td style="text-align: right;"><b>RX Display</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="rxdispEnable" value="OK" {{#if rxDisplay}}checked{{/if}}><span class="slider round"></span></label><label style="vertical-align: bottom;font-size: 8pt;"> <i>*All RX Packet for display affter filter.</i></label></td>
+</tr>
+<tr>
+<td style="text-align: right;"><b>Head Up</b></td>
+<td style="text-align: left;"><label class="switch"><input type="checkbox" name="hupEnable" value="OK" {{#if hUp}}checked{{/if}}><span class="slider round"></span></label><label style="vertical-align: bottom;font-size: 8pt;"> <i>*The compass will rotate in the direction of movement.</i></label></td>
+</tr>
+<tr>
+<td style="text-align: right;"><b>TFT Brightness</b></td>
+<td style="text-align: left;">
+<select name="dispBright" id="dispBright">
+{{#each brightOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}}</option>
+{{/each}}</select>
+</td></tr>
+<tr>
+<td style="text-align: right;"><b>Popup Delay</b></td>
+<td style="text-align: left;">
+<select name="dispDelay" id="dispDelay">
+{{#each delayOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} Sec</option>
+{{/each}}</select>
+</td></tr>
+<tr>
+<td style="text-align: right;"><b>OLED/TFT Sleep</b></td>
+<td style="text-align: left;">
+<select name="oled_timeout" id="oled_timeout">
+{{#each timeoutOptions}}<option value="{{value}}" {{#if selected}}selected{{/if}}>{{value}} Sec</option>
+{{/each}}</select>
+</td></tr>
+<tr><td style="text-align: right;"><b>RX Channel</b></td><td style="text-align: left;"><input type="checkbox" name="dispRF" value="OK" {{#if dispRF}}checked{{/if}}/>RF <input type="checkbox" name="dispINET" value="OK" {{#if dispINET}}checked{{/if}}/>Internet </td></tr>
+<tr>
+<td align="right"><b>Filter DX:</b></td>
+<td style="text-align: left;"><input type="number" name="filterDX" min="0" max="9999"
+step="1" value="{{filterDistant}}" /> Km.  <label style="vertical-align: bottom;font-size: 8pt;"> <i>*Value 0 is all distant allow.</i></label></td>
+</tr>
+<tr>
+<td align="right"><b>Filter:</b></td>
+<td align="center">
+<fieldset id="filterDispGrp">
+<legend>Filter popup display</legend>
+<table style="text-align:unset;border-width:0px;background:unset">
+<tr style="background:unset;"><td style="border:unset;"><input class="field_checkbox" id="filterMessage" name="filterMessage" type="checkbox" value="OK" {{#if filterMessage}}checked{{/if}}/>Message</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterStatus" name="filterStatus" type="checkbox" value="OK" {{#if filterStatus}}checked{{/if}}/>Status</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterTelemetry" name="filterTelemetry" type="checkbox" value="OK" {{#if filterTelemetry}}checked{{/if}}/>Telemetry</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterWeather" name="filterWeather" type="checkbox" value="OK" {{#if filterWeather}}checked{{/if}}/>Weather</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterObject" name="filterObject" type="checkbox" value="OK" {{#if filterObject}}checked{{/if}}/>Object</td>
+</tr><tr style="background:unset;"><td style="border:unset;"><input class="field_checkbox" id="filterItem" name="filterItem" type="checkbox" value="OK" {{#if filterItem}}checked{{/if}}/>Item</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterQuery" name="filterQuery" type="checkbox" value="OK" {{#if filterQuery}}checked{{/if}}/>Query</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterBuoy" name="filterBuoy" type="checkbox" value="OK" {{#if filterBuoy}}checked{{/if}}/>Buoy</td>
+<td style="border:unset;"><input class="field_checkbox" id="filterPosition" name="filterPosition" type="checkbox" value="OK" {{#if filterPosition}}checked{{/if}}/>Position</td>
+<td style="border:unset;"></td>
+</tr></table></fieldset>
+</td></tr>
+<tr><td colspan="2" align="right">
+<div><button class="button" type='submit' id='submitDISP'  name="commitDISP"> Apply Change </button></div>
+<input type="hidden" name="commitDISP"/>
+</td></tr></table><br />
+</form><br />{{/if}})SYSHTML";
+
 void handle_system(AsyncWebServerRequest *request)
 {
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
@@ -6007,42 +6175,12 @@ void handle_system(AsyncWebServerRequest *request)
 	}
 	else if (request->hasArg("commitPWR"))
 	{
-		bool PwrEn = false;
-		config.pwr_sleep_activate = 0;
-
+		// LU6JMF cleanup (Set/2026): this form used to have a whole dead
+		// "Power Save Mode" (Enable/GPIO/Sleep Interval/Mode/Events) that
+		// never actually did anything in the firmware. Only StandBy Delay
+		// (OLED timeout) was real - kept, rest removed to save space.
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
-			if (request->argName(i) == "pwr_active")
-			{
-				if (request->arg(i) != "")
-				{
-					config.pwr_active = (bool)request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "Enable")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-					{
-						PwrEn = true;
-					}
-				}
-			}
-			if (request->argName(i) == "pwr")
-			{
-				if (request->arg(i) != "")
-				{
-					config.pwr_gpio = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "sleep")
-			{
-				if (request->arg(i) != "")
-				{
-					config.pwr_sleep_interval = request->arg(i).toInt();
-				}
-			}
 			if (request->argName(i) == "stb")
 			{
 				if (request->arg(i) != "")
@@ -6050,86 +6188,7 @@ void handle_system(AsyncWebServerRequest *request)
 					config.pwr_stanby_delay = request->arg(i).toInt();
 				}
 			}
-			if (request->argName(i) == "mode")
-			{
-				if (request->arg(i) != "")
-				{
-					config.pwr_mode = request->arg(i).toInt();
-				}
-			}
-			if (request->argName(i) == "FilterTelemetry")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_TELEMETRY;
-				}
-			}
-
-			if (request->argName(i) == "FilterStatus")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_STATUS;
-				}
-			}
-
-			if (request->argName(i) == "FilterWeather")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_WX;
-				}
-			}
-
-			if (request->argName(i) == "FilterTracker")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_TRACKER;
-				}
-			}
-
-			if (request->argName(i) == "FilterIGate")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_IGATE;
-				}
-			}
-
-			if (request->argName(i) == "FilterDigi")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_DIGI;
-				}
-			}
-
-			if (request->argName(i) == "FilterQuery")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_QUERY;
-				}
-			}
-
-			if (request->argName(i) == "FilterWifi")
-			{
-				if (request->arg(i) != "")
-				{
-					if (strcmp(request->arg(i).c_str(), "OK") == 0)
-						config.pwr_sleep_activate |= ACTIVATE_WIFI;
-				}
-			}
 		}
-		config.pwr_en = PwrEn;
 		saveConfig(request);
 	}
 	else if (request->hasArg("commitLOG"))
@@ -6383,7 +6442,7 @@ void handle_system(AsyncWebServerRequest *request)
 			}
 		}
 
-#ifdef OLED
+#if defined OLED || defined GUI_LCD
 		if (oledEN && !config.oled_enable)
 		{
 			// display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false); // initialize with the I2C addr 0x3C (for the 128x64)
@@ -6419,589 +6478,396 @@ void handle_system(AsyncWebServerRequest *request)
 		getLocalTime(&tmstruct, 100);
 		sprintf(strTime, "%d-%02d-%02d %02d:%02d:%02d", (tmstruct.tm_year) + 1900, (tmstruct.tm_mon) + 1, tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
 
-		// Using dynamic memory allocation instead of String
-		char *html = allocateStringMemory(20000); // Initial buffer size, adjust as needed
-		if (!html)
-		{
-			return; // Memory allocation failed
-		}
+		JsonDocument data;
+		data["hostName"] = config.host_name;
+		data["setTime"] = strTime;
+		data["ntpHost"] = config.ntp_host;
+		data["resetTimeout"] = config.reset_timeout;
 
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formHostName\") document.getElementById(\"updateHostName\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formTime\") document.getElementById(\"updateTime\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formNTP\") document.getElementById(\"updateTimeNtp\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formTimeZone\") document.getElementById(\"updateTimeZone\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formReboot\") document.getElementById(\"REBOOT\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formDisp\") document.getElementById(\"submitDISP\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formWebAuth\") document.getElementById(\"submitWebAuth\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formPWR\") document.getElementById(\"submitPWR\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formPath\") document.getElementById(\"submitPath\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/system',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
-
-		// html += "<h2>System Setting</h2>\n";
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>System Setting</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\">Host Name:</td>\n");
-
-		// Building form with snprintf to avoid string concatenation
-		char temp_buffer[300];
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formHostName\" method=\"post\"><input name=\"SetHostName\" type=\"text\" value=\"%s\" />\n", config.host_name);
-		strcat(html, temp_buffer);
-		strcat(html, "<button type='submit' id='updateHostName'  name=\"updateHostName\"> Apply </button>\n");
-		strcat(html, "<input type=\"hidden\" name=\"updateHostName\"/></form>\n</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>");
-		// html += "<form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formTime\" method=\"post\">\n";
-		strcat(html, "<td style=\"text-align: right;\">LOCAL DATE/TIME </td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formTime\" method=\"post\">\n<input name=\"SetTime\" type=\"text\" value=\"%s\" />\n", strTime);
-		strcat(html, temp_buffer);
-		strcat(html, "<span class=\"input-group-addon\">\n<span class=\"glyphicon glyphicon-calendar\">\n</span></span>\n");
-		// html += "<div class=\"col-sm-3 col-xs-6\"><button class=\"btn btn-primary\" data-args=\"[true]\" data-method=\"getDate\" type=\"button\" data-related-target=\"#SetTime\" />Get Date</button></div>\n");
-		strcat(html, "<button type='submit' id='updateTime'  name=\"commit\"> Time Update </button>\n");
-		strcat(html, "<input type=\"hidden\" name=\"updateTime\"/></form>\n</td>\n");
-		// html += "<input class=\"btn btn-primary\" id=\"updateTime\" name=\"updateTime\" type=\"submit\" value=\"Time Update\" maxlength=\"80\"/></td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\">NTP Host </td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formNTP\" method=\"post\"><input name=\"SetTimeNtp\" type=\"text\" value=\"%s\" />\n", config.ntp_host);
-		strcat(html, temp_buffer);
-		strcat(html, "<button type='submit' id='updateTimeNtp'  name=\"commit\"> NTP Update </button>\n");
-		strcat(html, "<input type=\"hidden\" name=\"updateTimeNtp\"/></form>\n</td>\n");
-		// html += "<input class=\"btn btn-primary\" id=\"updateTimeNtp\" name=\"updateTimeNtp\" type=\"submit\" value=\"NTP Update\" maxlength=\"80\"/></td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\">Auto REBOOT:</td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formAutoReset\" method=\"post\"><input  min=\"0\" max=\"65535\"  name=\"SetAutoReset\" type=\"number\" value=\"%d\" /> Minutes\n", config.reset_timeout);
-		strcat(html, temp_buffer);
-		strcat(html, "<button type='submit' id='updateAutoReset'  name=\"commit\"> Update </button> *<i>0=No reset</i>\n");
-		strcat(html, "<input type=\"hidden\" name=\"updateAutoReset\"/></form>\n</td>\n");
-		// html += "<input class=\"button\" id=\"updateTimeNtp\" name=\"updateTimeNtp\" type=\"submit\" value=\"NTP Update\" maxlength=\"80\"/></td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\">Time Zone </td>\n");
-		strcat(html, "<td style=\"text-align: left;\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formTimeZone\" method=\"post\">\n");
-		strcat(html, "<select name=\"SetTimeZone\" id=\"SetTimeZone\">\n");
+		JsonArray tzOptions = data["tzOptions"].to<JsonArray>();
+		char tzValueBuf[8];
 		for (int i = 0; i < 40; i++)
 		{
-			if (config.timeZone == tzList[i].tz)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%.1f\" selected>%s Sec</option>\n", tzList[i].tz, tzList[i].name);
-			}
-			else
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%.1f\" >%s Sec</option>\n", tzList[i].tz, tzList[i].name);
-			}
-			strcat(html, temp_buffer);
+			JsonObject o = tzOptions.add<JsonObject>();
+			snprintf(tzValueBuf, sizeof(tzValueBuf), "%.1f", tzList[i].tz);
+			o["value"] = tzValueBuf;
+			o["label"] = tzList[i].name;
+			o["selected"] = (config.timeZone == tzList[i].tz);
 		}
-		strcat(html, "</select>");
-		strcat(html, "<button type='submit' id='updateTimeZone'  name=\"commit\"> TZ Update </button>\n");
-		strcat(html, "<input type=\"hidden\" name=\"updateTimeZone\"/></form>\n</td>\n");
-		// html += "<input class=\"btn btn-primary\" id=\"updateTimeZone\" name=\"updateTimeZone\" type=\"submit\" value=\"TZ Update\" maxlength=\"80\"/></td>\n");
-		strcat(html, "</tr>\n");
 
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\">SYSTEM CONTROL </td>\n");
-		strcat(html, "<td style=\"text-align: left;\"><table><tr><td width=\"100\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formReboot\" method=\"post\"> <button type='submit' id='REBOOT'  name=\"commit\" style=\"background-color:red;color:white\"> REBOOT </button>\n");
-		strcat(html, " <input type=\"hidden\" name=\"REBOOT\"/></form></td><td width=\"100\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formFactory\" method=\"post\"> <button type='submit' id='Factory'  name=\"commit\" style=\"background-color:orange;color:white\"> Factory Reset </button>\n");
-		strcat(html, " <input type=\"hidden\" name=\"Factory\"/></form></td><td width=\"100\"><form accept-charset=\"UTF-8\" action=\"#\" enctype='multipart/form-data' id=\"formLoad\" method=\"post\"> <button type='submit' id='LoadCFG'  name=\"commit\" style=\"background-color:green;color:white\"> Load Default </button>\n");
-		strcat(html, " <input type=\"hidden\" name=\"LoadCFG\"/></form></td></tr></table></td>\n");
-		// html += "<td style=\"text-align: left;\"><input type='submit' class=\"btn btn-danger\" id=\"REBOOT\" name=\"REBOOT\" value='REBOOT'></td>\n");
-		strcat(html, "</tr></table><br /><br />\n");
-
-		/************************ WEB AUTH **************************/
-		strcat(html, "<form id='formWebAuth' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Web Authentication</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Web USER:</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"32\" maxlength=\"32\" class=\"form-control\" name=\"webauth_user\" type=\"text\" value=\"%s\" /></td>\n", config.http_username);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Web PASSWORD:</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input size=\"63\" maxlength=\"63\" class=\"form-control\" name=\"webauth_pass\" type=\"password\" value=\"%s\" /></td>\n", config.http_password);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitWebAuth'  name=\"commit\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitWebAuth\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br /><br />");
-
-		/**************Power Mode******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formPWR\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Power Save Mode</b></span></th>\n");
-		strcat(html, "<tr>");
-
-		char enFlage[10] = "";
-		if (config.pwr_en)
-			strcpy(enFlage, "checked");
-		strcat(html, "<td align=\"right\"><b>Enable</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", enFlage);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		char LowFlag[20] = "", HighFlag[20] = "";
-		strcpy(LowFlag, "");
-		strcpy(HighFlag, "");
-		if (config.pwr_active)
-			strcpy(HighFlag, "checked=\"checked\"");
-		else
-			strcpy(LowFlag, "checked=\"checked\"");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PWR GPIO:</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"-1\" max=\"50\"  name=\"pwr\" type=\"number\" value=\"%d\" /> Output Active:<input type=\"radio\" name=\"pwr_active\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"pwr_active\" value=\"1\" %s/>HIGH </td>\n", config.pwr_gpio, LowFlag, HighFlag);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Sleep Interval:</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"0\" max=\"9999\" name=\"sleep\" type=\"number\" value=\"%d\" /></td>\n", config.pwr_sleep_interval);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>StandBy Delay:</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><input min=\"0\" max=\"9999\" name=\"stb\" type=\"number\" value=\"%d\" /></td>\n", config.pwr_stanby_delay);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Power Mode:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mode\" id=\"mode\">\n");
-		for (int i = 0; i < 3; i++)
-		{
-			if (config.pwr_mode == i)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%s </option>\n", i, PWR_MODE[i]);
-			}
-			else
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%s </option>\n", i, PWR_MODE[i]);
-			}
-			strcat(html, temp_buffer);
-		}
-		strcat(html, "</select> A=Reduce Speed(PWR Off),B=Light Sleep(WiFi/PWR Off),C=Deep Sleep(All Off)\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Event Activate:</b><br/>(For Mode C)</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<fieldset id=\"FilterGrp\">\n");
-		strcat(html, "<legend>Events</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">\n");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		char filterFlageEn[10] = "";
-		if (config.pwr_sleep_activate & ACTIVATE_TRACKER)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterTracker\" type=\"checkbox\" value=\"OK\" %s/>Tracker</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_STATUS)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterStatus\" type=\"checkbox\" value=\"OK\" %s/>Status</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_TELEMETRY)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterTelemetry\" type=\"checkbox\" value=\"OK\" %s/>Telemetry</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_WX)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_IGATE)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterIGate\" type=\"checkbox\" value=\"OK\" %s/>IGate</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_DIGI)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterDigi\" type=\"checkbox\" value=\"OK\" %s/>Digi</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_QUERY)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterQuery\" type=\"checkbox\" value=\"OK\" %s/>Query</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.pwr_sleep_activate & ACTIVATE_WIFI)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterWifi\" type=\"checkbox\" value=\"OK\" %s/>WiFi</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		strcat(html, "<td style=\"border:unset;\"></td>\n");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitPWR'  name=\"commitPWR\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitPWR\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "</form><br /><br />\n");
-
-		#ifdef LOG_FILE
-		/**************Log File******************/
-		strcat(html, "<form accept-charset=\"UTF-8\" action=\"#\" class=\"form-horizontal\" id=\"formLOG\" method=\"post\">\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Log File</b></span></th>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Activate:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<fieldset id=\"FilterGrp\">\n");
-		strcat(html, "<legend>Events</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">\n");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		if (config.log & LOG_TRACKER)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"logTracker\" type=\"checkbox\" value=\"OK\" %s/>Tracker</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.log & LOG_IGATE)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"logIgate\" type=\"checkbox\" value=\"OK\" %s/>IGate</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.log & LOG_DIGI)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"logDigi\" type=\"checkbox\" value=\"OK\" %s/>DIGI</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.log & LOG_WX)
-			strcpy(filterFlageEn, "checked");
-		else
-			strcpy(filterFlageEn, "");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"logWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n", filterFlageEn);
-		strcat(html, temp_buffer);
-
-		strcat(html, "<td style=\"border:unset;\"></td>\n");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitLOG'  name=\"commitLOG\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitLOG\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-
-		strcat(html, "</form><br /><br />\n");
-		#endif
-
-		/************************ PATH USER define **************************/
-		strcat(html, "<form id='formPath' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>PATH USER Define</b></span></th>\n");
-		strcat(html, "<tr>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"right\"><b>PATH_1:</b></td>\n<td style=\"text-align: left;\"><input size=\"72\" maxlength=\"72\" class=\"form-control\" name=\"path1\" type=\"text\" value=\"%s\" /></td>\n", config.path[0]);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"right\"><b>PATH_2:</b></td>\n<td style=\"text-align: left;\"><input size=\"72\" maxlength=\"72\" class=\"form-control\" name=\"path2\" type=\"text\" value=\"%s\" /></td>\n", config.path[1]);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"right\"><b>PATH_3:</b></td>\n<td style=\"text-align: left;\"><input size=\"72\" maxlength=\"72\" class=\"form-control\" name=\"path3\" type=\"text\" value=\"%s\" /></td>\n", config.path[2]);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td align=\"right\"><b>PATH_4:</b></td>\n<td style=\"text-align: left;\"><input size=\"72\" maxlength=\"72\" class=\"form-control\" name=\"path4\" type=\"text\" value=\"%s\" /></td>\n", config.path[3]);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitPath'  name=\"commitPath\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitPath\"/>\n");
-		strcat(html, "</td></tr></table>\n");
-		strcat(html, "</form><br /><br />");
-
-#if defined OLED || defined ST7735_160x80
-		strcat(html, "<form id='formDisp' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// html += "<h2>Display Setting</h2>\n";
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Display Setting</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>OLED/TFT Enable</b></td>\n");
-		char oledFlageEn[10] = "";
-		if (config.oled_enable == true)
-			strcpy(oledFlageEn, "checked");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"oledEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		if (config.disp_flip == true)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>Flip Rotate</b></td>\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"dispFlip\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>TX Display</b></td>\n");
-		if (config.tx_display == true)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"txdispEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"> <i>*All TX Packet for display affter filter.</i></label></td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>RX Display</b></td>\n");
-		if (config.rx_display == true)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"rxdispEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"> <i>*All RX Packet for display affter filter.</i></label></td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>Head Up</b></td>\n");
-		if (config.h_up == true)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"hupEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"> <i>*The compass will rotate in the direction of movement.</i></label></td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>TFT Brightness</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"dispBright\" id=\"dispBright\">\n");
-		for (int i = 0; i < 255; i += 25)
-		{
-			if (config.disp_brightness == i)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%d</option>\n", i, i);
-			}
-			else
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%d</option>\n", i, i);
-			}
-			strcat(html, temp_buffer);
-		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>Popup Delay</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"dispDelay\" id=\"dispDelay\">\n");
-		for (int i = 0; i < 16; i += 1)
-		{
-			if (config.dispDelay == i)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%d Sec</option>\n", i, i);
-			}
-			else
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%d Sec</option>\n", i, i);
-			}
-			strcat(html, temp_buffer);
-		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td></tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td style=\"text-align: right;\"><b>OLED/TFT Sleep</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"oled_timeout\" id=\"oled_timeout\">\n");
-		for (int i = 0; i <= 600; i += 30)
-		{
-			if (config.oled_timeout == i)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" selected>%d Sec</option>\n", i, i);
-			}
-			else
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<option value=\"%d\" >%d Sec</option>\n", i, i);
-			}
-			strcat(html, temp_buffer);
-		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td></tr>\n");
-		char rfFlageEn[20] = "";
-		if (config.dispRF == true)
-			strcpy(rfFlageEn, "checked");
-		char inetFlageEn[20] = "";
-		if (config.dispINET == true)
-			strcpy(inetFlageEn, "checked");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td style=\"text-align: right;\"><b>RX Channel</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"dispRF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"dispINET\" value=\"OK\" %s/>Internet </td></tr>\n", rfFlageEn, inetFlageEn);
-		strcat(html, temp_buffer);
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Filter DX:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\"><input type=\"number\" name=\"filterDX\" min=\"0\" max=\"9999\"\n");
-
-		snprintf(temp_buffer, sizeof(temp_buffer), "step=\"1\" value=\"%d\" /> Km.  <label style=\"vertical-align: bottom;font-size: 8pt;\"> <i>*Value 0 is all distant allow.</i></label></td>\n", config.filterDistant);
-		strcat(html, temp_buffer);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Filter:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<fieldset id=\"filterDispGrp\">\n");
-		strcat(html, "<legend>Filter popup display</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">\n");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		// html += "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"dispTNC\" name=\"dispTNC\" type=\"checkbox\" value=\"OK\" " + rfFlageEn + "/>From RF</td>\n";
-
-		// html += "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"dispINET\" name=\"dispINET\" type=\"checkbox\" value=\"OK\" " + inetFlageEn + "/>From INET</td>\n";
-
-		if (config.dispFilter & FILTER_MESSAGE)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterMessage\" name=\"filterMessage\" type=\"checkbox\" value=\"OK\" %s/>Message</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-		if (config.dispFilter & FILTER_STATUS)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterStatus\" name=\"filterStatus\" type=\"checkbox\" value=\"OK\" %s/>Status</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_TELEMETRY)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterTelemetry\" name=\"filterTelemetry\" type=\"checkbox\" value=\"OK\" %s/>Telemetry</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_WX)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterWeather\" name=\"filterWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_OBJECT)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterObject\" name=\"filterObject\" type=\"checkbox\" value=\"OK\" %s/>Object</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_ITEM)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		strcat(html, "</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterItem\" name=\"filterItem\" type=\"checkbox\" value=\"OK\" ");
-		strcat(html, oledFlageEn);
-		strcat(html, "/>Item</td>\n");
-
-		if (config.dispFilter & FILTER_QUERY)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterQuery\" name=\"filterQuery\" type=\"checkbox\" value=\"OK\" %s/>Query</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_BUOY)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterBuoy\" name=\"filterBuoy\" type=\"checkbox\" value=\"OK\" %s/>Buoy</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		if (config.dispFilter & FILTER_POSITION)
-			strcpy(oledFlageEn, "checked");
-		else
-			strcpy(oledFlageEn, "");
-		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"border:unset;\"><input class=\"field_checkbox\" id=\"filterPosition\" name=\"filterPosition\" type=\"checkbox\" value=\"OK\" %s/>Position</td>\n", oledFlageEn);
-		strcat(html, temp_buffer);
-
-		strcat(html, "<td style=\"border:unset;\"></td>\n");
-		strcat(html, "</tr></table></fieldset>\n");
-
-		strcat(html, "</td></tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitDISP'  name=\"commitDISP\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitDISP\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
+		data["webUser"] = config.http_username;
+		data["webPass"] = config.http_password;
+		data["pwrStandbyDelay"] = config.pwr_stanby_delay;
+
+#ifdef LOG_FILE
+		data["logFile"] = true;
+		data["logTracker"] = (bool)(config.log & LOG_TRACKER);
+		data["logIgate"] = (bool)(config.log & LOG_IGATE);
+		data["logDigi"] = (bool)(config.log & LOG_DIGI);
+		data["logWeather"] = (bool)(config.log & LOG_WX);
+#else
+		data["logFile"] = false;
 #endif
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("System", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html);
+		data["path1"] = config.path[0];
+		data["path2"] = config.path[1];
+		data["path3"] = config.path[2];
+		data["path4"] = config.path[3];
+
+#if defined OLED || defined ST7735_160x80 || defined GUI_LCD
+		data["dispSupport"] = true;
+		data["oledEnable"] = config.oled_enable;
+		data["dispFlip"] = config.disp_flip;
+		data["txDisplay"] = config.tx_display;
+		data["rxDisplay"] = config.rx_display;
+		data["hUp"] = config.h_up;
+
+		JsonArray brightOptions = data["brightOptions"].to<JsonArray>();
+		for (int i = 0; i < 255; i += 25)
+		{
+			JsonObject o = brightOptions.add<JsonObject>();
+			o["value"] = i;
+			o["selected"] = (config.disp_brightness == i);
+		}
+		JsonArray delayOptions = data["delayOptions"].to<JsonArray>();
+		for (int i = 0; i < 16; i += 1)
+		{
+			JsonObject o = delayOptions.add<JsonObject>();
+			o["value"] = i;
+			o["selected"] = (config.dispDelay == i);
+		}
+		JsonArray timeoutOptions = data["timeoutOptions"].to<JsonArray>();
+		for (int i = 0; i <= 600; i += 30)
+		{
+			JsonObject o = timeoutOptions.add<JsonObject>();
+			o["value"] = i;
+			o["selected"] = (config.oled_timeout == i);
+		}
+
+		data["dispRF"] = config.dispRF;
+		data["dispINET"] = config.dispINET;
+		data["filterDistant"] = config.filterDistant;
+
+		data["filterMessage"] = (bool)(config.dispFilter & FILTER_MESSAGE);
+		data["filterStatus"] = (bool)(config.dispFilter & FILTER_STATUS);
+		data["filterTelemetry"] = (bool)(config.dispFilter & FILTER_TELEMETRY);
+		data["filterWeather"] = (bool)(config.dispFilter & FILTER_WX);
+		data["filterObject"] = (bool)(config.dispFilter & FILTER_OBJECT);
+		data["filterItem"] = (bool)(config.dispFilter & FILTER_ITEM);
+		data["filterQuery"] = (bool)(config.dispFilter & FILTER_QUERY);
+		data["filterBuoy"] = (bool)(config.dispFilter & FILTER_BUOY);
+		data["filterPosition"] = (bool)(config.dispFilter & FILTER_POSITION);
+#else
+		data["dispSupport"] = false;
+#endif
+
+		String html_str = renderTemplate(SYSTEM_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "System");
 	}
 }
+
+static const char *IGATE_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formIgate\") document.getElementById(\"submitIGATE\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formIgateFilter\") document.getElementById(\"submitIGATEfilter\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/igate',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n<script type=\"text/javascript\">\n"
+	"function openWindowSymbol() {\n"
+	"var i, l, options = [{\n"
+	"value: 'first',\n"
+	"text: 'First'\n"
+	"}, {\n"
+	"value: 'second',\n"
+	"text: 'Second'\n"
+	"}],\n"
+	"newWindow = window.open(\"/symbol\", null, \"height=400,width=400,status=no,toolbar=no,menubar=no,location=no\");\n"
+	"}\n"
+	"function setValue(symbol,table) {\n"
+	"document.getElementById('igateSymbol').value = String.fromCharCode(symbol);\n"
+	"if(table==1){\n document.getElementById('igateTable').value='/';\n"
+	"}else if(table==2){\n document.getElementById('igateTable').value='\\\\';\n}\n"
+	"document.getElementById('igateImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"\n}\n"
+	"function calculatePHGR(){document.forms.formIgate.texttouse.value=\"PHG\"+calcPower(document.forms.formIgate.power.value)+calcHeight(document.forms.formIgate.haat.value)+calcGain(document.forms.formIgate.gain.value)+calcDirection(document.forms.formIgate.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n"
+	"function onRF2INETCheck() {\n"
+	"if (document.querySelector('#rf2inetEnable').checked) {\n"
+	"document.getElementById(\"rf2inetFilterGrp\").disabled=false;\n"
+	"} else {\n"
+	"document.getElementById(\"rf2inetFilterGrp\").disabled=true;\n"
+	"}\n}\n"
+	"function onINET2RFCheck() {\n"
+	"if (document.querySelector('#inet2rfEnable').checked) {\n"
+	"document.getElementById(\"inet2rfFilterGrp\").disabled=false;\n"
+	"} else {\n"
+	"document.getElementById(\"inet2rfFilterGrp\").disabled=true;\n"
+	"}\n}\n"
+	"function selPrecision(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"precision\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n"
+	"}\n"
+	"function selOffset(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"offset\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formIgate' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[IGATE] Internet Gateway Mode</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateEnable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"{{myCall}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station SSID:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"mySSID\" id=\"mySSID\">\n"
+	"{{#each ssidOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{value}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Symbol:</b></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"igateTable\" name=\"igateTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"igateSymbol\" name=\"igateSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"igateImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Item/Obj Name:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" id=\"igateObject\" name=\"igateObject\" type=\"text\" value=\"{{object}}\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"igatePath\" id=\"igatePath\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Server Host:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"20\" size=\"20\" id=\"aprsHost\" name=\"aprsHost\" type=\"text\" value=\"{{aprsHost}}\" /> *APRS-IS by T2THAI at <a href=\"http://aprs.nakhonthai.net:14501\" target=\"_t2thai\">aprs.nakhonthai.net:14580</a>,CBAPRS at <a href=\"http://aprs.nakhonthai.net:24501\" target=\"_t2thai\">aprs.nakhonthai.net:24580</a></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Server Port:</b></td>\n"
+	"<td style=\"text-align: left;\"><input min=\"1\" max=\"65535\" step=\"1\" id=\"aprsPort\" name=\"aprsPort\" type=\"number\" value=\"{{aprsPort}}\" /> *AMPR Host at <a href=\"http://aprs.hs5tqa.ampr.org:14501\" target=\"_t2thai\">aprs.hs5tqa.ampr.org:14580</a></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Server Filter:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"30\" size=\"30\" id=\"aprsFilter\" name=\"aprsFilter\" type=\"text\" value=\"{{aprsFilter}}\" /> *Filter: <a target=\"_blank\" href=\"http://www.aprs-is.net/javAPRSFilter.aspx\">http://www.aprs-is.net/javAPRSFilter.aspx</a></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Comment:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"igateComment\" name=\"igateComment\" type=\"text\" value=\"{{comment}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Status:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"igateStatus\" name=\"igateStatus\" type=\"text\" value=\"{{status}}\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"igateSTSInv\" type=\"number\" value=\"{{statusInterval}}\" />Sec.</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>RF2INET:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"rf2inetEnable\" name=\"rf2inetEnable\" onclick=\"onRF2INETCheck()\" value=\"OK\" {{#if rf2inet}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch RF to Internet gateway</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>INET2RF:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"inet2rfEnable\" name=\"inet2rfEnable\" onclick=\"onINET2RFCheck()\" value=\"OK\" {{#if inet2rf}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch Internet to RF gateway</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Time Stamp:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateTimeStamp\" value=\"OK\" {{#if timestamp}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n<tr>"
+	"<td align=\"right\"><b>POSITION:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Beacon:</td><td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateBcnEnable\" value=\"OK\" {{#if bcnEn}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\">  Interval:<input min=\"0\" max=\"3600\" step=\"1\" id=\"igatePosInv\" name=\"igatePosInv\" type=\"number\" value=\"{{posInterval}}\" />Sec.</label></td></tr>"
+	"<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"igatePosSel\" value=\"0\" {{#if posFix}}checked=\"checked\"{{/if}}/>Fix <input type=\"radio\" name=\"igatePosSel\" value=\"1\" {{#if posGPS}}checked=\"checked\"{{/if}}/>GPS </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"igatePos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"igatePos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"igatePosLat\" name=\"igatePosLat\" type=\"number\" value=\"{{lat}}\" />degrees (positive for North, negative for South)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"igatePosLon\" name=\"igatePosLon\" type=\"number\" value=\"{{lon}}\" />degrees (positive for East, negative for West)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"igatePosAlt\" name=\"igatePosAlt\" type=\"number\" value=\"{{alt}}\" /> meter. *Value 0 is not send height</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PHG:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr>\n"
+	"<td align=\"right\">Radio TX Power</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"power\" id=\"power\">\n"
+	"<option value=\"1\" selected>1</option>\n"
+	"<option value=\"5\">5</option>\n"
+	"<option value=\"10\">10</option>\n"
+	"<option value=\"15\">15</option>\n"
+	"<option value=\"25\">25</option>\n"
+	"<option value=\"35\">35</option>\n"
+	"<option value=\"50\">50</option>\n"
+	"<option value=\"65\">65</option>\n"
+	"<option value=\"80\">80</option>\n"
+	"</select> Watts</td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">Antenna Gain</td><td style=\"text-align: left;\"><input size=\"3\" min=\"0\" max=\"100\" step=\"0.1\" id=\"gain\" name=\"gain\" type=\"number\" value=\"6\" /> dBi</td></tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Height</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"haat\" id=\"haat\">\n"
+	"<option value=\"10\" selected>10</option>\n"
+	"<option value=\"20\">20</option>\n"
+	"<option value=\"40\">40</option>\n"
+	"<option value=\"80\">80</option>\n"
+	"<option value=\"160\">160</option>\n"
+	"<option value=\"320\">320</option>\n"
+	"<option value=\"640\">640</option>\n"
+	"<option value=\"1280\">1280</option>\n"
+	"<option value=\"2560\">2560</option>\n"
+	"<option value=\"5120\">5120</option>\n"
+	"</select> Feet</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Antenna/Direction</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"direction\" id=\"direction\">\n"
+	"<option>Omni</option><option>NE</option><option>E</option><option>SE</option><option>S</option><option>SW</option><option>W</option><option>NW</option><option>N</option>\n"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr><td align=\"right\"><b>PHG Text</b></td><td align=\"left\"><input name=\"texttouse\" type=\"text\" size=\"6\" style=\"background-color: rgb(97, 239, 170);\" value=\"{{phg}}\"/> <input type=\"button\" value=\"Calculate PHG\" onclick=\"javascript:calculatePHGR()\" /></td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitIGATE'  name=\"commitIGATE\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitIGATE\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />\n"
+	"<form id='formIgateFilter' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[IGATE] Filter</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>RF2INET Filter:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<fieldset id=\"rf2inetFilterGrp\" {{#if rf2inetGrpDisabled}}disabled{{/if}}>\n"
+	"<legend>Filter RF to Internet</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterMessage\" type=\"checkbox\" value=\"OK\" {{#if rf2inetMsg}}checked{{/if}}/>Message</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterStatus\" type=\"checkbox\" value=\"OK\" {{#if rf2inetStatus}}checked{{/if}}/>Status</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterTelemetry\" type=\"checkbox\" value=\"OK\" {{#if rf2inetTlm}}checked{{/if}}/>Telemetry</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterWeather\" type=\"checkbox\" value=\"OK\" {{#if rf2inetWx}}checked{{/if}}/>Weather</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterObject\" type=\"checkbox\" value=\"OK\" {{#if rf2inetObj}}checked{{/if}}/>Object</td>\n"
+	"</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterItem\" type=\"checkbox\" value=\"OK\" {{#if rf2inetItem}}checked{{/if}}/>Item</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterQuery\" type=\"checkbox\" value=\"OK\" {{#if rf2inetQuery}}checked{{/if}}/>Query</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterBuoy\" type=\"checkbox\" value=\"OK\" {{#if rf2inetBuoy}}checked{{/if}}/>Buoy</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterPosition\" type=\"checkbox\" value=\"OK\" {{#if rf2inetPos}}checked{{/if}}/>Position</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterAll\" type=\"checkbox\" value=\"OK\" {{#if rf2inetAll}}checked{{/if}}/>ALL</td>\n"
+	"<td style=\"border:unset;\"></td>"
+	"</tr></table></fieldset>\n"
+	"</td></tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>INET2RF Filter:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<fieldset id=\"inet2rfFilterGrp\" {{#if inet2rfGrpDisabled}}disabled{{/if}}>\n"
+	"<legend>Filter Internet to RF</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterMessage\" type=\"checkbox\" value=\"OK\" {{#if inet2rfMsg}}checked{{/if}}/>Message</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterStatus\" type=\"checkbox\" value=\"OK\" {{#if inet2rfStatus}}checked{{/if}}/>Status</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterTelemetry\" type=\"checkbox\" value=\"OK\" {{#if inet2rfTlm}}checked{{/if}}/>Telemetry</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterWeather\" type=\"checkbox\" value=\"OK\" {{#if inet2rfWx}}checked{{/if}}/>Weather</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterObject\" type=\"checkbox\" value=\"OK\" {{#if inet2rfObj}}checked{{/if}}/>Object</td>\n"
+	"</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterItem\" type=\"checkbox\" value=\"OK\" {{#if inet2rfItem}}checked{{/if}}/>Item</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterQuery\" type=\"checkbox\" value=\"OK\" {{#if inet2rfQuery}}checked{{/if}}/>Query</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterBuoy\" type=\"checkbox\" value=\"OK\" {{#if inet2rfBuoy}}checked{{/if}}/>Buoy</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterPosition\" type=\"checkbox\" value=\"OK\" {{#if inet2rfPos}}checked{{/if}}/>Position</td>\n"
+	"<td style=\"border:unset;\"></td>"
+	"</tr></table></fieldset>\n"
+	"</td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitIGATEfilter'  name=\"commitIGATEfilter\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitIGATEfilter\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />\n"
+	"<div style=\"margin:8px 0;padding:6px;background:#fff3cd;border:1px solid #ffe69c;font-size:9pt;\">Telemetry channels moved to their own page - see the <b>IGTLM</b> tab.</div>\n";
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Telemetry split out of the IGATE page
+// into its own page/tab (RF2INET/INET2RF Filter moved back into IGATE_TEMPLATE
+// per user request - only Telemetry, which has the heavier 5-channel loop,
+// stays isolated here). Same commitIGATETlm POST contract as before.
+static const char *IGATE2_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formIgateTlm\") document.getElementById(\"submitIGATETlm\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/igate2',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n<script type=\"text/javascript\">\n"
+	"function selPrecision(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"precision\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n"
+	"}\n"
+	"function selOffset(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"offset\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formIgateTlm' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[IGATE] Telemetry</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n"
+	"<td align=\"center\"><table>\n"
+	"<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"igateTlmInv\" name=\"igateTlmInv\" type=\"number\" value=\"{{tlmInterval}}\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>"
+	"{{#each tlmChannels}}<tr><td align=\"right\"><b>CH A{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Sensor:</td>\n"
+	"<td style=\"text-align: left;\">CH: "
+	"<select name=\"sensorCH{{idx}}\" id=\"sensorCH{{idx}}\">\n"
+	"{{#each sensorOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param{{idx}}\" type=\"text\" value=\"{{param}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit{{idx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision{{idx}}\" type=\"text\" value=\"{{precision}}\" onchange=\"selPrecision({{idx}})\"/></td></tr>\n"
+	"<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}a\" type=\"number\" value=\"{{eqnsA}}\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}b\" type=\"number\" value=\"{{eqnsB}}\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}c\" type=\"number\" value=\"{{eqnsC}}\" /> (av<sup>2</sup>+bv+c) </td>\n"
+	"<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset{{idx}}\" type=\"text\" value=\"{{offset}}\" onchange=\"selOffset({{idx}})\"/></td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"</table></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitIGATETlm'  name=\"commitIGATETlm\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitIGATETlm\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />";
 
 void handle_igate(AsyncWebServerRequest *request)
 {
@@ -7040,7 +6906,7 @@ void handle_igate(AsyncWebServerRequest *request)
 					String name = request->arg(i);
 					name.trim();
 					name.toUpperCase();
-					strcpy(config.igate_mycall, name.c_str());
+					strcpy(config.aprs_mycall, name.c_str());
 				}
 			}
 			if (request->argName(i) == "igateObject")
@@ -7061,9 +6927,9 @@ void handle_igate(AsyncWebServerRequest *request)
 				if (request->arg(i) != "")
 				{
 					if (isValidNumber(request->arg(i)))
-						config.igate_ssid = request->arg(i).toInt();
-					if (config.igate_ssid > 15)
-						config.igate_ssid = 13;
+						config.aprs_ssid = request->arg(i).toInt();
+					if (config.aprs_ssid > 15)
+						config.aprs_ssid = 13;
 				}
 			}
 			if (request->argName(i) == "igatePosInv")
@@ -7134,7 +7000,7 @@ void handle_igate(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.igate_host, request->arg(i).c_str());
+					strcpy(config.aprs_host, request->arg(i).c_str());
 				}
 			}
 			if (request->argName(i) == "aprsPort")
@@ -7149,7 +7015,7 @@ void handle_igate(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.igate_filter, request->arg(i).c_str());
+					strcpy(config.aprs_filter, request->arg(i).c_str());
 				}
 			}
 			if (request->argName(i) == "igatePath")
@@ -7186,7 +7052,8 @@ void handle_igate(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.igate_phg, request->arg(i).c_str());
+					strncpy(config.igate_phg, request->arg(i).c_str(), sizeof(config.igate_phg) - 1);
+config.igate_phg[sizeof(config.igate_phg) - 1] = 0;
 				}
 			}
 
@@ -7236,62 +7103,6 @@ void handle_igate(AsyncWebServerRequest *request)
 				{
 					if (String(request->arg(i)) == "OK")
 						timeStamp = true;
-				}
-			}
-			if (request->argName(i) == "igateTlmInv")
-			{
-				if (request->arg(i) != "")
-				{
-					if (isValidNumber(request->arg(i)))
-						config.igate_tlm_interval = request->arg(i).toInt();
-				}
-			}
-
-			String arg;
-			for (int x = 0; x < 5; x++)
-			{
-				arg = "sensorCH" + String(x);
-				if (request->argName(i) == arg)
-				{
-					if (isValidNumber(request->arg(i)))
-						config.igate_tlm_sensor[x] = request->arg(i).toInt();
-				}
-				arg = "param" + String(x);
-				if (request->argName(i) == arg)
-				{
-					if (request->arg(i) != "")
-					{
-						strcpy(config.igate_tlm_PARM[x], request->arg(i).c_str());
-					}
-				}
-				arg = "unit" + String(x);
-				if (request->argName(i) == arg)
-				{
-					if (request->arg(i) != "")
-					{
-						strcpy(config.igate_tlm_UNIT[x], request->arg(i).c_str());
-					}
-				}
-				arg = "precision" + String(x);
-				if (request->argName(i) == arg)
-				{
-					if (isValidNumber(request->arg(i)))
-						config.igate_tlm_precision[x] = request->arg(i).toInt();
-				}
-				arg = "offset" + String(x);
-				if (request->argName(i) == arg)
-				{
-					if (isValidNumber(request->arg(i)))
-						config.igate_tlm_offset[x] = request->arg(i).toFloat();
-				}
-				for (int y = 0; y < 3; y++)
-				{
-					arg = "eqns" + String(x) + String((char)(y + 'a'));
-					if (request->argName(i) == arg)
-					{
-						if (isValidNumber(request->arg(i)))
-							config.igate_tlm_EQNS[x][y] = request->arg(i).toFloat();
-					}
 				}
 			}
 		}
@@ -7508,494 +7319,444 @@ void handle_igate(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Allocate initial memory for HTML content
-		char tempHtml[500];						  // Temporary buffer for small HTML snippets
-		char *html = allocateStringMemory(25000); // Start with 8KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		// strcat(html, "document.getElementById(\"submitIGATE\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formIgate\") document.getElementById(\"submitIGATE\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formIgateFilter\") document.getElementById(\"submitIGATEfilter\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/igate',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n<script type=\"text/javascript\">\n");
+		esp_task_wdt_reset(); // feed watchdog: handle_igate runs on the async_tcp task itself,
+		// this is still a large RF page even without Telemetry (moved to handle_igate2) -
+		// can take long enough under heap pressure to trip the TWDT.
+		JsonDocument data;
+		data["enabled"] = config.igate_en;
+		data["myCall"] = config.aprs_mycall;
 
-		strcat(html, "function openWindowSymbol() {\n");
-		strcat(html, "var i, l, options = [{\n");
-		strcat(html, "value: 'first',\n");
-		strcat(html, "text: 'First'\n");
-		strcat(html, "}, {\n");
-		strcat(html, "value: 'second',\n");
-		strcat(html, "text: 'Second'\n");
-		strcat(html, "}],\n");
-		strcat(html, "newWindow = window.open(\"/symbol\", null, \"height=400,width=400,status=no,toolbar=no,menubar=no,location=no\");\n");
-		strcat(html, "}\n");
-
-		strcat(html, "function setValue(symbol,table) {\n");
-		strcat(html, "document.getElementById('igateSymbol').value = String.fromCharCode(symbol);\n");
-		strcat(html, "if(table==1){\n document.getElementById('igateTable').value='/';\n");
-		strcat(html, "}else if(table==2){\n document.getElementById('igateTable').value='\\\\';\n}\n");
-		strcat(html, "document.getElementById('igateImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n");
-		strcat(html, "\n}\n");
-		strcat(html, "function calculatePHGR(){document.forms.formIgate.texttouse.value=\"PHG\"+calcPower(document.forms.formIgate.power.value)+calcHeight(document.forms.formIgate.haat.value)+calcGain(document.forms.formIgate.gain.value)+calcDirection(document.forms.formIgate.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n");
-		strcat(html, "function onRF2INETCheck() {\n");
-		strcat(html, "if (document.querySelector('#rf2inetEnable').checked) {\n");
-		// Checkbox has been checked
-		strcat(html, "document.getElementById(\"rf2inetFilterGrp\").disabled=false;\n");
-		strcat(html, "} else {\n");
-		// Checkbox has been unchecked
-		strcat(html, "document.getElementById(\"rf2inetFilterGrp\").disabled=true;\n");
-		strcat(html, "}\n}\n");
-		strcat(html, "function onINET2RFCheck() {\n");
-		strcat(html, "if (document.querySelector('#inet2rfEnable').checked) {\n");
-		// Checkbox has been checked
-		strcat(html, "document.getElementById(\"inet2rfFilterGrp\").disabled=false;\n");
-		strcat(html, "} else {\n");
-		// Checkbox has been unchecked
-		strcat(html, "document.getElementById(\"inet2rfFilterGrp\").disabled=true;\n");
-		strcat(html, "}\n}\n");
-
-		strcat(html, "function selPrecision(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "x = document.getElementsByName(\"precision\"+idx)[0].value;\n");
-		strcat(html, "document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n");
-		strcat(html, "}\n");
-		strcat(html, "function selOffset(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "x = document.getElementsByName(\"offset\"+idx)[0].value;\n");
-		strcat(html, "document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n");
-		strcat(html, "}\n");
-		strcat(html, "</script>\n");
-		delay(1);
-		/************************ IGATE Mode **************************/
-		strcat(html, "<form id='formIgate' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// strcat(html, "<h2>[IGATE] Internet Gateway Mode</h2>\n");
-		strcat(html, "<table>\n");
-		// strcat(html, "<tr>\n");
-		// strcat(html, "<th width=\"200\"><span><b>Setting</b></span></th>\n");
-		// strcat(html, "<th><span><b>Value</b></span></th>\n");
-		// strcat(html, "</tr>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>[IGATE] Internet Gateway Mode</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-		char igateEnFlag[10] = "";
-		if (config.igate_en)
-			strcpy(igateEnFlag, "checked");
-		else
-			strcpy(igateEnFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", igateEnFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station Callsign:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"%s\" /></td>\n", config.igate_mycall);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station SSID:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mySSID\" id=\"mySSID\">\n");
+		JsonArray ssidOptions = data["ssidOptions"].to<JsonArray>();
 		for (uint8_t ssid = 0; ssid <= 15; ssid++)
 		{
-			if (config.igate_ssid == ssid)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%d</option>\n", ssid, ssid);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%d</option>\n", ssid, ssid);
-			}
-			strcat(html, tempHtml);
+			JsonObject o = ssidOptions.add<JsonObject>();
+			o["value"] = ssid;
+			o["selected"] = (config.aprs_ssid == ssid);
 		}
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station Symbol:</b></td>\n");
-		const char *table = "1";
-		if (config.igate_symbol[0] == 47)
-			table = "1";
-		if (config.igate_symbol[0] == 92)
-			table = "2";
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"igateTable\" name=\"igateTable\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"igateSymbol\" name=\"igateSymbol\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"igateImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-%s.png\"> <i>*Click icon for select symbol</i></td>\n",
-				 config.igate_symbol[0], config.igate_symbol[1], (int)config.igate_symbol[1], table);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Item/Obj Name:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" id=\"igateObject\" name=\"igateObject\" type=\"text\" value=\"%s\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n", config.igate_object);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"igatePath\" id=\"igatePath\">\n");
+
+		auto tableFor = [](char first) -> const char *
+		{
+			if (first == 92)
+				return "2";
+			return "1";
+		};
+		char cbuf[2];
+		cbuf[0] = config.igate_symbol[0];
+		cbuf[1] = 0;
+		data["symTable"] = cbuf;
+		cbuf[0] = config.igate_symbol[1];
+		cbuf[1] = 0;
+		data["symSymbol"] = cbuf;
+		data["symImgNum"] = (int)config.igate_symbol[1];
+		data["symImgTable"] = tableFor(config.igate_symbol[0]);
+
+		data["object"] = config.igate_object;
+
+		JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
 		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
 		{
-			if (config.igate_path == pthIdx)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			strcat(html, tempHtml);
+			JsonObject o = pathOptions.add<JsonObject>();
+			o["value"] = pthIdx;
+			o["label"] = PATH_NAME[pthIdx];
+			o["selected"] = (config.igate_path == pthIdx);
 		}
-		strcat(html, "</select></td>\n");
-		// strcat(html, "<td style=\"text-align: left;\"><input maxlength=\"72\" size=\"72\" id=\"igatePath\" name=\"igatePath\" type=\"text\" value=\"" + String(config.igate_path) + "\" /></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Host:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"20\" size=\"20\" id=\"aprsHost\" name=\"aprsHost\" type=\"text\" value=\"%s\" /> *APRS-IS by T2THAI at <a href=\"http://aprs.nakhonthai.net:14501\" target=\"_t2thai\">aprs.nakhonthai.net:14580</a>,CBAPRS at <a href=\"http://aprs.nakhonthai.net:24501\" target=\"_t2thai\">aprs.nakhonthai.net:24580</a></td>\n", config.igate_host);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Port:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input min=\"1\" max=\"65535\" step=\"1\" id=\"aprsPort\" name=\"aprsPort\" type=\"number\" value=\"%d\" /> *AMPR Host at <a href=\"http://aprs.hs5tqa.ampr.org:14501\" target=\"_t2thai\">aprs.hs5tqa.ampr.org:14580</a></td>\n", config.aprs_port);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Server Filter:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"30\" size=\"30\" id=\"aprsFilter\" name=\"aprsFilter\" type=\"text\" value=\"%s\" /> *Filter: <a target=\"_blank\" href=\"http://www.aprs-is.net/javAPRSFilter.aspx\">http://www.aprs-is.net/javAPRSFilter.aspx</a></td>\n", config.igate_filter);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Text Comment:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"igateComment\" name=\"igateComment\" type=\"text\" value=\"%s\" /></td>\n", config.igate_comment);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Text Status:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"igateStatus\" name=\"igateStatus\" type=\"text\" value=\"%s\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"igateSTSInv\" type=\"number\" value=\"%d\" />Sec.</td>\n", config.igate_status, config.igate_sts_interval);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
 
-		char rf2inetFlag[10];
-		if (config.rf2inet)
-			strcpy(rf2inetFlag, "checked");
-		else
-			strcpy(rf2inetFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td align=\"right\"><b>RF2INET:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"rf2inetEnable\" name=\"rf2inetEnable\" onclick=\"onRF2INETCheck()\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch RF to Internet gateway</i></label></td>\n", rf2inetFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		char inet2rfEnFlag[10];
-		if (config.inet2rf)
-			strcpy(inet2rfEnFlag, "checked");
-		else
-			strcpy(inet2rfEnFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td align=\"right\"><b>INET2RF:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"inet2rfEnable\" name=\"inet2rfEnable\" onclick=\"onINET2RFCheck()\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch Internet to RF gateway</i></label></td>\n", inet2rfEnFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		const char *timeStampFlag = config.igate_timestamp ? "checked" : "";
-		snprintf(tempHtml, sizeof(tempHtml), "<td align=\"right\"><b>Time Stamp:</b></td>\n<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateTimeStamp\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", timeStampFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n<tr>");
+		data["aprsHost"] = config.aprs_host;
+		data["aprsPort"] = config.aprs_port;
+		data["aprsFilter"] = config.aprs_filter;
+		data["comment"] = config.igate_comment;
+		data["status"] = config.igate_status;
+		data["statusInterval"] = config.igate_sts_interval;
+		data["rf2inet"] = config.rf2inet;
+		data["inet2rf"] = config.inet2rf;
+		data["timestamp"] = config.igate_timestamp;
+		data["bcnEn"] = config.igate_bcn;
+		data["posInterval"] = config.igate_interval;
+		data["posFix"] = !config.igate_gps;
+		data["posGPS"] = config.igate_gps;
+		data["pos2RF"] = config.igate_loc2rf;
+		data["pos2INET"] = config.igate_loc2inet;
 
-		strcat(html, "<td align=\"right\"><b>POSITION:</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
-		const char *igateBcnEnFlag = config.igate_bcn ? "checked" : "";
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Beacon:</td><td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"igateBcnEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\">  Interval:<input min=\"0\" max=\"3600\" step=\"1\" id=\"igatePosInv\" name=\"igatePosInv\" type=\"number\" value=\"%d\" />Sec.</label></td></tr>", igateBcnEnFlag, config.igate_interval);
-		strcat(html, tempHtml);
-		const char *igatePosFixFlag = config.igate_gps ? "" : "checked=\"checked\"";
-		const char *igatePosGPSFlag = config.igate_gps ? "checked=\"checked\"" : "";
-		const char *igatePos2RFFlag = config.igate_loc2rf ? "checked" : "";
-		const char *igatePos2INETFlag = config.igate_loc2inet ? "checked" : "";
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.5f", config.igate_lat);
+		data["lat"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.igate_lon);
+		data["lon"] = buf;
+		snprintf(buf, sizeof(buf), "%.2f", config.igate_alt);
+		data["alt"] = buf;
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"igatePosSel\" value=\"0\" %s/>Fix <input type=\"radio\" name=\"igatePosSel\" value=\"1\" %s/>GPS </td></tr>\n", igatePosFixFlag, igatePosGPSFlag);
-		strcat(html, tempHtml);
+		data["phg"] = config.igate_phg;
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"igatePos2RF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"igatePos2INET\" value=\"OK\" %s/>Internet </td></tr>\n", igatePos2RFFlag, igatePos2INETFlag);
-		strcat(html, tempHtml);
+		data["rf2inetGrpDisabled"] = !config.rf2inet;
+		data["rf2inetMsg"] = (config.rf2inetFilter & FILTER_MESSAGE) != 0;
+		data["rf2inetStatus"] = (config.rf2inetFilter & FILTER_STATUS) != 0;
+		data["rf2inetTlm"] = (config.rf2inetFilter & FILTER_TELEMETRY) != 0;
+		data["rf2inetWx"] = (config.rf2inetFilter & FILTER_WX) != 0;
+		data["rf2inetObj"] = (config.rf2inetFilter & FILTER_OBJECT) != 0;
+		data["rf2inetItem"] = (config.rf2inetFilter & FILTER_ITEM) != 0;
+		data["rf2inetQuery"] = (config.rf2inetFilter & FILTER_QUERY) != 0;
+		data["rf2inetBuoy"] = (config.rf2inetFilter & FILTER_BUOY) != 0;
+		data["rf2inetPos"] = (config.rf2inetFilter & FILTER_POSITION) != 0;
+		data["rf2inetAll"] = (config.rf2inetFilter & FILTER_ENABLE_ALL) != 0;
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"igatePosLat\" name=\"igatePosLat\" type=\"number\" value=\"%.5f\" />degrees (positive for North, negative for South)</td></tr>\n", config.igate_lat);
-		strcat(html, tempHtml);
+		data["inet2rfGrpDisabled"] = !config.inet2rf;
+		data["inet2rfMsg"] = (config.inet2rfFilter & FILTER_MESSAGE) != 0;
+		data["inet2rfStatus"] = (config.inet2rfFilter & FILTER_STATUS) != 0;
+		data["inet2rfTlm"] = (config.inet2rfFilter & FILTER_TELEMETRY) != 0;
+		data["inet2rfWx"] = (config.inet2rfFilter & FILTER_WX) != 0;
+		data["inet2rfObj"] = (config.inet2rfFilter & FILTER_OBJECT) != 0;
+		data["inet2rfItem"] = (config.inet2rfFilter & FILTER_ITEM) != 0;
+		data["inet2rfQuery"] = (config.inet2rfFilter & FILTER_QUERY) != 0;
+		data["inet2rfBuoy"] = (config.inet2rfFilter & FILTER_BUOY) != 0;
+		data["inet2rfPos"] = (config.inet2rfFilter & FILTER_POSITION) != 0;
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"igatePosLon\" name=\"igatePosLon\" type=\"number\" value=\"%.5f\" />degrees (positive for East, negative for West)</td></tr>\n", config.igate_lon);
-		strcat(html, tempHtml);
+		// Telemetry (tlmChannels) data moved to handle_igate2() - no longer
+		// needed here, IGATE_TEMPLATE doesn't reference those keys anymore.
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"igatePosAlt\" name=\"igatePosAlt\" type=\"number\" value=\"%.2f\" /> meter. *Value 0 is not send height</td></tr>\n", config.igate_alt);
-		strcat(html, tempHtml);
-
-		strcat(html, "</table></td>");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PHG:</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Radio TX Power</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"power\" id=\"power\">\n");
-		strcat(html, "<option value=\"1\" selected>1</option>\n");
-		strcat(html, "<option value=\"5\">5</option>\n");
-		strcat(html, "<option value=\"10\">10</option>\n");
-		strcat(html, "<option value=\"15\">15</option>\n");
-		strcat(html, "<option value=\"25\">25</option>\n");
-		strcat(html, "<option value=\"35\">35</option>\n");
-		strcat(html, "<option value=\"50\">50</option>\n");
-		strcat(html, "<option value=\"65\">65</option>\n");
-		strcat(html, "<option value=\"80\">80</option>\n");
-		strcat(html, "</select> Watts</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td style=\"text-align: right;\">Antenna Gain</td><td style=\"text-align: left;\"><input size=\"3\" min=\"0\" max=\"100\" step=\"0.1\" id=\"gain\" name=\"gain\" type=\"number\" value=\"6\" /> dBi</td></tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Height</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"haat\" id=\"haat\">\n");
-		int k = 10;
-		for (uint8_t w = 0; w < 10; w++)
-		{
-			char *temp_opt = allocateStringMemory(256);
-			if (temp_opt)
-			{
-				if (w == 0)
-				{
-					snprintf(temp_opt, 256, "<option value=\"%d\" selected>%d</option>\n", k, k);
-				}
-				else
-				{
-					snprintf(temp_opt, 256, "<option value=\"%d\">%d</option>\n", k, k);
-				}
-				strcat(html, temp_opt);
-				free(temp_opt);
-			}
-			k += k;
-		}
-		strcat(html, "</select> Feet</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Antenna/Direction</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"direction\" id=\"direction\">\n");
-		strcat(html, "<option>Omni</option><option>NE</option><option>E</option><option>SE</option><option>S</option><option>SW</option><option>W</option><option>NW</option><option>N</option>\n");
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>PHG Text</b></td><td align=\"left\"><input name=\"texttouse\" type=\"text\" size=\"6\" style=\"background-color: rgb(97, 239, 170);\" value=\"%s\"/> <input type=\"button\" value=\"Calculate PHG\" onclick=\"javascript:calculatePHGR()\" /></td></tr>\n", config.igate_phg);
-		strcat(html, tempHtml);
-		strcat(html, "</table></td>");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n");
-		strcat(html, "<td align=\"center\"><table>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"igateTlmInv\" name=\"igateTlmInv\" type=\"number\" value=\"%d\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>", config.igate_tlm_interval);
-		strcat(html, tempHtml);
-		for (int ax = 0; ax < 5; ax++)
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>CH A%d:</b></td>\n", ax + 1);
-			strcat(html, tempHtml);
-
-			strcat(html, "<td align=\"center\">\n");
-			strcat(html, "<table>");
-
-			strcat(html, "<tr><td style=\"text-align: right;\">Sensor:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">CH: ");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax, ax);
-			strcat(html, tempHtml);
-
-			for (uint8_t idx = 0; idx < 11; idx++)
-			{
-				if (idx == 0)
-				{
-					if (config.igate_tlm_sensor[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>NONE</option>\n", idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">NONE</option>\n", idx);
-					}
-				}
-				else
-				{
-					if (config.igate_tlm_sensor[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>SENSOR#%d</option>\n", idx, idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">SENSOR#%d</option>\n", idx, idx);
-					}
-				}
-				strcat(html, tempHtml);
-			}
-			strcat(html, "</select></td>\n");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.igate_tlm_PARM[ax]);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.igate_tlm_UNIT[ax]);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision%d\" type=\"text\" value=\"%d\" onchange=\"selPrecision(%d)\"/></td></tr>\n", ax, config.igate_tlm_precision[ax], ax);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%da\" type=\"number\" value=\"%.5f\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%db\" type=\"number\" value=\"%.5f\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%dc\" type=\"number\" value=\"%.5f\" /> (av<sup>2</sup>+bv+c) </td>\n",
-					 ax, config.igate_tlm_EQNS[ax][0], ax, config.igate_tlm_EQNS[ax][1], ax, config.igate_tlm_EQNS[ax][2]);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset%d\" type=\"text\" value=\"%.5f\" onchange=\"selOffset(%d)\"/></td></tr>\n", ax, config.igate_tlm_offset[ax], ax);
-			strcat(html, tempHtml);
-
-			strcat(html, "</table></td>");
-			strcat(html, "</tr>\n");
-		}
-		strcat(html, "</table></td></tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitIGATE'  name=\"commitIGATE\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitIGATE\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br /><br />");
-
-		strcat(html, "<form id='formIgateFilter' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>[IGATE] Filter</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>RF2INET Filter:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		if (config.rf2inet)
-			strcat(html, "<fieldset id=\"rf2inetFilterGrp\">\n");
-		else
-			strcat(html, "<fieldset id=\"rf2inetFilterGrp\" disabled>\n");
-		strcat(html, "<legend>Filter RF to Internet</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterMessage\" type=\"checkbox\" value=\"OK\" %s/>Message</td>\n",
-				 (config.rf2inetFilter & FILTER_MESSAGE) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterStatus\" type=\"checkbox\" value=\"OK\" %s/>Status</td>\n",
-				 (config.rf2inetFilter & FILTER_STATUS) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterTelemetry\" type=\"checkbox\" value=\"OK\" %s/>Telemetry</td>\n",
-				 (config.rf2inetFilter & FILTER_TELEMETRY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n",
-				 (config.rf2inetFilter & FILTER_WX) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterObject\" type=\"checkbox\" value=\"OK\" %s/>Object</td>\n",
-				 (config.rf2inetFilter & FILTER_OBJECT) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterItem\" type=\"checkbox\" value=\"OK\" %s/>Item</td>\n",
-				 (config.rf2inetFilter & FILTER_ITEM) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterQuery\" type=\"checkbox\" value=\"OK\" %s/>Query</td>\n",
-				 (config.rf2inetFilter & FILTER_QUERY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterBuoy\" type=\"checkbox\" value=\"OK\" %s/>Buoy</td>\n",
-				 (config.rf2inetFilter & FILTER_BUOY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterPosition\" type=\"checkbox\" value=\"OK\" %s/>Position</td>\n",
-				 (config.rf2inetFilter & FILTER_POSITION) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterAll\" type=\"checkbox\" value=\"OK\" %s/>ALL</td>\n",
-				 (config.rf2inetFilter & FILTER_ENABLE_ALL) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		strcat(html, "<td style=\"border:unset;\"></td>");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>INET2RF Filter:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		if (config.inet2rf)
-			strcat(html, "<fieldset id=\"inet2rfFilterGrp\">\n");
-		else
-			strcat(html, "<fieldset id=\"inet2rfFilterGrp\" disabled>\n");
-		strcat(html, "<legend>Filter Internet to RF</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterMessage\" type=\"checkbox\" value=\"OK\" %s/>Message</td>\n",
-				 (config.inet2rfFilter & FILTER_MESSAGE) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterStatus\" type=\"checkbox\" value=\"OK\" %s/>Status</td>\n",
-				 (config.inet2rfFilter & FILTER_STATUS) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterTelemetry\" type=\"checkbox\" value=\"OK\" %s/>Telemetry</td>\n",
-				 (config.inet2rfFilter & FILTER_TELEMETRY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n",
-				 (config.inet2rfFilter & FILTER_WX) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterObject\" type=\"checkbox\" value=\"OK\" %s/>Object</td>\n",
-				 (config.inet2rfFilter & FILTER_OBJECT) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterItem\" type=\"checkbox\" value=\"OK\" %s/>Item</td>\n",
-				 (config.inet2rfFilter & FILTER_ITEM) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterQuery\" type=\"checkbox\" value=\"OK\" %s/>Query</td>\n",
-				 (config.inet2rfFilter & FILTER_QUERY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterBuoy\" type=\"checkbox\" value=\"OK\" %s/>Buoy</td>\n",
-				 (config.inet2rfFilter & FILTER_BUOY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterPosition\" type=\"checkbox\" value=\"OK\" %s/>Position</td>\n",
-				 (config.inet2rfFilter & FILTER_POSITION) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		strcat(html, "<td style=\"border:unset;\"></td>");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitIGATEfilter'  name=\"commitIGATEfilter\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitIGATEfilter\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
-
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("IGATE", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		// Page content (IGATE form + Filter form; Telemetry form moved to
+		// handle_igate2/IGATE2_TEMPLATE) is smaller than before the original
+		// split, but still sizeable - keep the generous reserve in line with
+		// the other large pages that work reliably at this scale (MOD=55000,
+		// System=48000).
+		log_e("[IGATE] before alloc: freeHeap=%u largestFreeBlock=%u", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+		esp_task_wdt_reset();
+		delay(1);
+		String html_str = renderTemplate(IGATE_TEMPLATE, data.as<JsonVariant>());
+		// Streamed response: avoids a single large calloc() for the whole page.
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		// instead of requiring one big contiguous heap block up front - this was
+		// the reproducible trigger for a heap corruption assert (block_trim_free)
+		// under real traffic, confirmed via heap-integrity diagnostics.
+		sendHtmlChunked(request, html_str, "IGATE");
 	}
 }
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Telemetry split out of handle_igate()
+// into its own page/handler (see IGATE2_TEMPLATE above). RF2INET/INET2RF
+// Filter handling moved back into handle_igate() per user request - only
+// Telemetry stays here. Same commitIGATETlm POST contract as before.
+void handle_igate2(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+
+	if (request->hasArg("commitIGATETlm"))
+	{
+		for (int i = 0; i < request->args(); i++)
+		{
+			if (request->argName(i) == "igateTlmInv")
+			{
+				if (request->arg(i) != "")
+				{
+					if (isValidNumber(request->arg(i)))
+						config.igate_tlm_interval = request->arg(i).toInt();
+				}
+			}
+
+			String arg;
+			for (int x = 0; x < 5; x++)
+			{
+				arg = "sensorCH" + String(x);
+				if (request->argName(i) == arg)
+				{
+					if (isValidNumber(request->arg(i)))
+						config.igate_tlm_sensor[x] = request->arg(i).toInt();
+				}
+				arg = "param" + String(x);
+				if (request->argName(i) == arg)
+				{
+					if (request->arg(i) != "")
+					{
+						strcpy(config.igate_tlm_PARM[x], request->arg(i).c_str());
+					}
+				}
+				arg = "unit" + String(x);
+				if (request->argName(i) == arg)
+				{
+					if (request->arg(i) != "")
+					{
+						strcpy(config.igate_tlm_UNIT[x], request->arg(i).c_str());
+					}
+				}
+				arg = "precision" + String(x);
+				if (request->argName(i) == arg)
+				{
+					if (isValidNumber(request->arg(i)))
+						config.igate_tlm_precision[x] = request->arg(i).toInt();
+				}
+				arg = "offset" + String(x);
+				if (request->argName(i) == arg)
+				{
+					if (isValidNumber(request->arg(i)))
+						config.igate_tlm_offset[x] = request->arg(i).toFloat();
+				}
+				for (int y = 0; y < 3; y++)
+				{
+					arg = "eqns" + String(x) + String((char)(y + 'a'));
+					if (request->argName(i) == arg)
+					{
+						if (isValidNumber(request->arg(i)))
+							config.igate_tlm_EQNS[x][y] = request->arg(i).toFloat();
+					}
+				}
+			}
+		}
+
+		String html;
+		if (saveConfiguration("/default.cfg", config))
+		{
+			html = "Setup completed successfully";
+			request->send(200, "text/html", html); // send to someones browser when asked
+		}
+		else
+		{
+			html = "Save config failed.";
+			request->send(501, "text/html", html); // Not Implemented
+		}
+	}
+	else
+	{
+		esp_task_wdt_reset();
+		JsonDocument data;
+		char buf[32];
+
+		data["tlmInterval"] = config.igate_tlm_interval;
+
+		JsonArray tlmChannels = data["tlmChannels"].to<JsonArray>();
+		for (int ax = 0; ax < 5; ax++)
+		{
+			JsonObject c = tlmChannels.add<JsonObject>();
+			c["idx"] = ax;
+			c["num"] = ax + 1;
+			c["param"] = config.igate_tlm_PARM[ax];
+			c["unit"] = config.igate_tlm_UNIT[ax];
+			c["precision"] = config.igate_tlm_precision[ax];
+			snprintf(buf, sizeof(buf), "%.5f", config.igate_tlm_EQNS[ax][0]);
+			c["eqnsA"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.igate_tlm_EQNS[ax][1]);
+			c["eqnsB"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.igate_tlm_EQNS[ax][2]);
+			c["eqnsC"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.igate_tlm_offset[ax]);
+			c["offset"] = buf;
+
+			JsonArray sensorOptions = c["sensorOptions"].to<JsonArray>();
+			for (uint8_t idx = 0; idx < 11; idx++)
+			{
+				JsonObject o = sensorOptions.add<JsonObject>();
+				o["value"] = idx;
+				o["label"] = (idx == 0) ? String("NONE") : ("SENSOR#" + String(idx));
+				o["selected"] = (config.igate_tlm_sensor[ax] == idx);
+			}
+		}
+
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(IGATE2_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "IGATETlm");
+	}
+}
+
+static const char *DIGI_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitDIGI\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/digi',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n<script type=\"text/javascript\">\n"
+	"function openWindowSymbol() {\n"
+	"var i, l, options = [{\n"
+	"value: 'first',\n"
+	"text: 'First'\n"
+	"}, {\n"
+	"value: 'second',\n"
+	"text: 'Second'\n"
+	"}],\n"
+	"newWindow = window.open(\"/symbol\", null, \"height=400,width=400,status=no,toolbar=no,menubar=no,titlebar=no,location=no\");\n"
+	"}\n"
+	"function setValue(symbol,table) {\n"
+	"document.getElementById('digiSymbol').value = String.fromCharCode(symbol);\n"
+	"if(table==1){\n document.getElementById('digiTable').value='/';\n"
+	"}else if(table==2){\n document.getElementById('digiTable').value='\\\\';\n}\n"
+	"document.getElementById('digiImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"\n}\n"
+	"function calculatePHGR(){document.forms.formDIGI.texttouse.value=\"PHG\"+calcPower(document.forms.formDIGI.power.value)+calcHeight(document.forms.formDIGI.haat.value)+calcGain(document.forms.formDIGI.gain.value)+calcDirection(document.forms.formDIGI.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n"
+	"function selPrecision(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"precision\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n"
+	"}\n"
+	"function selOffset(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"offset\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formDIGI' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[DIGI] Digital Repeater Mode</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiEnable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Auto Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiAuto\" value=\"OK\" {{#if digiAuto}}checked{{/if}}><span class=\"slider round\"></span></label> <i>*Automatic enable when APRS-IS disconnected</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"{{myCall}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station SSID:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"mySSID\" id=\"mySSID\">\n"
+	"{{#each ssidOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{value}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Symbol:</b></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"digiTable\" name=\"digiTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"digiSymbol\" name=\"digiSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"digiImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"digiPath\" id=\"digiPath\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Comment:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"digiComment\" name=\"digiComment\" type=\"text\" value=\"{{comment}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Status:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"digiStatus\" name=\"digiStatus\" type=\"text\" value=\"{{status}}\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"digiSTSInv\" type=\"number\" value=\"{{statusInterval}}\" />Sec.</td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\"><b>Repeat Delay:</b></td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"100\" id=\"digiDelay\" name=\"digiDelay\" type=\"number\" value=\"{{delay}}\" /> mSec. <i>*0 is auto,Other random of delay time</i></td></tr>"
+	"<tr>\n"
+	"<td align=\"right\"><b>Time Stamp:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiTimeStamp\" value=\"OK\" {{#if timestamp}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr><td align=\"right\"><b>POSITION:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Beacon:</td><td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiBcnEnable\" value=\"OK\" {{#if bcnEn}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\">  Interval:<input min=\"0\" max=\"3600\" step=\"1\" id=\"digiPosInv\" name=\"digiPosInv\" type=\"number\" value=\"{{posInterval}}\" />Sec.</label></td></tr>"
+	"<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"digiPosSel\" value=\"0\" {{#if posFix}}checked=\"checked\"{{/if}}/>Fix <input type=\"radio\" name=\"digiPosSel\" value=\"1\" {{#if posGPS}}checked=\"checked\"{{/if}}/>GPS </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"digiPos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"digiPos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"digiPosLat\" name=\"digiPosLat\" type=\"number\" value=\"{{lat}}\" />degrees (positive for North, negative for South)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"digiPosLon\" name=\"digiPosLon\" type=\"number\" value=\"{{lon}}\" />degrees (positive for East, negative for West)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"digiPosAlt\" name=\"digiPosAlt\" type=\"number\" value=\"{{alt}}\" /> meter. *Value 0 is not send height</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PHG:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr>\n"
+	"<td align=\"right\">Radio TX Power</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"power\" id=\"power\">\n"
+	"<option value=\"1\" selected>1</option>\n"
+	"<option value=\"5\">5</option>\n"
+	"<option value=\"10\">10</option>\n"
+	"<option value=\"15\">15</option>\n"
+	"<option value=\"25\">25</option>\n"
+	"<option value=\"35\">35</option>\n"
+	"<option value=\"50\">50</option>\n"
+	"<option value=\"65\">65</option>\n"
+	"<option value=\"80\">80</option>\n"
+	"</select> Watts</td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">Antenna Gain</td><td style=\"text-align: left;\"><input size=\"3\" min=\"0\" max=\"100\" step=\"0.1\" id=\"gain\" name=\"gain\" type=\"number\" value=\"6\" /> dBi</td></tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Height</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"haat\" id=\"haat\">\n"
+	"<option value=\"10\" selected>10</option>\n"
+	"<option value=\"20\">20</option>\n"
+	"<option value=\"40\">40</option>\n"
+	"<option value=\"80\">80</option>\n"
+	"<option value=\"160\">160</option>\n"
+	"<option value=\"320\">320</option>\n"
+	"<option value=\"640\">640</option>\n"
+	"<option value=\"1280\">1280</option>\n"
+	"<option value=\"2560\">2560</option>\n"
+	"<option value=\"5120\">5120</option>\n"
+	"</select> Feet</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Antenna/Direction</td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"direction\" id=\"direction\">\n"
+	"<option>Omni</option><option>NE</option><option>E</option><option>SE</option><option>S</option><option>SW</option><option>W</option><option>NW</option><option>N</option>\n"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr><td align=\"right\"><b>PHG Text</b></td><td align=\"left\"><input name=\"texttouse\" type=\"text\" size=\"6\" style=\"background-color: rgb(97, 239, 170);\" value=\"{{phg}}\"/> <input type=\"button\" value=\"Calculate PHG\" onclick=\"javascript:calculatePHGR()\" /></td></tr>\n"
+	"</table></td>"
+	"<tr>\n"
+	"<td align=\"right\"><b>Filter:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<fieldset id=\"FilterGrp\">\n"
+	"<legend>Filter repeater</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterMessage\" type=\"checkbox\" value=\"OK\" {{#if filterMessage}}checked{{/if}}/>Message</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterStatus\" type=\"checkbox\" value=\"OK\" {{#if filterStatus}}checked{{/if}}/>Status</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterTelemetry\" type=\"checkbox\" value=\"OK\" {{#if filterTelemetry}}checked{{/if}}/>Telemetry</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterWeather\" type=\"checkbox\" value=\"OK\" {{#if filterWeather}}checked{{/if}}/>Weather</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterObject\" type=\"checkbox\" value=\"OK\" {{#if filterObject}}checked{{/if}}/>Object</td>\n"
+	"</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterItem\" type=\"checkbox\" value=\"OK\" {{#if filterItem}}checked{{/if}}/>Item</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterQuery\" type=\"checkbox\" value=\"OK\" {{#if filterQuery}}checked{{/if}}/>Query</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterBuoy\" type=\"checkbox\" value=\"OK\" {{#if filterBuoy}}checked{{/if}}/>Buoy</td>\n"
+	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterPosition\" type=\"checkbox\" value=\"OK\" {{#if filterPosition}}checked{{/if}}/>Position</td>\n"
+	"<td style=\"border:unset;\"></td>"
+	"</tr></table></fieldset>\n"
+	"</td></tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n"
+	"<td align=\"center\"><table>\n"
+	"<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"digiTlmInv\" name=\"digiTlmInv\" type=\"number\" value=\"{{tlmInterval}}\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>"
+	"{{#each tlmChannels}}<tr><td align=\"right\"><b>CH A{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Sensor:</td>\n"
+	"<td style=\"text-align: left;\">CH: "
+	"<select name=\"sensorCH{{idx}}\" id=\"sensorCH{{idx}}\">\n"
+	"{{#each sensorOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param{{idx}}\" type=\"text\" value=\"{{param}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit{{idx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision{{idx}}\" type=\"text\" value=\"{{precision}}\" onchange=\"selPrecision({{idx}})\"/></td></tr>\n"
+	"<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}a\" type=\"number\" value=\"{{eqnsA}}\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}b\" type=\"number\" value=\"{{eqnsB}}\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}c\" type=\"number\" value=\"{{eqnsC}}\" /> (av<sup>2</sup>+bv+c) </td>\n"
+	"<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset{{idx}}\" type=\"text\" value=\"{{offset}}\" onchange=\"selOffset({{idx}})\" /></td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"</table></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitDIGI'  name=\"commitDIGI\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitDIGI\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />";
 
 void handle_digi(AsyncWebServerRequest *request)
 {
@@ -8149,7 +7910,8 @@ void handle_digi(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.digi_phg, request->arg(i).c_str());
+					strncpy(config.digi_phg, request->arg(i).c_str(), sizeof(config.digi_phg) - 1);
+config.digi_phg[sizeof(config.digi_phg) - 1] = 0;
 				}
 			}
 			if (request->argName(i) == "digiStatus")
@@ -8381,397 +8143,242 @@ void handle_digi(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Allocate initial memory for HTML content
-		char *html = allocateStringMemory(20000); // Start with 12KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		char tempHtml[512];
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "document.getElementById(\"submitDIGI\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/digi',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n<script type=\"text/javascript\">\n");
-		strcat(html, "function openWindowSymbol() {\n");
-		strcat(html, "var i, l, options = [{\n");
-		strcat(html, "value: 'first',\n");
-		strcat(html, "text: 'First'\n");
-		strcat(html, "}, {\n");
-		strcat(html, "value: 'second',\n");
-		strcat(html, "text: 'Second'\n");
-		strcat(html, "}],\n");
-		strcat(html, "newWindow = window.open(\"/symbol\", null, \"height=400,width=400,status=no,toolbar=no,menubar=no,titlebar=no,location=no\");\n");
-		strcat(html, "}\n");
+		esp_task_wdt_reset(); // feed watchdog: handle_digi runs on the async_tcp task itself,
+		// same class of page as MSG/IGATE (5 TLM channels, 9-flag filter fieldset).
+		JsonDocument data;
+		data["enabled"] = config.digi_en;
+		data["digiAuto"] = config.digi_auto;
+		data["myCall"] = config.digi_mycall;
 
-		strcat(html, "function setValue(symbol,table) {\n");
-		strcat(html, "document.getElementById('digiSymbol').value = String.fromCharCode(symbol);\n");
-		strcat(html, "if(table==1){\n document.getElementById('digiTable').value='/';\n");
-		strcat(html, "}else if(table==2){\n document.getElementById('digiTable').value='\\\\';\n}\n");
-		strcat(html, "document.getElementById('digiImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n");
-		strcat(html, "\n}\n");
-		strcat(html, "function calculatePHGR(){document.forms.formDIGI.texttouse.value=\"PHG\"+calcPower(document.forms.formDIGI.power.value)+calcHeight(document.forms.formDIGI.haat.value)+calcGain(document.forms.formDIGI.gain.value)+calcDirection(document.forms.formDIGI.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n");
-		strcat(html, "function selPrecision(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "x = document.getElementsByName(\"precision\"+idx)[0].value;\n");
-		strcat(html, "document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n");
-		strcat(html, "}\n");
-		strcat(html, "function selOffset(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "x = document.getElementsByName(\"offset\"+idx)[0].value;\n");
-		strcat(html, "document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n");
-		strcat(html, "}\n");
-		strcat(html, "</script>\n");
-
-		/************************ DIGI Mode **************************/
-		strcat(html, "<form id='formDIGI' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// strcat(html, "<h2>[DIGI] Digital Repeater Mode</h2>\n");
-		strcat(html, "<table>\n");
-		// strcat(html, "<tr>\n");
-		// strcat(html, "<th width=\"200\"><span><b>Setting</b></span></th>\n");
-		// strcat(html, "<th><span><b>Value</b></span></th>\n");
-		// strcat(html, "</tr>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>[DIGI] Digital Repeater Mode</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-		char digiFlag[10] = "";
-		if (config.digi_en)
-			strcpy(digiFlag, "checked");
-		else
-			strcpy(digiFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", digiFlag);
-		strcat(html, tempHtml);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Auto Enable:</b></td>\n");
-
-		if (config.digi_auto)
-			strcpy(digiFlag, "checked");
-		else
-			strcpy(digiFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiAuto\" value=\"OK\" %s><span class=\"slider round\"></span></label> <i>*Automatic enable when APRS-IS disconnected</i></td>\n", digiFlag);
-		strcat(html, tempHtml);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station Callsign:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"%s\" /></td>\n", config.digi_mycall);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station SSID:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mySSID\" id=\"mySSID\">\n");
+		JsonArray ssidOptions = data["ssidOptions"].to<JsonArray>();
 		for (uint8_t ssid = 0; ssid <= 15; ssid++)
 		{
-			if (config.digi_ssid == ssid)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%d</option>\n", ssid, ssid);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%d</option>\n", ssid, ssid);
-			}
-			strcat(html, tempHtml);
+			JsonObject o = ssidOptions.add<JsonObject>();
+			o["value"] = ssid;
+			o["selected"] = (config.digi_ssid == ssid);
 		}
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station Symbol:</b></td>\n");
-		char table[3] = "1";
-		if (config.digi_symbol[0] == 47)
-			strcpy(table, "1");
-		if (config.digi_symbol[0] == 92)
-			strcpy(table, "2");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"digiTable\" name=\"digiTable\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"digiSymbol\" name=\"digiSymbol\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"digiImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-%s.png\"> <i>*Click icon for select symbol</i></td>\n",
-				 config.digi_symbol[0], config.digi_symbol[1], (int)config.digi_symbol[1], table);
-		strcat(html, tempHtml);
 
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"digiPath\" id=\"digiPath\">\n");
+		auto tableFor = [](char first) -> const char *
+		{
+			if (first == 92)
+				return "2";
+			return "1";
+		};
+		char cbuf[2];
+		cbuf[0] = config.digi_symbol[0];
+		cbuf[1] = 0;
+		data["symTable"] = cbuf;
+		cbuf[0] = config.digi_symbol[1];
+		cbuf[1] = 0;
+		data["symSymbol"] = cbuf;
+		data["symImgNum"] = (int)config.digi_symbol[1];
+		data["symImgTable"] = tableFor(config.digi_symbol[0]);
+
+		JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
 		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
 		{
-			if (config.digi_path == pthIdx)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			strcat(html, tempHtml);
+			JsonObject o = pathOptions.add<JsonObject>();
+			o["value"] = pthIdx;
+			o["label"] = PATH_NAME[pthIdx];
+			o["selected"] = (config.digi_path == pthIdx);
 		}
-		strcat(html, "</select></td>\n");
-		// strcat(html, "<td style=\"text-align: left;\"><input maxlength=\"72\" size=\"72\" id=\"digiPath\" name=\"digiPath\" type=\"text\" value=\"" + String(config.digi_path) + "\" /></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Text Comment:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"digiComment\" name=\"digiComment\" type=\"text\" value=\"%s\" /></td>\n", config.digi_comment);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Text Status:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"digiStatus\" name=\"digiStatus\" type=\"text\" value=\"%s\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"digiSTSInv\" type=\"number\" value=\"%d\" />Sec.</td>\n", config.digi_status, config.digi_sts_interval);
-		strcat(html, tempHtml);
 
-		strcat(html, "</tr>\n");
+		data["comment"] = config.digi_comment;
+		data["status"] = config.digi_status;
+		data["statusInterval"] = config.digi_sts_interval;
+		data["delay"] = config.digi_delay;
+		data["timestamp"] = config.digi_timestamp;
+		data["bcnEn"] = config.digi_bcn;
+		data["posInterval"] = config.digi_interval;
+		data["posFix"] = !config.digi_gps;
+		data["posGPS"] = config.digi_gps;
+		data["pos2RF"] = config.digi_loc2rf;
+		data["pos2INET"] = config.digi_loc2inet;
 
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\"><b>Repeat Delay:</b></td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"100\" id=\"digiDelay\" name=\"digiDelay\" type=\"number\" value=\"%d\" /> mSec. <i>*0 is auto,Other random of delay time</i></td></tr>", config.digi_delay);
-		strcat(html, tempHtml);
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.5f", config.digi_lat);
+		data["lat"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.digi_lon);
+		data["lon"] = buf;
+		snprintf(buf, sizeof(buf), "%.2f", config.digi_alt);
+		data["alt"] = buf;
 
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Time Stamp:</b></td>\n");
-		char timeStampFlag[10];
-		if (config.digi_timestamp)
-			strcpy(timeStampFlag, "checked");
-		else
-			strcpy(timeStampFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiTimeStamp\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", timeStampFlag);
-		strcat(html, tempHtml);
+		data["phg"] = config.digi_phg;
 
-		strcat(html, "</tr>\n");
+		data["filterMessage"] = (config.digiFilter & FILTER_MESSAGE) != 0;
+		data["filterStatus"] = (config.digiFilter & FILTER_STATUS) != 0;
+		data["filterTelemetry"] = (config.digiFilter & FILTER_TELEMETRY) != 0;
+		data["filterWeather"] = (config.digiFilter & FILTER_WX) != 0;
+		data["filterObject"] = (config.digiFilter & FILTER_OBJECT) != 0;
+		data["filterItem"] = (config.digiFilter & FILTER_ITEM) != 0;
+		data["filterQuery"] = (config.digiFilter & FILTER_QUERY) != 0;
+		data["filterBuoy"] = (config.digiFilter & FILTER_BUOY) != 0;
+		data["filterPosition"] = (config.digiFilter & FILTER_POSITION) != 0;
 
-		strcat(html, "<tr><td align=\"right\"><b>POSITION:</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
+		data["tlmInterval"] = config.digi_tlm_interval;
 
-		if (config.digi_bcn)
-			strcpy(digiFlag, "checked");
-		else
-			strcpy(digiFlag, "");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Beacon:</td><td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"digiBcnEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\">  Interval:<input min=\"0\" max=\"3600\" step=\"1\" id=\"digiPosInv\" name=\"digiPosInv\" type=\"number\" value=\"%d\" />Sec.</label></td></tr>", digiFlag, config.digi_interval);
-		strcat(html, tempHtml);
-
-		String digiPosFixFlag = "";
-		String digiPosGPSFlag = "";
-		String digiPos2RFFlag = "";
-		String digiPos2INETFlag = "";
-		if (config.digi_gps)
-			digiPosGPSFlag = "checked=\"checked\"";
-		else
-			digiPosFixFlag = "checked=\"checked\"";
-
-		if (config.digi_loc2rf)
-			digiPos2RFFlag = "checked";
-		if (config.digi_loc2inet)
-			digiPos2INETFlag = "checked";
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"digiPosSel\" value=\"0\" %s/>Fix <input type=\"radio\" name=\"digiPosSel\" value=\"1\" %s/>GPS </td></tr>\n",
-				 digiPosFixFlag.c_str(), digiPosGPSFlag.c_str());
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"digiPos2RF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"digiPos2INET\" value=\"OK\" %s/>Internet </td></tr>\n",
-				 digiPos2RFFlag.c_str(), digiPos2INETFlag.c_str());
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"digiPosLat\" name=\"digiPosLat\" type=\"number\" value=\"%.5f\" />degrees (positive for North, negative for South)</td></tr>\n", config.digi_lat);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"digiPosLon\" name=\"digiPosLon\" type=\"number\" value=\"%.5f\" />degrees (positive for East, negative for West)</td></tr>\n", config.digi_lon);
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"digiPosAlt\" name=\"digiPosAlt\" type=\"number\" value=\"%.2f\" /> meter. *Value 0 is not send height</td></tr>\n", config.digi_alt);
-		strcat(html, tempHtml);
-		strcat(html, "</table></td>");
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PHG:</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Radio TX Power</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"power\" id=\"power\">\n");
-		strcat(html, "<option value=\"1\" selected>1</option>\n");
-		strcat(html, "<option value=\"5\">5</option>\n");
-		strcat(html, "<option value=\"10\">10</option>\n");
-		strcat(html, "<option value=\"15\">15</option>\n");
-		strcat(html, "<option value=\"25\">25</option>\n");
-		strcat(html, "<option value=\"35\">35</option>\n");
-		strcat(html, "<option value=\"50\">50</option>\n");
-		strcat(html, "<option value=\"65\">65</option>\n");
-		strcat(html, "<option value=\"80\">80</option>\n");
-		strcat(html, "</select> Watts</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td style=\"text-align: right;\">Antenna Gain</td><td style=\"text-align: left;\"><input size=\"3\" min=\"0\" max=\"100\" step=\"0.1\" id=\"gain\" name=\"gain\" type=\"number\" value=\"6\" /> dBi</td></tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Height</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"haat\" id=\"haat\">\n");
-		int k = 10;
-		for (uint8_t w = 0; w < 10; w++)
-		{
-			if (w == 0)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%d</option>\n", k, k);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%d</option>\n", k, k);
-			}
-			strcat(html, tempHtml);
-			k += k;
-		}
-		strcat(html, "</select> Feet</td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\">Antenna/Direction</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"direction\" id=\"direction\">\n");
-		strcat(html, "<option>Omni</option><option>NE</option><option>E</option><option>SE</option><option>S</option><option>SW</option><option>W</option><option>NW</option><option>N</option>\n");
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>PHG Text</b></td><td align=\"left\"><input name=\"texttouse\" type=\"text\" size=\"6\" style=\"background-color: rgb(97, 239, 170);\" value=\"%s\"/> <input type=\"button\" value=\"Calculate PHG\" onclick=\"javascript:calculatePHGR()\" /></td></tr>\n", config.digi_phg);
-		strcat(html, tempHtml);
-
-		strcat(html, "</table></tr>");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Filter:</b></td>\n");
-
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<fieldset id=\"FilterGrp\">\n");
-		strcat(html, "<legend>Filter repeater</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">");
-		strcat(html, "<tr style=\"background:unset;\">");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterMessage\" type=\"checkbox\" value=\"OK\" %s/>Message</td>\n",
-				 (config.digiFilter & FILTER_MESSAGE) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterStatus\" type=\"checkbox\" value=\"OK\" %s/>Status</td>\n",
-				 (config.digiFilter & FILTER_STATUS) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterTelemetry\" type=\"checkbox\" value=\"OK\" %s/>Telemetry</td>\n",
-				 (config.digiFilter & FILTER_TELEMETRY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterWeather\" type=\"checkbox\" value=\"OK\" %s/>Weather</td>\n",
-				 (config.digiFilter & FILTER_WX) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterObject\" type=\"checkbox\" value=\"OK\" %s/>Object</td>\n",
-				 (config.digiFilter & FILTER_OBJECT) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "</tr><tr style=\"background:unset;\"><td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterItem\" type=\"checkbox\" value=\"OK\" %s/>Item</td>\n",
-				 (config.digiFilter & FILTER_ITEM) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterQuery\" type=\"checkbox\" value=\"OK\" %s/>Query</td>\n",
-				 (config.digiFilter & FILTER_QUERY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterBuoy\" type=\"checkbox\" value=\"OK\" %s/>Buoy</td>\n",
-				 (config.digiFilter & FILTER_BUOY) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"FilterPosition\" type=\"checkbox\" value=\"OK\" %s/>Position</td>\n",
-				 (config.digiFilter & FILTER_POSITION) ? "checked" : "");
-		strcat(html, tempHtml);
-
-		strcat(html, "<td style=\"border:unset;\"></td>");
-		strcat(html, "</tr></table></fieldset>\n");
-		strcat(html, "</td></tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n");
-		strcat(html, "<td align=\"center\"><table>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"digiTlmInv\" name=\"digiTlmInv\" type=\"number\" value=\"%d\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>", config.digi_tlm_interval);
-		strcat(html, tempHtml);
+		JsonArray tlmChannels = data["tlmChannels"].to<JsonArray>();
 		for (int ax = 0; ax < 5; ax++)
 		{
-			snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>CH A%d:</b></td>\n", ax + 1);
-			strcat(html, tempHtml);
-			strcat(html, "<td align=\"center\">\n");
-			strcat(html, "<table>");
+			JsonObject c = tlmChannels.add<JsonObject>();
+			c["idx"] = ax;
+			c["num"] = ax + 1;
+			c["param"] = config.digi_tlm_PARM[ax];
+			c["unit"] = config.digi_tlm_UNIT[ax];
+			c["precision"] = config.digi_tlm_precision[ax];
+			snprintf(buf, sizeof(buf), "%.5f", config.digi_tlm_EQNS[ax][0]);
+			c["eqnsA"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.digi_tlm_EQNS[ax][1]);
+			c["eqnsB"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.digi_tlm_EQNS[ax][2]);
+			c["eqnsC"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.digi_tlm_offset[ax]);
+			c["offset"] = buf;
 
-			strcat(html, "<tr><td style=\"text-align: right;\">Sensor:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">CH: ");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax, ax);
-			strcat(html, tempHtml);
-
+			JsonArray sensorOptions = c["sensorOptions"].to<JsonArray>();
 			for (uint8_t idx = 0; idx < 11; idx++)
 			{
-				if (idx == 0)
-				{
-					if (config.digi_tlm_sensor[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>NONE</option>\n", idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">NONE</option>\n", idx);
-					}
-				}
-				else
-				{
-					if (config.digi_tlm_sensor[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>SENSOR#%d</option>\n", idx, idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">SENSOR#%d</option>\n", idx, idx);
-					}
-				}
-				strcat(html, tempHtml);
+				JsonObject o = sensorOptions.add<JsonObject>();
+				o["value"] = idx;
+				o["label"] = (idx == 0) ? String("NONE") : ("SENSOR#" + String(idx));
+				o["selected"] = (config.digi_tlm_sensor[ax] == idx);
 			}
-			strcat(html, "</select></td>\n");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.digi_tlm_PARM[ax]);
-			strcat(html, tempHtml);
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.digi_tlm_UNIT[ax]);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision%d\" type=\"text\" value=\"%d\" onchange=\"selPrecision(%d)\"/></td></tr>\n", ax, config.digi_tlm_precision[ax], ax);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%da\" type=\"number\" value=\"%.5f\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%db\" type=\"number\" value=\"%.5f\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%dc\" type=\"number\" value=\"%.5f\" /> (av<sup>2</sup>+bv+c) </td>\n",
-					 ax, config.digi_tlm_EQNS[ax][0], ax, config.digi_tlm_EQNS[ax][1], ax, config.digi_tlm_EQNS[ax][2]);
-			strcat(html, tempHtml);
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset%d\" type=\"text\" value=\"%.5f\" onchange=\"selOffset(%d)\" /></td></tr>\n", ax, config.digi_tlm_offset[ax], ax);
-			strcat(html, tempHtml);
-
-			strcat(html, "</table></td>");
-			strcat(html, "</tr>\n");
 		}
-		strcat(html, "</table></td></tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitDIGI'  name=\"commitDIGI\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitDIGI\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("digi", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(DIGI_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "digi");
 	}
 }
+
+static const char *WX_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitWX\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/wx',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<form id='formWX' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[WX] Weather Station</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"{{myCall}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station SSID:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"mySSID\" id=\"mySSID\">\n"
+	"{{#each ssidOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{value}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Object Name:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" name=\"Object\" type=\"text\" value=\"{{object}}\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"Path\" id=\"Path\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Comment:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"50\" name=\"Comment\" type=\"text\" value=\"{{comment}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Time Stamp:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wxTimeStamp\" value=\"OK\" {{#if timestamp}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr><td align=\"right\"><b>POSITION:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" id=\"PosInv\" name=\"PosInv\" type=\"number\" value=\"{{posInterval}}\" />Sec.</td></tr>"
+	"<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"PosSel\" value=\"0\" {{#if posFix}}checked=\"checked\"{{/if}}/>Fix <input type=\"radio\" name=\"PosSel\" value=\"1\" {{#if posGPS}}checked=\"checked\"{{/if}}/>GPS </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"Pos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"Pos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" name=\"PosLat\" type=\"number\" value=\"{{lat}}\" />degrees (positive for North, negative for South)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" name=\"PosLon\" type=\"number\" value=\"{{lon}}\" />degrees (positive for East, negative for West)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" name=\"PosAlt\" type=\"number\" value=\"{{alt}}\" /> meter. *The altitude in meters(m) above sea level</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitWX'  name=\"commitWX\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitWX\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />\n"
+	"<div style=\"margin:8px 0;padding:6px;background:#fff3cd;border:1px solid #ffe69c;font-size:9pt;\">Sensor channel mapping (26 channels) moved to its own page - see the <b>WXCH</b> tab.</div>\n";
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Sensor channel mapping (26 channels)
+// split out of the WX page into its own page/tab. Same senEn{idx}/sensorCH{idx}/
+// avgSel{idx} POST contract as before, just no longer competing with the rest
+// of the WX page for space/heap (this was the worst offender of the three
+// split pages - WX_SENSOR_NUM=26 rows, each with an 11-option nested select).
+static const char *WX2_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitWXch\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/wx2',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<form id='formWXch' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[WX] Sensor Channel Mapping</b></span></th>\n"
+	"<tr><td align=\"right\"><b>SENSOR:<br />Selection</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"{{#each sensors}}<tr><td align=\"right\"><b>{{name}}:</b> \n"
+	"<label class=\"switch\"><input type=\"checkbox\" name=\"senEn{{idx}}\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label>"
+	"</td>\n"
+	"<td style=\"text-align: left;\">Sensor Channel: "
+	"<select name=\"sensorCH{{idx}}\" id=\"sensorCH{{idx}}\">\n"
+	"{{#each chOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select>\n"
+	"<input type=\"radio\" name=\"avgSel{{idx}}\" value=\"0\" {{#if avg}}{{else}}checked=\"checked\"{{/if}}/>Sample <input type=\"radio\" name=\"avgSel{{idx}}\" value=\"1\" {{#if avg}}checked=\"checked\"{{/if}}/>Average"
+	"</td></tr>"
+	"{{/each}}"
+	"</table></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitWXch'  name=\"commitWXch\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitWXch\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />";
 
 void handle_wx(AsyncWebServerRequest *request)
 {
@@ -8786,13 +8393,9 @@ void handle_wx(AsyncWebServerRequest *request)
 	bool pos2RF = false;
 	bool pos2INET = false;
 	bool timeStamp = false;
-	String arg = "";
 
 	if (request->hasArg("commitWX"))
 	{
-		for (int x = 0; x < WX_SENSOR_NUM; x++)
-			config.wx_sensor_enable[x] = false;
-
 		for (int i = 0; i < request->args(); i++)
 		{
 			if (request->argName(i) == "Enable")
@@ -8929,12 +8532,100 @@ void handle_wx(AsyncWebServerRequest *request)
 						timeStamp = true;
 				}
 			}
+		}
+		config.wx_en = En;
+		config.wx_gps = posGPS;
+		config.wx_2rf = pos2RF;
+		config.wx_2inet = pos2INET;
+		config.wx_timestamp = timeStamp;
+
+		initInterval = true;
+		String html_msg;
+		if (saveConfiguration("/default.cfg", config))
+		{
+			html_msg = "Setup completed successfully";
+			request->send(200, "text/html", html_msg); // send to someones browser when asked
+		}
+		else
+		{
+			html_msg = "Save config failed.";
+			request->send(501, "text/html", html_msg); // Not Implemented
+		}
+	}
+	else
+	{
+		esp_task_wdt_reset(); // feed watchdog: handle_wx runs on the async_tcp task itself,
+		// same class of page as MSG/IGATE/DIGI (per-sensor channel selects, WX_SENSOR_NUM rows).
+		JsonDocument data;
+		data["enabled"] = config.wx_en;
+		data["myCall"] = config.wx_mycall;
+
+		JsonArray ssidOptions = data["ssidOptions"].to<JsonArray>();
+		for (uint8_t ssid = 0; ssid <= 15; ssid++)
+		{
+			JsonObject o = ssidOptions.add<JsonObject>();
+			o["value"] = ssid;
+			o["selected"] = (config.wx_ssid == ssid);
+		}
+
+		data["object"] = config.wx_object;
+
+		JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
+		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
+		{
+			JsonObject o = pathOptions.add<JsonObject>();
+			o["value"] = pthIdx;
+			o["label"] = PATH_NAME[pthIdx];
+			o["selected"] = (config.wx_path == pthIdx);
+		}
+
+		data["comment"] = config.wx_comment;
+		data["timestamp"] = config.wx_timestamp;
+		data["posInterval"] = config.wx_interval;
+		data["posFix"] = !config.wx_gps;
+		data["posGPS"] = config.wx_gps;
+		data["pos2RF"] = config.wx_2rf;
+		data["pos2INET"] = config.wx_2inet;
+
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%.5f", config.wx_lat);
+		data["lat"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.wx_lon);
+		data["lon"] = buf;
+		snprintf(buf, sizeof(buf), "%.2f", config.wx_alt);
+		data["alt"] = buf;
+
+		log_e("[WX] before alloc: freeHeap=%u largestFreeBlock=%u", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(WX_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "Weather");
+	}
+}
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Sensor channel mapping (26 channels)
+// split out of handle_wx() into their own page/handler (see WX2_TEMPLATE
+// above). Same senEn{idx}/sensorCH{idx}/avgSel{idx} POST contract as before.
+void handle_wx2(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+
+	if (request->hasArg("commitWXch"))
+	{
+		for (int x = 0; x < WX_SENSOR_NUM; x++)
+			config.wx_sensor_enable[x] = false;
+
+		String arg;
+		for (int i = 0; i < request->args(); i++)
+		{
 			for (int x = 0; x < WX_SENSOR_NUM; x++)
 			{
 				arg = "senEn" + String(x);
 				if (request->argName(i) == arg)
 				{
-
 					if (request->arg(i) != "")
 					{
 						if (String(request->arg(i)) == "OK")
@@ -8960,13 +8651,7 @@ void handle_wx(AsyncWebServerRequest *request)
 				}
 			}
 		}
-		config.wx_en = En;
-		config.wx_gps = posGPS;
-		config.wx_2rf = pos2RF;
-		config.wx_2inet = pos2INET;
-		config.wx_timestamp = timeStamp;
 
-		initInterval = true;
 		String html_msg;
 		if (saveConfiguration("/default.cfg", config))
 		{
@@ -8981,243 +8666,127 @@ void handle_wx(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Allocate initial memory for HTML content
-		char tempHtml[300];
-		char *html = allocateStringMemory(26000); // Start with 8KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "document.getElementById(\"submitWX\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/wx',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
+		esp_task_wdt_reset(); // feed watchdog: handle_wx2 runs on the async_tcp task itself,
+		// same class of page as MSG/IGATE/DIGI (per-sensor channel selects, WX_SENSOR_NUM rows).
+		JsonDocument data;
 
-		/************************ WX Mode **************************/
-		strcat(html, "<form id='formWX' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>[WX] Weather Station</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-		char EnFlag[10] = "";
-		if (config.wx_en)
-			strcpy(EnFlag, "checked");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", EnFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station Callsign:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"%s\" /></td>\n", config.wx_mycall);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station SSID:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mySSID\" id=\"mySSID\">\n");
-		for (uint8_t ssid = 0; ssid <= 15; ssid++)
-		{
-			if (config.wx_ssid == ssid)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%d</option>\n", ssid, ssid);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%d</option>\n", ssid, ssid);
-			}
-			strcat(html, tempHtml);
-		}
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Object Name:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" name=\"Object\" type=\"text\" value=\"%s\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n", config.wx_object);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"Path\" id=\"Path\">\n");
-		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
-		{
-			if (config.wx_path == pthIdx)
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			else
-			{
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-			}
-			strcat(html, tempHtml);
-		}
-		strcat(html, "</select></td>\n");
-		// strcat(html, "<td style=\"text-align: left;\"><input maxlength=\"72\" size=\"72\" name=\"Path\" type=\"text\" value=\"" + String(config.wx_path) + "\" /></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Text Comment:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"50\" name=\"Comment\" type=\"text\" value=\"%s\" /></td>\n", config.wx_comment);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Time Stamp:</b></td>\n");
-		char timeStampFlag[10];
-		if (config.wx_timestamp)
-			strcpy(timeStampFlag, "checked");
-		else
-			strcpy(timeStampFlag, "");
-
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wxTimeStamp\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", timeStampFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-
-		strcat(html, "<tr><td align=\"right\"><b>POSITION:</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" id=\"PosInv\" name=\"PosInv\" type=\"number\" value=\"%d\" />Sec.</td></tr>", config.wx_interval);
-		strcat(html, tempHtml);
-		String PosFixFlag = "";
-		String PosGPSFlag = "";
-		String Pos2RFFlag = "";
-		String Pos2INETFlag = "";
-		if (config.wx_gps)
-			PosGPSFlag = "checked=\"checked\"";
-		else
-			PosFixFlag = "checked=\"checked\"";
-
-		if (config.wx_2rf)
-			Pos2RFFlag = "checked";
-		if (config.wx_2inet)
-			Pos2INETFlag = "checked";
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"PosSel\" value=\"0\" %s/>Fix <input type=\"radio\" name=\"PosSel\" value=\"1\" %s/>GPS </td></tr>\n", PosFixFlag.c_str(), PosGPSFlag.c_str());
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"Pos2RF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"Pos2INET\" value=\"OK\" %s/>Internet </td></tr>\n", Pos2RFFlag.c_str(), Pos2INETFlag.c_str());
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" name=\"PosLat\" type=\"number\" value=\"%.5f\" />degrees (positive for North, negative for South)</td></tr>\n", config.wx_lat);
-		strcat(html, tempHtml);
-
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" name=\"PosLon\" type=\"number\" value=\"%.5f\" />degrees (positive for East, negative for West)</td></tr>\n", config.wx_lon);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" name=\"PosAlt\" type=\"number\" value=\"%.2f\" /> meter. *The altitude in meters(m) above sea level</td></tr>\n", config.wx_alt);
-		strcat(html, tempHtml);
-
-		strcat(html, "</table></td>");
-		strcat(html, "</tr>\n");
-
-		// strcat(html, "<tr>\n");
-		// strcat(html, "<td align=\"right\"><b>PORT:</b></td>\n");
-		// strcat(html, "<td style=\"text-align: left;\">\n");
-		// strcat(html, "<select name=\"channel\" id=\"channel\">\n");
-		// for (int i = 0; i < 5; i++)
-		// {
-		// 	if (config.wx_channel == i)
-		// 		strcat(html, "<option value=\"" + String(i) + "\" selected>" + String(WX_PORT[i]) + " </option>\n");
-		// 	else
-		// 		strcat(html, "<option value=\"" + String(i) + "\" >" + String(WX_PORT[i]) + " </option>\n");
-		// }
-		// strcat(html, "</select>\n");
-		// strcat(html, "</td>\n");
-		// strcat(html, "</tr>\n");
-		/************************ Sensor Config Mode **************************/
-		// strcat(html, "<form id='formSENSOR' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// strcat(html, "<table>\n");
-		// strcat(html, "<th colspan=\"2\"><span><b>Sensor Config</b></span></th>\n");
-
-		strcat(html, "<tr><td align=\"right\"><b>SENSOR:<br />Selection</b></td>\n");
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
-
+		JsonArray sensors = data["sensors"].to<JsonArray>();
 		for (int ax = 0; ax < WX_SENSOR_NUM; ax++)
 		{
-			snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>%s:</b> \n", WX_SENSOR[ax]);
-			strcat(html, tempHtml);
+			JsonObject s = sensors.add<JsonObject>();
+			s["idx"] = ax;
+			s["name"] = WX_SENSOR[ax];
+			s["enabled"] = config.wx_sensor_enable[ax];
+			s["avg"] = config.wx_sensor_avg[ax];
 
-			char EnFlag[16] = "";
-			if (config.wx_sensor_enable[ax])
-				snprintf(EnFlag, sizeof(EnFlag), "checked");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<label class=\"switch\"><input type=\"checkbox\" name=\"senEn%d\" value=\"OK\" %s><span class=\"slider round\"></span></label>", ax, EnFlag);
-			strcat(html, tempHtml);
-
-			strcat(html, "</td>\n");
-
-			// strcat(html, "<td style=\"text-align: lefe;\">Sensor:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">Sensor Channel: ");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax, ax);
-			strcat(html, tempHtml);
+			JsonArray chOptions = s["chOptions"].to<JsonArray>();
 			for (uint8_t idx = 0; idx < 11; idx++)
 			{
-				if (idx == 0)
-				{
-					if (config.wx_sensor_ch[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>NONE</option>\n", idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">NONE</option>\n", idx);
-					}
-				}
-				else
-				{
-					if (config.wx_sensor_ch[ax] == idx)
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>SENSOR#%d</option>\n", idx, idx);
-					}
-					else
-					{
-						snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">SENSOR#%d</option>\n", idx, idx);
-					}
-				}
-				strcat(html, tempHtml);
+				JsonObject o = chOptions.add<JsonObject>();
+				o["value"] = idx;
+				o["label"] = (idx == 0) ? String("NONE") : ("SENSOR#" + String(idx));
+				o["selected"] = (config.wx_sensor_ch[ax] == idx);
 			}
-			strcat(html, "</select>\n");
-			String avgFlag = "";
-			String sampleFlag = "";
-			if (config.wx_sensor_avg[ax])
-				avgFlag = "checked=\"checked\"";
-			else
-				sampleFlag = "checked=\"checked\"";
-
-			snprintf(tempHtml, sizeof(tempHtml), "<input type=\"radio\" name=\"avgSel%d\" value=\"0\" %s/>Sample <input type=\"radio\" name=\"avgSel%d\" value=\"1\" %s/>Average", ax, sampleFlag.c_str(), ax, avgFlag.c_str());
-			strcat(html, tempHtml);
-			strcat(html, "</td></tr>");
 		}
-		strcat(html, "</table></td></tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitWX'  name=\"commitWX\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitWX\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("Weather", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		log_e("[WX2] before alloc: freeHeap=%u largestFreeBlock=%u", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(WX2_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "WeatherCh");
 	}
 }
+
+static const char *TLM_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitTLM\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/tlm',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<form id='formTLM' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>System Telemetry</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"{{myCall}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station SSID:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"mySSID\" id=\"mySSID\">\n"
+	"{{#each ssidOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{value}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"Path\" id=\"Path\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Comment:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"50\" name=\"Comment\" type=\"text\" value=\"{{comment}}\" /></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">Info Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" name=\"infoInv\" type=\"number\" value=\"{{infoInterval}}\" />Sec.</td></tr>"
+	"<tr><td style=\"text-align: right;\">Data Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" name=\"dataInv\" type=\"number\" value=\"{{dataInterval}}\" />Sec.</td></tr>"
+	"<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"Pos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"Pos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
+	"{{#each channelsA}}<tr><td align=\"right\"><b>Channel A{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Type/Name:</td>\n"
+	"<td style=\"text-align: left;\">Sensor Type: "
+	"<select name=\"sensorCH{{chIdx}}\" id=\"sensorCH{{chIdx}}\">\n"
+	"{{#each sensorOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Parameter: <input maxlength=\"10\" size=\"8\" name=\"param{{chIdx}}\" type=\"text\" value=\"{{param}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit{{chIdx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns{{chIdx}}a\" type=\"number\" value=\"{{eqnsA}}\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns{{chIdx}}b\" type=\"number\" value=\"{{eqnsB}}\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns{{chIdx}}c\" type=\"number\" value=\"{{eqnsC}}\" /> (av<sup>2</sup>+bv+c)</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"{{#each channelsB}}<tr><td align=\"right\"><b>Channel B{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<td style=\"text-align: left;\">Type: "
+	"<select name=\"sensorCH{{selIdx}}\" id=\"sensorCH{{bitIdx}}\">\n"
+	"{{#each sensorOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Parameter: <input maxlength=\"10\" size=\"8\" name=\"param{{selIdx}}\" type=\"text\" value=\"{{param}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit{{selIdx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"<td style=\"text-align: left;\"> Active:<input type=\"radio\" name=\"bitact{{bitIdx}}\" value=\"0\" {{#if low}}checked=\"checked\"{{/if}}/>LOW <input type=\"radio\" name=\"bitact{{bitIdx}}\" value=\"1\" {{#if high}}checked=\"checked\"{{/if}}/>HIGH </td>\n"
+	"</tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitTLM'  name=\"commitTLM\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitTLM\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />";
 
 void handle_tlm(AsyncWebServerRequest *request)
 {
@@ -9393,229 +8962,315 @@ void handle_tlm(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		char temp_buf[512];
-		// Allocate initial memory for HTML content
-		char *html = allocateStringMemory(18000); // Start with 8KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "document.getElementById(\"submitTLM\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/tlm',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
+		JsonDocument data;
+		data["enabled"] = config.tlm0_en;
+		data["myCall"] = config.tlm0_mycall;
 
-		/************************ TLM Mode **************************/
-		strcat(html, "<form id='formTLM' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>System Telemetry</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-		char EnFlag[10] = "";
-		if (config.tlm0_en)
-			strcpy(EnFlag, "checked");
-		snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"Enable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", EnFlag);
-		strcat(html, temp_buf);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		snprintf(temp_buf, sizeof(temp_buf), "<td align=\"right\"><b>Station Callsign:</b></td>\n<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"%s\" /></td>\n", config.tlm0_mycall);
-		strcat(html, temp_buf);
-
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Station SSID:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"mySSID\" id=\"mySSID\">\n");
+		JsonArray ssidOptions = data["ssidOptions"].to<JsonArray>();
 		for (uint8_t ssid = 0; ssid <= 15; ssid++)
 		{
-				if (config.tlm0_ssid == ssid)
-				{
-					snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\" selected>%d</option>\n", ssid, ssid);
-				}
-				else
-				{
-					snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\">%d</option>\n", ssid, ssid);
-				}
-				strcat(html, temp_buf);
+			JsonObject o = ssidOptions.add<JsonObject>();
+			o["value"] = ssid;
+			o["selected"] = (config.tlm0_ssid == ssid);
 		}
-		strcat(html, "</select></td>\n");
-		strcat(html, "</tr>\n");
 
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"Path\" id=\"Path\">\n");
+		JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
 		for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
 		{
-					if (config.tlm0_path == pthIdx)
-					{
-						snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\" selected>%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-					}
-					else
-					{
-						snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\">%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-					}
-					strcat(html, temp_buf);
+			JsonObject o = pathOptions.add<JsonObject>();
+			o["value"] = pthIdx;
+			o["label"] = PATH_NAME[pthIdx];
+			o["selected"] = (config.tlm0_path == pthIdx);
 		}
-		strcat(html, "</select></td>\n");
-		// strcat(html, "<td style=\"text-align: left;\"><input maxlength=\"72\" size=\"72\" name=\"Path\" type=\"text\" value=\"" + String(config.tlm0_path) + "\" /></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		{
-			snprintf(temp_buf, sizeof(temp_buf), "<td align=\"right\"><b>Text Comment:</b></td>\n<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"50\" name=\"Comment\" type=\"text\" value=\"%s\" /></td>\n", config.tlm0_comment);
-			strcat(html, temp_buf);
-		}
-		strcat(html, "</tr>\n");
 
-		snprintf(temp_buf, sizeof(temp_buf), "<tr><td style=\"text-align: right;\">Info Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" name=\"infoInv\" type=\"number\" value=\"%d\" />Sec.</td></tr>", config.tlm0_info_interval);
-		strcat(html, temp_buf);
-		snprintf(temp_buf, sizeof(temp_buf), "<tr><td style=\"text-align: right;\">Data Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" name=\"dataInv\" type=\"number\" value=\"%d\" />Sec.</td></tr>", config.tlm0_data_interval);
-		strcat(html, temp_buf);
+		data["comment"] = config.tlm0_comment;
+		data["infoInterval"] = config.tlm0_info_interval;
+		data["dataInterval"] = config.tlm0_data_interval;
+		data["pos2RF"] = config.tlm0_2rf;
+		data["pos2INET"] = config.tlm0_2inet;
 
-		char Pos2RFFlag[10] = "";
-		char Pos2INETFlag[10] = "";
-		if (config.tlm0_2rf)
-			strcpy(Pos2RFFlag, "checked");
-		if (config.tlm0_2inet)
-			strcpy(Pos2INETFlag, "checked");
-		snprintf(temp_buf, sizeof(temp_buf), "<tr><td style=\"text-align: right;\">TX Channel:</td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"Pos2RF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"Pos2INET\" value=\"OK\" %s/>Internet </td></tr>\n", Pos2RFFlag, Pos2INETFlag);
-		strcat(html, temp_buf);
-
-		// strcat(html, "<tr>\n");
-		// strcat(html, "<td align=\"right\"><b>Time Stamp:</b></td>\n");
-		// String timeStampFlag = "";
-		// if (config.wx_timestamp)
-		// 	timeStampFlag = "checked";
-		// strcat(html, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wxTimeStamp\" value=\"OK\" " + timeStampFlag + "><span class=\"slider round\"></span></label></td>\n");
-		// strcat(html, "</tr>\n");
+		JsonArray channelsA = data["channelsA"].to<JsonArray>();
 		for (int ax = 0; ax < 5; ax++)
 		{
-			snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Channel A%d:</b></td>\n", ax + 1);
-			strcat(html, temp_buf);
+			JsonObject c = channelsA.add<JsonObject>();
+			c["num"] = ax + 1;
+			c["chIdx"] = ax;
+			c["param"] = config.tlm0_PARM[ax];
+			c["unit"] = config.tlm0_UNIT[ax];
+			char buf[24];
+			snprintf(buf, sizeof(buf), "%.3f", config.tlm0_EQNS[ax][0]);
+			c["eqnsA"] = buf;
+			snprintf(buf, sizeof(buf), "%.3f", config.tlm0_EQNS[ax][1]);
+			c["eqnsB"] = buf;
+			snprintf(buf, sizeof(buf), "%.3f", config.tlm0_EQNS[ax][2]);
+			c["eqnsC"] = buf;
 
-			strcat(html, "<td align=\"center\">\n");
-			strcat(html, "<table>");
-
-			// strcat(html, "<tr><td style=\"text-align: right;\">Name:</td><td style=\"text-align: center;\"><i>Sensor Type</i></td><td style=\"text-align: center;\"><i>Parameter</i></td><td style=\"text-align: center;\"><i>Unit</i></td></tr>\n");
-
-			strcat(html, "<tr><td style=\"text-align: right;\">Type/Name:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">Sensor Type: ");
-			snprintf(temp_buf, sizeof(temp_buf), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax, ax);
-			strcat(html, temp_buf);
+			JsonArray sensorOptions = c["sensorOptions"].to<JsonArray>();
 			for (uint8_t idx = 0; idx < SYSTEM_LEN; idx++)
 			{
-						if (config.tml0_data_channel[ax] == idx)
-						{
-							snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\" selected>%s</option>\n", idx, SYSTEM_NAME[idx]);
-						}
-						else
-						{
-							snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\">%s</option>\n", idx, SYSTEM_NAME[idx]);
-						}
-						strcat(html, temp_buf);
+				JsonObject o = sensorOptions.add<JsonObject>();
+				o["value"] = idx;
+				o["label"] = SYSTEM_NAME[idx];
+				o["selected"] = (config.tml0_data_channel[ax] == idx);
 			}
-			strcat(html, "</select></td>\n");
-
-			snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\">Parameter: <input maxlength=\"10\" size=\"8\" name=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.tlm0_PARM[ax]);
-			strcat(html, temp_buf);
-			snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.tlm0_UNIT[ax]);
-			strcat(html, temp_buf);
-			strcat(html, "</tr>\n");
-			snprintf(temp_buf, sizeof(temp_buf), "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns%da\" type=\"number\" value=\"%.3f\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns%db\" type=\"number\" value=\"%.3f\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.0001\" name=\"eqns%dc\" type=\"number\" value=\"%.3f\" /> (av<sup>2</sup>+bv+c)</td></tr>\n",
-							 ax, config.tlm0_EQNS[ax][0], ax, config.tlm0_EQNS[ax][1], ax, config.tlm0_EQNS[ax][2]);
-			strcat(html, temp_buf);
-			strcat(html, "</table></td>");
-			strcat(html, "</tr>\n");
 		}
 
+		JsonArray channelsB = data["channelsB"].to<JsonArray>();
 		uint8_t b = 1;
 		for (int ax = 0; ax < 8; ax++)
 		{
-			snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Channel B%d:</b></td>\n", ax + 1);
-			strcat(html, temp_buf);
-			strcat(html, "<td align=\"center\">\n");
-			strcat(html, "<table>");
+			JsonObject c = channelsB.add<JsonObject>();
+			c["num"] = ax + 1;
+			c["selIdx"] = ax + 5;
+			c["bitIdx"] = ax;
+			c["param"] = config.tlm0_PARM[ax + 5];
+			c["unit"] = config.tlm0_UNIT[ax + 5];
+			c["high"] = (config.tlm0_BITS_Active & b) != 0;
+			c["low"] = !(config.tlm0_BITS_Active & b);
 
-			// strcat(html, "<tr><td style=\"text-align: right;\">Type/Name:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">Type: ");
-			snprintf(temp_buf, sizeof(temp_buf), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax + 5, ax);
-			strcat(html, temp_buf);
+			JsonArray sensorOptions = c["sensorOptions"].to<JsonArray>();
 			for (uint8_t idx = 0; idx < SYSTEM_BIT_LEN; idx++)
 			{
-						if (config.tml0_data_channel[ax + 5] == idx)
-						{
-							snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\" selected>%s</option>\n", idx, SYSTEM_BITS_NAME[idx]);
-						}
-						else
-						{
-							snprintf(temp_buf, sizeof(temp_buf), "<option value=\"%d\">%s</option>\n", idx, SYSTEM_BITS_NAME[idx]);
-						}
-						strcat(html, temp_buf);
+				JsonObject o = sensorOptions.add<JsonObject>();
+				o["value"] = idx;
+				o["label"] = SYSTEM_BITS_NAME[idx];
+				o["selected"] = (config.tml0_data_channel[ax + 5] == idx);
 			}
-			strcat(html, "</select></td>\n");
-
-			snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\">Parameter: <input maxlength=\"10\" size=\"8\" name=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax + 5, config.tlm0_PARM[ax + 5]);
-			strcat(html, temp_buf);
-			snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax + 5, config.tlm0_UNIT[ax + 5]);
-			strcat(html, temp_buf);
-			char LowFlag[20] = "", HighFlag[20] = "";
-			if (config.tlm0_BITS_Active & b)
-				strcpy(HighFlag, "checked=\"checked\"");
-			else
-				strcpy(LowFlag, "checked=\"checked\"");
-			snprintf(temp_buf, sizeof(temp_buf), "<td style=\"text-align: left;\"> Active:<input type=\"radio\" name=\"bitact%d\" value=\"0\" %s/>LOW <input type=\"radio\" name=\"bitact%d\" value=\"1\" %s/>HIGH </td>\n", ax, LowFlag, ax, HighFlag);
-			strcat(html, temp_buf);
-			strcat(html, "</tr>\n");
-			// strcat(html, "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax + 1) + "a\" type=\"number\" value=\"" + String(config.tlm0_EQNS[ax][0], 3) + "\" />  b:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax + 1) + "b\" type=\"number\" value=\"" + String(config.tlm0_EQNS[ax][1], 3) + "\" /> c:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax + 1) + "c\" type=\"number\" value=\"" + String(config.tlm0_EQNS[ax][2], 3) + "\" /> (av<sup>2</sup>+bv+c)</td></tr>\n";
-			strcat(html, "</table></td>");
-			strcat(html, "</tr>\n");
 			b <<= 1;
 		}
 
-		// strcat(html, "<tr><td align=\"right\"><b>Parameter Name:</b></td>\n";
-		// strcat(html, "<td align=\"center\">\n";
-		// strcat(html, "<table>";
-
-		// // strcat(html, "<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" name=\"PosLat\" type=\"number\" value=\"" + String(config.wx_lat, 5) + "\" />degrees (positive for North, negative for South)</td></tr>\n";
-		// // strcat(html, "<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" name=\"PosLon\" type=\"number\" value=\"" + String(config.wx_lon, 5) + "\" />degrees (positive for East, negative for West)</td></tr>\n";
-		// // strcat(html, "<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" name=\"PosAlt\" type=\"number\" value=\"" + String(config.wx_alt, 2) + "\" /> meter. *Value 0 is not send height</td></tr>\n";
-		// strcat(html, "</table></td>";
-		// strcat(html, "</tr>\n";
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitTLM'  name=\"commitTLM\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitTLM\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
-
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("Telemetry", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(TLM_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "Telemetry");
 	}
 }
 
 extern TaskHandle_t taskSensorHandle;
 
+static const char *SENSOR_TEMPLATE =
+	"<table>\n"
+	"<th colspan=\"5\"><span><b>Sensor Monitor</b></span></th>\n"
+	"{{#each monitorRows}}<tr>\n"
+	"{{#each this}}<td align=\"center\">\n"
+	"<fieldset id=\"SenGrp{{idx}}\" {{#if enabled}}{{else}}disabled{{/if}}>\n"
+	"<legend>{{legend}}</legend>\n"
+	"<input id=\"sVal{{idx}}\" style=\"text-align:right;\" size=\"5\" type=\"text\" value=\"{{value}}\" readonly/> {{unit}}\n"
+	"</fieldset>\n"
+	"</td>\n"
+	"{{/each}}"
+	"</tr>\n"
+	"{{/each}}"
+	"</table><br />\n"
+	"<div style=\"margin:8px 0;padding:6px;background:#fff3cd;border:1px solid #ffe69c;font-size:9pt;\">Sensor configuration (10 channels) moved to its own page - see the <b>SCFG</b> tab.</div>\n";
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Sensor configuration (10 channels)
+// split out of the SENSOR page into its own page/tab. Same En{idx}/sensorCH{idx}/
+// sensorP{idx}/address{idx}/sample{idx}/avg{idx}/param{idx}/unit{idx}/eqns{idx}{a,b,c}
+// POST contract as before, just no longer competing with the live Sensor
+// Monitor table for space/heap.
+static const char *SENSOR2_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitSENSOR\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/sensor2',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"function setElm(name,val) {\n"
+	"document.getElementById(name).value=val;\n"
+	"};\n"
+	"function selSensorType(idx) {\n"
+	"var x=0;\n"
+	"var parm=\"param\"+idx;\n"
+	"var unit=\"unit\"+idx;\n"
+	"x = document.getElementById(\"sensorCH\"+idx).value;\n"
+	"if (x==1) {\n"
+	"setElm(parm,\"Co2\");setElm(unit,\"ppm\");\n"
+	"}else if (x==2) {\n"
+	"setElm(parm,\"CH2O\");setElm(unit,\"\xce\xbcg/m\xc2\xb3\");\n"
+	"}else if (x==3) {\n"
+	"setElm(parm,\"TVOC\");setElm(unit,\"\xce\xbcg/m\xc2\xb3\");\n"
+	"}else if (x==4) {\n"
+	"setElm(parm,\"PM2.5\");setElm(unit,\"\xce\xbcg/m\xc2\xb3\");\n"
+	"}else if (x==5) {\n"
+	"setElm(parm,\"PM10.0\");setElm(unit,\"\xce\xbcg/m\xc2\xb3\");\n"
+	"}else if (x==6) {\n"
+	"setElm(parm,\"Temperature\");setElm(unit,\"\xc2\xb0""C\");\n"
+	"}else if (x==7) {\n"
+	"setElm(parm,\"Humidity\");setElm(unit,\"%RH\");\n"
+	"}else if (x==8) {\n"
+	"setElm(parm,\"Pressure\");setElm(unit,\"hPa\");\n"
+	"}else if (x==9) {\n"
+	"setElm(parm,\"WindSpeed\");setElm(unit,\"kPh\");\n"
+	"}else if (x==10) {\n"
+	"setElm(parm,\"WindCourse\");setElm(unit,\"\xc2\xb0\");\n"
+	"}else if (x==11) {\n"
+	"setElm(parm,\"Rain\");setElm(unit,\"mm\");\n"
+	"}else if (x==12) {\n"
+	"setElm(parm,\"Luminosity\");setElm(unit,\"W/m\xc2\xb3\");\n"
+	"}else if (x==13) {\n"
+	"setElm(parm,\"SoilTemp\");setElm(unit,\"\xc2\xb0""C\");\n"
+	"}else if (x==14) {\n"
+	"setElm(parm,\"SoilMoisture\");setElm(unit,\"%VWC\");\n"
+	"}else if (x==15) {\n"
+	"setElm(parm,\"WaterTemp\");setElm(unit,\"\xc2\xb0""C\");\n"
+	"}else if (x==16) {\n"
+	"setElm(parm,\"WaterTDS\");setElm(unit,\" \");\n"
+	"}else if (x==17) {\n"
+	"setElm(parm,\"WaterLevel\");setElm(unit,\"mm\");\n"
+	"}else if (x==18) {\n"
+	"setElm(parm,\"WaterFlow\");setElm(unit,\"L/min\");\n"
+	"}else if (x==19) {\n"
+	"setElm(parm,\"Voltage\");setElm(unit,\"V\");\n"
+	"}else if (x==20) {\n"
+	"setElm(parm,\"Current\");setElm(unit,\"A\");\n"
+	"}else if (x==21) {\n"
+	"setElm(parm,\"Power\");setElm(unit,\"W\");\n"
+	"}else if (x==22) {\n"
+	"setElm(parm,\"Energy\");setElm(unit,\"Wh\");\n"
+	"}else if (x==23) {\n"
+	"setElm(parm,\"Frequency\");setElm(unit,\"Hz\");\n"
+	"}else if (x==24) {\n"
+	"setElm(parm,\"PF\");setElm(unit,\" \");\n"
+	"}else if (x==25) {\n"
+	"setElm(parm,\"Satellite\");setElm(unit,\" \");\n"
+	"}else if (x==26) {\n"
+	"setElm(parm,\"HDOP\");setElm(unit,\" \");\n"
+	"}else if (x==27) {\n"
+	"setElm(parm,\"Battery\");setElm(unit,\"V\");\n"
+	"}else if (x==28) {\n"
+	"setElm(parm,\"BattLevel\");setElm(unit,\"%\");\n"
+	"}\n}\n"
+	"function selSensor(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementById(\"sensorP\"+idx).value;\n"
+	"if (x>=10 && x<=13) {\n"
+	"document.getElementById(\"address\"+idx).value={{#if beamS3}}119{{else}}118{{/if}};\n"
+	"}else if (x==16 || x==17) {\n"
+	"document.getElementById(\"address\"+idx).value=90;\n"
+	"}else if (x==23) {\n"
+	"document.getElementById(\"address\"+idx).value=1;\n"
+	"}else if (x==24 || x==25) {\n"
+	"document.getElementById(\"address\"+idx).value=1000;\n"
+	"}else{\n"
+	"document.getElementById(\"address\"+idx).value=0;\n"
+	"}\n}\n"
+	"</script>\n"
+	"<form id='formSENSOR' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>Sensor Config</b></span></th>\n"
+	"{{#each sensorConfigs}}<tr><td align=\"right\"><b>SENSOR#{{num}}:</b><br />\n"
+	"<label class=\"switch\"><input type=\"checkbox\" name=\"En{{idx}}\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label>"
+	"</td><td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Type:</td>\n"
+	"<td style=\"text-align: left;\"><select name=\"sensorCH{{idx}}\" id=\"sensorCH{{idx}}\" onchange=\"selSensorType({{idx}})\">\n"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Name: <input maxlength=\"15\" size=\"15\" name=\"param{{idx}}\" id=\"param{{idx}}\" type=\"text\" value=\"{{parm}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"10\" size=\"5\" name=\"unit{{idx}}\" id=\"unit{{idx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">PORT:</td>\n<td style=\"text-align: left;\">\n<select name=\"sensorP{{idx}}\" id=\"sensorP{{idx}}\" onchange=\"selSensor({{idx}})\">\n"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Addr/Reg/GPIO: <input style=\"text-align:right;\" min=\"0\" max=\"6500\" step=\"1\" name=\"address{{idx}}\" id=\"address{{idx}}\" type=\"number\" value=\"{{port}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Sample: <input style=\"text-align:right;\" min=\"0\" max=\"9999\" step=\"1\" name=\"sample{{idx}}\" type=\"number\" value=\"{{sample}}\" />Sec.\n"
+	"Average: <input style=\"text-align:right;\" min=\"0\" max=\"999\" step=\"1\" name=\"avg{{idx}}\" type=\"number\" value=\"{{avg}}\" />Sec.</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns{{idx}}a\" type=\"number\" value=\"{{eqnsA}}\" />  b:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns{{idx}}b\" type=\"number\" value=\"{{eqnsB}}\" /> c:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns{{idx}}c\" type=\"number\" value=\"{{eqnsC}}\" /> (av<sup>2</sup>+bv+c)</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitSENSOR'  name=\"commitSENSOR\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitSENSOR\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />"
+	"<script type=\"text/javascript\">\n"
+	"if (typeof typeArry === 'undefined'){let typeArry = [];};\n"
+	"typeArry = new Array({{#each typeNames}}'{{.}}',{{/each}});\n"
+	"if (typeof portArry === 'undefined'){let portArry = [];};\n"
+	"portArry = new Array({{#each portNames}}'{{.}}',{{/each}});\n"
+	"if (typeof typeSel === 'undefined'){var typeSel = [];};\n"
+	"if (typeof listType === 'undefined'){var listType = [];};\n"
+	"if (typeof portSel === 'undefined'){var portSel = [];};\n"
+	"if (typeof listPort === 'undefined'){var listPort = [];};\n"
+	"{{#each initSensors}}listType[{{i}}] = document.querySelector('#sensorCH{{i}}');typeSel[{{i}}]={{type}};\n"
+	"listPort[{{i}}] = document.querySelector('#sensorP{{i}}');portSel[{{i}}]={{port}};\n"
+	"{{/each}}"
+	"for (let n = 0; n < 10; n++){\n"
+	"for (let i = 0; i < typeArry.length; i++) {\n"
+	"const optionType = new Option(typeArry[i], i);\n"
+	"listType[n].add(optionType, undefined);\n"
+	"};\n"
+	"listType[n].options[typeSel[n]].selected = true;\n"
+	"for (let p = 0; p < portArry.length; p++) {\n"
+	"const optionPort = new Option(portArry[p], p);\n"
+	"listPort[n].add(optionPort, undefined);\n"
+	"};\n"
+	"listPort[n].options[portSel[n]].selected = true;\n"
+	"};\n"
+	"</script>\n";
+
 void handle_sensor(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+
+	{
+		JsonDocument data;
+
+		JsonArray monitorRows = data["monitorRows"].to<JsonArray>();
+		{
+			int ax = 0;
+			for (int r = 0; r < 3; r++)
+			{
+				JsonArray row = monitorRows.add<JsonArray>();
+				for (int c = 0; c < 5; c++)
+				{
+					JsonObject cell = row.add<JsonObject>();
+					cell["idx"] = ax;
+					cell["enabled"] = config.sensor[ax].enable;
+					cell["legend"] = "SEN#" + String(ax + 1) + "-" + String(config.sensor[ax].parm);
+					char buf[24];
+					snprintf(buf, sizeof(buf), "%.2f", sen[ax].sample);
+					cell["value"] = buf;
+					cell["unit"] = config.sensor[ax].unit;
+					ax++;
+					if (ax >= SENSOR_NUMBER)
+						break;
+				}
+				if (ax >= SENSOR_NUMBER)
+					break;
+			}
+		}
+
+		log_e("[SENSOR] before alloc: freeHeap=%u largestFreeBlock=%u", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(SENSOR_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "Sensor");
+	}
+}
+
+// LU6JMF - Marcelo Ferreira (Set/2026): Sensor configuration (10 channels)
+// split out of handle_sensor() into their own page/handler (see SENSOR2_TEMPLATE
+// above). Same En{idx}/sensorCH{idx}/sensorP{idx}/address{idx}/sample{idx}/
+// avg{idx}/param{idx}/unit{idx}/eqns{idx}{a,b,c} POST contract as before.
+void handle_sensor2(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
@@ -9722,319 +9377,247 @@ void handle_sensor(AsyncWebServerRequest *request)
 	}
 	else
 	{
-		// Allocate initial memory for HTML content
-		char temp_buffer[512];
-		char *html = allocateStringMemory(25000); // Start with 8KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "document.getElementById(\"submitSENSOR\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/sensor',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "function setElm(name,val) {\n");
-		strcat(html, "document.getElementById(name).value=val;\n");
-		strcat(html, "};\n");
-		strcat(html, "function selSensorType(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "var parm=\"param\"+idx;\n");
-		strcat(html, "var unit=\"unit\"+idx;\n");
-		strcat(html, "x = document.getElementById(\"sensorCH\"+idx).value;\n");
-		strcat(html, "if (x==1) {\n");
-		strcat(html, "setElm(parm,\"Co2\");");
-		strcat(html, "setElm(unit,\"ppm\");\n");
-		strcat(html, "}else if (x==2) {\n");
-		strcat(html, "setElm(parm,\"CH2O\");");
-		strcat(html, "setElm(unit,\"μg/m³\");\n");
-		strcat(html, "}else if (x==3) {\n");
-		strcat(html, "setElm(parm,\"TVOC\");");
-		strcat(html, "setElm(unit,\"μg/m³\");\n");
-		strcat(html, "}else if (x==4) {\n");
-		strcat(html, "setElm(parm,\"PM2.5\");");
-		strcat(html, "setElm(unit,\"μg/m³\");\n");
-		strcat(html, "}else if (x==5) {\n");
-		strcat(html, "setElm(parm,\"PM10.0\");");
-		strcat(html, "setElm(unit,\"μg/m³\");\n");
-		strcat(html, "}else if (x==6) {\n");
-		strcat(html, "setElm(parm,\"Temperature\");");
-		strcat(html, "setElm(unit,\"°C\");\n");
-		strcat(html, "}else if (x==7) {\n");
-		strcat(html, "setElm(parm,\"Humidity\");");
-		strcat(html, "setElm(unit,\"%RH\");\n");
-		strcat(html, "}else if (x==8) {\n");
-		strcat(html, "setElm(parm,\"Pressure\");");
-		strcat(html, "setElm(unit,\"hPa\");\n");
-		strcat(html, "}else if (x==9) {\n");
-		strcat(html, "setElm(parm,\"WindSpeed\");");
-		strcat(html, "setElm(unit,\"kPh\");\n");
-		strcat(html, "}else if (x==10) {\n");
-		strcat(html, "setElm(parm,\"WindCourse\");");
-		strcat(html, "setElm(unit,\"°\");\n");
-		strcat(html, "}else if (x==11) {\n");
-		strcat(html, "setElm(parm,\"Rain\");");
-		strcat(html, "setElm(unit,\"mm\");\n");
-		strcat(html, "}else if (x==12) {\n");
-		strcat(html, "setElm(parm,\"Luminosity\");");
-		strcat(html, "setElm(unit,\"W/m³\");\n");
-		strcat(html, "}else if (x==13) {\n");
-		strcat(html, "setElm(parm,\"SoilTemp\");");
-		strcat(html, "setElm(unit,\"°C\");\n");
-		strcat(html, "}else if (x==14) {\n");
-		strcat(html, "setElm(parm,\"SoilMoisture\");");
-		strcat(html, "setElm(unit,\"%VWC\");\n");
-		strcat(html, "}else if (x==15) {\n");
-		strcat(html, "setElm(parm,\"WaterTemp\");");
-		strcat(html, "setElm(unit,\"°C\");\n");
-		strcat(html, "}else if (x==16) {\n");
-		strcat(html, "setElm(parm,\"WaterTDS\");");
-		strcat(html, "setElm(unit,\" \");\n");
-		strcat(html, "}else if (x==17) {\n");
-		strcat(html, "setElm(parm,\"WaterLevel\");");
-		strcat(html, "setElm(unit,\"mm\");\n");
-		strcat(html, "}else if (x==18) {\n");
-		strcat(html, "setElm(parm,\"WaterFlow\");");
-		strcat(html, "setElm(unit,\"L/min\");\n");
-		strcat(html, "}else if (x==19) {\n");
-		strcat(html, "setElm(parm,\"Voltage\");");
-		strcat(html, "setElm(unit,\"V\");\n");
-		strcat(html, "}else if (x==20) {\n");
-		strcat(html, "setElm(parm,\"Current\");");
-		strcat(html, "setElm(unit,\"A\");\n");
-		strcat(html, "}else if (x==21) {\n");
-		strcat(html, "setElm(parm,\"Power\");");
-		strcat(html, "setElm(unit,\"W\");\n");
-		strcat(html, "}else if (x==22) {\n");
-		strcat(html, "setElm(parm,\"Energy\");");
-		strcat(html, "setElm(unit,\"Wh\");\n");
-		strcat(html, "}else if (x==23) {\n");
-		strcat(html, "setElm(parm,\"Frequency\");");
-		strcat(html, "setElm(unit,\"Hz\");\n");
-		strcat(html, "}else if (x==24) {\n");
-		strcat(html, "setElm(parm,\"PF\");");
-		strcat(html, "setElm(unit,\" \");\n");
-		strcat(html, "}else if (x==25) {\n");
-		strcat(html, "setElm(parm,\"Satellite\");");
-		strcat(html, "setElm(unit,\" \");\n");
-		strcat(html, "}else if (x==26) {\n");
-		strcat(html, "setElm(parm,\"HDOP\");");
-		strcat(html, "setElm(unit,\" \");\n");
-		strcat(html, "}else if (x==27) {\n");
-		strcat(html, "setElm(parm,\"Battery\");");
-		strcat(html, "setElm(unit,\"V\");\n");
-		strcat(html, "}else if (x==28) {\n");
-		strcat(html, "setElm(parm,\"BattLevel\");");
-		strcat(html, "setElm(unit,\"%\");\n");
-		strcat(html, "}\n}\n");
-
-		strcat(html, "function selSensor(idx) {\n");
-		strcat(html, "var x=0;\n");
-		strcat(html, "x = document.getElementById(\"sensorP\"+idx).value;\n");
-		strcat(html, "if (x>=10 && x<=13) {\n");
+		JsonDocument data;
 #ifdef TTGO_T_Beam_S3_SUPREME_V3
-		strcat(html, "document.getElementById(\"address\"+idx).value=119;\n");
+		data["beamS3"] = true;
 #else
-		strcat(html, "document.getElementById(\"address\"+idx).value=118;\n");
+		data["beamS3"] = false;
 #endif
-		strcat(html, "}else if (x==16 || x==17) {\n");
-		strcat(html, "document.getElementById(\"address\"+idx).value=90;\n");
-		strcat(html, "}else if (x==23) {\n");
-		strcat(html, "document.getElementById(\"address\"+idx).value=1;\n");
-		strcat(html, "}else if (x==24 || x==25) {\n");
-		strcat(html, "document.getElementById(\"address\"+idx).value=1000;\n");
-		strcat(html, "}else{\n");
-		strcat(html, "document.getElementById(\"address\"+idx).value=0;\n");
-		strcat(html, "}\n}\n");
-		strcat(html, "</script>\n");
 
-		/************************ Sensor Monitor **************************/
-		// strcat(html, "<form id='formSENSOR' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"5\"><span><b>Sensor Monitor</b></span></th>\n");
-		int ax = 0;
-		for (int r = 0; r < 3; r++)
-		{
-			strcat(html, "<tr>\n");
-			for (int c = 0; c < 5; c++)
-			{
-				strcat(html, "<td align=\"center\">\n");
-				if (config.sensor[ax].enable)
-				{
-					snprintf(temp_buffer, sizeof(temp_buffer), "<fieldset id=\"SenGrp%d\">\n", ax + 1);
-					strcat(html, temp_buffer);
-				}
-				else
-				{
-					snprintf(temp_buffer, sizeof(temp_buffer), "<fieldset id=\"SenGrp%d\" disabled>\n", ax + 1);
-					strcat(html, temp_buffer);
-				}
-
-				snprintf(temp_buffer, sizeof(temp_buffer), "<legend>SEN#%d-%s</legend>\n", ax + 1, config.sensor[ax].parm);
-				strcat(html, temp_buffer);
-				snprintf(temp_buffer, sizeof(temp_buffer), "<input id=\"sVal%d\" style=\"text-align:right;\" size=\"5\" type=\"text\" value=\"%.2f\" readonly/> %s\n", ax, sen[ax].sample, config.sensor[ax].unit);
-				strcat(html, temp_buffer);
-				strcat(html, "</td>\n");
-				ax++;
-				if (ax >= SENSOR_NUMBER)
-					break;
-			}
-			strcat(html, "</tr>\n");
-			if (ax >= SENSOR_NUMBER)
-				break;
-		}
-		strcat(html, "</table>< /br>\n");
-
-		/************************ Sensor Config Mode **************************/
-		strcat(html, "<form id='formSENSOR' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>Sensor Config</b></span></th>\n");
-		String EnFlag = "";
-
+		JsonArray sensorConfigs = data["sensorConfigs"].to<JsonArray>();
 		for (int ax = 0; ax < SENSOR_NUMBER; ax++)
 		{
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td align=\"right\"><b>SENSOR#%d:</b><br />\n", ax + 1);
-			strcat(html, temp_buffer);
-			EnFlag = "";
-			if (config.sensor[ax].enable)
-				EnFlag = "checked";
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<label class=\"switch\"><input type=\"checkbox\" name=\"En%d\" value=\"OK\" %s><span class=\"slider round\"></span></label>", ax, EnFlag.c_str());
-				strcat(html, temp_buffer);
-			}
-			strcat(html, "</td><td align=\"center\">\n");
-			strcat(html, "<table>");
-
-			strcat(html, "<tr><td style=\"text-align: right;\">Type:</td>\n");
-			strcat(html, "<td style=\"text-align: left;\">");
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<select name=\"sensorCH%d\" id=\"sensorCH%d\" onchange=\"selSensorType(%d)\">\n", ax, ax, ax);
-				strcat(html, temp_buffer);
-			}
-			// for (uint8_t idx = 0; idx < SENSOR_NAME_NUM; idx++)
-			// {
-			// 	if (config.sensor[ax].type == idx)
-			// 	{
-			// 		strcat(html, "<option value=\"" + String(idx) + "\" selected>" + String(SENSOR_NAME[idx]) + "</option>\n");
-			// 	}
-			// 	else
-			// 	{
-			// 		strcat(html, "<option value=\"" + String(idx) + "\">" + String(SENSOR_NAME[idx]) + "</option>\n");
-			// 	}
-			// }
-			strcat(html, "</select></td>\n");
-
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\">Name: <input maxlength=\"15\" size=\"15\" name=\"param%d\" id=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax, ax, config.sensor[ax].parm);
-			strcat(html, temp_buffer);
-
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\">Unit: <input maxlength=\"10\" size=\"5\" name=\"unit%d\" id=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax, ax, config.sensor[ax].unit);
-			strcat(html, temp_buffer);
-			strcat(html, "</tr>\n");
-			// strcat(html, "<tr><td style=\"text-align: right;\">Port:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax) + "a\" type=\"number\" value=\"" + String(config.sensor[ax].eqns[0], 3) + "\" />  b:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax) + "b\" type=\"number\" value=\"" + String(config.sensor[ax].eqns[1], 3) + "\" /> c:<input min=\"-999\" max=\"999\" step=\"0.1\" name=\"eqns" + String(ax) + "c\" type=\"number\" value=\"" + String(config.sensor[ax].eqns[2], 3) + "\" /> (av<sup>2</sup>+bv+c)</td></tr>\n";
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td style=\"text-align: right;\">PORT:</td>\n<td style=\"text-align: left;\">\n<select name=\"sensorP%d\" id=\"sensorP%d\" onchange=\"selSensor(%d)\">\n", ax, ax, ax);
-			strcat(html, temp_buffer);
-			// for (uint8_t idx = 0; idx < SENSOR_PORT_NUM; idx++)
-			// {
-			// 	if (config.sensor[ax].port == idx)
-			// 	{
-			// 		strcat(html, "<option value=\"" + String(idx) + "\" selected>" + String(SENSOR_PORT[idx]) + "</option>\n";
-			// 	}
-			// 	else
-			// 	{
-			// 		strcat(html, "<option value=\"" + String(idx) + "\">" + String(SENSOR_PORT[idx]) + "</option>\n";
-			// 	}
-			// }
-			strcat(html, "</select></td>\n");
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\">Addr/Reg/GPIO: <input style=\"text-align:right;\" min=\"0\" max=\"6500\" step=\"1\" name=\"address%d\" id=\"address%d\" type=\"number\" value=\"%d\" /></td>\n", ax, ax, config.sensor[ax].address);
-			strcat(html, temp_buffer);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"text-align: left;\">Sample: <input style=\"text-align:right;\" min=\"0\" max=\"9999\" step=\"1\" name=\"sample%d\" type=\"number\" value=\"%d\" />Sec.\n", ax, config.sensor[ax].samplerate);
-			strcat(html, temp_buffer);
-			snprintf(temp_buffer, sizeof(temp_buffer), "Average: <input style=\"text-align:right;\" min=\"0\" max=\"999\" step=\"1\" name=\"avg%d\" type=\"number\" value=\"%d\" />Sec.</td></tr>\n", ax, config.sensor[ax].averagerate);
-			strcat(html, temp_buffer);
-			snprintf(temp_buffer, sizeof(temp_buffer), "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns%da\" type=\"number\" value=\"%.5f\" />  b:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns%db\" type=\"number\" value=\"%.5f\" /> c:<input min=\"-999\" max=\"999\" step=\"0.00001\" name=\"eqns%dc\" type=\"number\" value=\"%.5f\" /> (av<sup>2</sup>+bv+c)</td></tr>\n",
-							 ax, config.sensor[ax].eqns[0], ax, config.sensor[ax].eqns[1], ax, config.sensor[ax].eqns[2]);
-			strcat(html, temp_buffer);
-			strcat(html, "</table></td>");
-			strcat(html, "</tr>\n");
+			JsonObject s = sensorConfigs.add<JsonObject>();
+			s["idx"] = ax;
+			s["num"] = ax + 1;
+			s["enabled"] = config.sensor[ax].enable;
+			s["parm"] = config.sensor[ax].parm;
+			s["unit"] = config.sensor[ax].unit;
+			s["port"] = config.sensor[ax].address;
+			s["sample"] = config.sensor[ax].samplerate;
+			s["avg"] = config.sensor[ax].averagerate;
+			char buf[24];
+			snprintf(buf, sizeof(buf), "%.5f", config.sensor[ax].eqns[0]);
+			s["eqnsA"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.sensor[ax].eqns[1]);
+			s["eqnsB"] = buf;
+			snprintf(buf, sizeof(buf), "%.5f", config.sensor[ax].eqns[2]);
+			s["eqnsC"] = buf;
 		}
 
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitSENSOR'  name=\"commitSENSOR\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitSENSOR\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
-
-		strcat(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "if (typeof typeArry === 'undefined'){let typeArry = [];};\n");
-		strcat(html, "typeArry = new Array(");
+		JsonArray typeNames = data["typeNames"].to<JsonArray>();
 		for (uint8_t idx = 0; idx < SENSOR_NAME_NUM; idx++)
-		{
-			snprintf(temp_buffer, sizeof(temp_buffer), "'%s'", SENSOR_NAME[idx]);
-			strcat(html, temp_buffer);
-			if (idx < SENSOR_NAME_NUM - 1)
-				strcat(html, ",");
-		}
-		strcat(html, ");\n");
-		strcat(html, "if (typeof portArry === 'undefined'){let portArry = [];};\n");
-		strcat(html, "portArry = new Array(");
+			typeNames.add(SENSOR_NAME[idx]);
+
+		JsonArray portNames = data["portNames"].to<JsonArray>();
 		for (uint8_t idx = 0; idx < SENSOR_PORT_NUM; idx++)
-		{
-			snprintf(temp_buffer, sizeof(temp_buffer), "'%s'", SENSOR_PORT[idx]);
-			strcat(html, temp_buffer);
-			if (idx < SENSOR_PORT_NUM - 1)
-				strcat(html, ",");
-		}
-		strcat(html, ");\n");
-		// strcat(html, "delete typeSel;delete listType;delete portSel;delete listPort;\n";
-		strcat(html, "if (typeof typeSel === 'undefined'){var typeSel = [];};\n");
-		strcat(html, "if (typeof listType === 'undefined'){var listType = [];};\n");
-		strcat(html, "if (typeof portSel === 'undefined'){var portSel = [];};\n");
-		strcat(html, "if (typeof listPort === 'undefined'){var listPort = [];};\n");
+			portNames.add(SENSOR_PORT[idx]);
+
+		JsonArray initSensors = data["initSensors"].to<JsonArray>();
 		for (int i = 0; i < 10; i++)
 		{
-			snprintf(temp_buffer, sizeof(temp_buffer), "listType[%d] = document.querySelector('#sensorCH%d');typeSel[%d]=%d;\n", i, i, i, config.sensor[i].type);
-			strcat(html, temp_buffer);
-			snprintf(temp_buffer, sizeof(temp_buffer), "listPort[%d] = document.querySelector('#sensorP%d');portSel[%d]=%d;\n", i, i, i, config.sensor[i].port);
-			strcat(html, temp_buffer);
+			JsonObject s = initSensors.add<JsonObject>();
+			s["i"] = i;
+			s["type"] = config.sensor[i].type;
+			s["port"] = config.sensor[i].port;
 		}
 
-		strcat(html, "for (let n = 0; n < 10; n++){\n");
-		strcat(html, "for (let i = 0; i < typeArry.length; i++) {\n");
-		strcat(html, "const optionType = new Option(typeArry[i], i);\n");
-		strcat(html, "listType[n].add(optionType, undefined);\n");
-		strcat(html, "};\n");
-		strcat(html, "listType[n].options[typeSel[n]].selected = true;\n");
-		strcat(html, "for (let p = 0; p < portArry.length; p++) {\n");
-		strcat(html, "const optionPort = new Option(portArry[p], p);\n");
-		strcat(html, "listPort[n].add(optionPort, undefined);\n");
-		strcat(html, "};\n");
-		strcat(html, "listPort[n].options[portSel[n]].selected = true;\n");
-		strcat(html, "};\n");
-
-		strcat(html, "</script>\n");
-
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("Sensor", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		log_e("[SENSOR2] before alloc: freeHeap=%u largestFreeBlock=%u", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+		esp_task_wdt_reset(); // feed watchdog: handle_sensor2 runs on the async_tcp task itself
+		String html_str = renderTemplate(SENSOR2_TEMPLATE, data.as<JsonVariant>());
+		sendHtmlChunked(request, html_str, "SensorCfg");
 	}
 }
+
+static const char *TRACKER_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitTRACKER\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/tracker',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n<script type=\"text/javascript\">\n"
+	"function openWindowSymbol(sel) {\n"
+	"var i, l, options = [{\n"
+	"value: 'first',\n"
+	"text: 'First'\n"
+	"}, {\n"
+	"value: 'second',\n"
+	"text: 'Second'\n"
+	"}],\n"
+	"newWindow = window.open(\"/symbol?sel=\"+sel.toString(), null, \"height=400,width=400,status=no,toolbar=no,menubar=no,location=no\");\n"
+	"}\n"
+	"function setValue(sel,symbol,table) {\n"
+	"var txtsymbol=document.getElementById('trackerSymbol');\n"
+	"var txttable=document.getElementById('trackerTable');\n"
+	"var imgicon=document.getElementById('trackerImgSymbol');\n"
+	"if(sel==1){\n"
+	"txtsymbol=document.getElementById('moveSymbol');\n"
+	"txttable=document.getElementById('moveTable');\n"
+	"imgicon= document.getElementById('moveImgSymbol');\n"
+	"}else if(sel==2){\n"
+	"txtsymbol=document.getElementById('stopSymbol');\n"
+	"txttable=document.getElementById('stopTable');\n"
+	"imgicon= document.getElementById('stopImgSymbol');\n"
+	"}\n"
+	"txtsymbol.value = String.fromCharCode(symbol);\n"
+	"if(table==1){\n txttable.value='/';\n"
+	"}else if(table==2){\n txttable.value='\\\\';\n}\n"
+	"imgicon.src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"\n}\n"
+	"function onSmartCheck() {\n"
+	"if (document.querySelector('#smartBcnEnable').checked) {\n"
+	"document.getElementById(\"smartbcnGrp\").disabled=false;\n"
+	"} else {\n"
+	"document.getElementById(\"smartbcnGrp\").disabled=true;\n"
+	"}\n}\n"
+	"function selPrecision(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"precision\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n"
+	"}\n"
+	"function selOffset(idx) {\n"
+	"var x=0;\n"
+	"x = document.getElementsByName(\"offset\"+idx)[0].value;\n"
+	"document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formtracker' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>[TRACKER] Tracker Position Mode</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"trackerEnable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station Callsign:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"{{myCall}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Station SSID:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"mySSID\" id=\"mySSID\">\n"
+	"{{#each ssidOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{value}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Item/Obj Name:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" id=\"trackerObject\" name=\"trackerObject\" type=\"text\" value=\"{{object}}\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PATH:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"trackerPath\" id=\"trackerPath\">\n"
+	"{{#each pathOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Comment:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"trackerComment\" name=\"trackerComment\" type=\"text\" value=\"{{comment}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Text Status:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"trkStatus\" name=\"trkStatus\" type=\"text\" value=\"{{status}}\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"trkSTSInv\" type=\"number\" value=\"{{statusInterval}}\" />Sec.</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Smart Beacon:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"smartBcnEnable\" name=\"smartBcnEnable\" onclick=\"onSmartCheck()\" value=\"OK\" {{#if smartBcnEn}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch use to smart beacon mode</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Compress:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"compressEnable\" value=\"OK\" {{#if compressEn}}checked{{/if}}><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch compress packet</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Mic-E Type:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"trkMicEType\" id=\"trkMicEType\">\n"
+	"{{#each micEOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select><label style=\"vertical-align: bottom;font-size: 8pt;\"><i>*Support if Compress is enabled and not use Item/Obj,Time Stamp or UnUsed</i></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Time Stamp:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"trackerTimeStamp\" value=\"OK\" {{#if timestamp}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerPos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"trackerPos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
+	"<tr><td style=\"text-align: right;\"><b>Option:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerOptCST\" value=\"OK\" {{#if optCST}}checked{{/if}}/>Telemetry <input type=\"checkbox\" name=\"trackerOptAlt\" value=\"OK\" {{#if optAlt}}checked{{/if}}/>Altutude <input type=\"checkbox\" name=\"trackerOptBat\" value=\"OK\" {{#if optBat}}checked{{/if}}/>Audio Request </td></tr>\n"
+	"<tr>"
+	"<td align=\"right\"><b>POSITION:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" id=\"trackerPosInv\" name=\"trackerPosInv\" type=\"number\" value=\"{{posInterval}}\" />Sec.</label></td></tr>"
+	"<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"trackerPosSel\" value=\"0\" {{#if posFix}}checked=\"checked\"{{/if}}/>Fix <input type=\"radio\" name=\"trackerPosSel\" value=\"1\" {{#if posGPS}}checked=\"checked\"{{/if}}/>GPS </td></tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Symbol Icon:</td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"trackerTable\" name=\"trackerTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"trackerSymbol\" name=\"trackerSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"trackerImgSymbol\" onclick=\"openWindowSymbol(0);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"trackerPosLat\" name=\"trackerPosLat\" type=\"number\" value=\"{{lat}}\" />degrees (positive for North, negative for South)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"trackerPosLon\" name=\"trackerPosLon\" type=\"number\" value=\"{{lon}}\" />degrees (positive for East, negative for West)</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"trackerPosAlt\" name=\"trackerPosAlt\" type=\"number\" value=\"{{alt}}\" /> meter. *Value 0 is not send height</td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Smart Beacon:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<fieldset id=\"smartbcnGrp\" {{#if smartbeaconDisabled}}disabled{{/if}}>\n"
+	"<legend>Smart beacon configuration</legend>\n<table>"
+	"<tr>\n"
+	"<td align=\"right\">Move Symbol:</td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"moveTable\" name=\"moveTable\" type=\"text\" value=\"{{moveTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"moveSymbol\" name=\"moveSymbol\" type=\"text\" value=\"{{moveSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"moveImgSymbol\" onclick=\"openWindowSymbol(1);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{moveImgNum}}-{{moveImgTable}}.png\"> <i>*Click icon for select MOVE symbol</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\">Stop Symbol:</td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"stopTable\" name=\"stopTable\" type=\"text\" value=\"{{stopTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"stopSymbol\" name=\"stopSymbol\" type=\"text\" value=\"{{stopSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"stopImgSymbol\" onclick=\"openWindowSymbol(2);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{stopImgNum}}-{{stopImgTable}}.png\"> <i>*Click icon for select STOP symbol</i></td>\n"
+	"</tr>\n"
+	"<tr><td style=\"text-align: right;\">High Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"10\" max=\"1000\" step=\"1\" id=\"hspeed\" name=\"hspeed\" type=\"number\" value=\"{{hspeed}}\" /> km/h</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Low Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"250\" step=\"1\" id=\"lspeed\" name=\"lspeed\" type=\"number\" value=\"{{lspeed}}\" /> km/h</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Slow Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"60\" max=\"3600\" step=\"1\" id=\"slowInterval\" name=\"slowInterval\" type=\"number\" value=\"{{slowInterval}}\" /> Sec.</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Max Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"10\" max=\"255\" step=\"1\" id=\"maxInterval\" name=\"maxInterval\" type=\"number\" value=\"{{maxInterval}}\" /> Sec.</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Min Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"100\" step=\"1\" id=\"minInterval\" name=\"minInterval\" type=\"number\" value=\"{{minInterval}}\" /> Sec.</td></tr>\n"
+	"<tr><td style=\"text-align: right;\">Min Angle:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"359\" step=\"1\" id=\"minAngle\" name=\"minAngle\" type=\"number\" value=\"{{minAngle}}\" /> Degree.</td></tr>\n"
+	"</table></fieldset></tr>"
+	"<tr>\n"
+	"<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n"
+	"<td align=\"center\"><table>\n"
+	"<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"trkTlmInv\" name=\"trkTlmInv\" type=\"number\" value=\"{{tlmInterval}}\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>"
+	"{{#each tlmChannels}}<tr><td align=\"right\"><b>CH A{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<table>"
+	"<tr><td style=\"text-align: right;\">Sensor:</td>\n"
+	"<td style=\"text-align: left;\">CH: "
+	"<select name=\"sensorCH{{idx}}\" id=\"sensorCH{{idx}}\">\n"
+	"{{#each sensorOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select></td>\n"
+	"<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param{{idx}}\" type=\"text\" value=\"{{param}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit{{idx}}\" type=\"text\" value=\"{{unit}}\" /></td>\n"
+	"<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision{{idx}}\" type=\"text\" value=\"{{precision}}\" onchange=\"selPrecision({{idx}})\" /></td></tr>\n"
+	"<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}a\" type=\"number\" value=\"{{eqnsA}}\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}b\" type=\"number\" value=\"{{eqnsB}}\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns{{idx}}c\" type=\"number\" value=\"{{eqnsC}}\" /> (av<sup>2</sup>+bv+c) </td>\n"
+	"<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset{{idx}}\" type=\"text\" value=\"{{offset}}\"  onchange=\"selOffset({{idx}})\" /></td></tr>\n"
+	"</table></td>"
+	"</tr>\n"
+	"{{/each}}"
+	"</table></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitTRACKER'  name=\"commitTRACKER\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitTRACKER\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />";
 
 void handle_tracker(AsyncWebServerRequest *request)
 {
@@ -10054,9 +9637,7 @@ void handle_tracker(AsyncWebServerRequest *request)
 	bool pos2INET = false;
 	bool optCST = false;
 	bool optAlt = false;
-	bool optRSSI = false;
-	bool optSNR = false;
-	bool optFreqErr = false;
+	bool optBat = false;
 	bool optSat = false;
 	bool timeStamp = false;
 
@@ -10104,28 +9685,12 @@ void handle_tracker(AsyncWebServerRequest *request)
 						optAlt = true;
 				}
 			}
-			if (request->argName(i) == "trackeroptRSSI")
+			if (request->argName(i) == "trackerOptBat")
 			{
 				if (request->arg(i) != "")
 				{
 					if (String(request->arg(i)) == "OK")
-						optRSSI = true;
-				}
-			}
-			if (request->argName(i) == "trackerOptSNR")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-						optSNR = true;
-				}
-			}
-			if (request->argName(i) == "trackerOptFreqErr")
-			{
-				if (request->arg(i) != "")
-				{
-					if (String(request->arg(i)) == "OK")
-						optFreqErr = true;
+						optBat = true;
 				}
 			}
 			if (request->argName(i) == "trackerOptSat")
@@ -10439,9 +10004,7 @@ void handle_tracker(AsyncWebServerRequest *request)
 
 		config.trk_log = optCST;
 		config.trk_altitude = optAlt;
-		config.trk_rssi = optRSSI;
-		config.trk_snr = optSNR;
-		config.trk_freqerr = optFreqErr;
+		config.trk_rssi = optBat;
 		config.trk_sat = optSat;
 		config.trk_timestamp = timeStamp;
 
@@ -10449,396 +10012,275 @@ void handle_tracker(AsyncWebServerRequest *request)
 		saveConfig(request);
 	}
 
-	// Allocate initial memory for HTML content
-	char tempHtml[500];
-	char *html = allocateStringMemory(22000); // Start with 8KB buffer
-	if (!html)
-	{
-		request->send(500, "text/html", "Memory allocation failed");
-		return;
-	}
-	strcpy(html, "<script type=\"text/javascript\">\n");
-	strcat(html, "$('form').submit(function (e) {\n");
-	strcat(html, "e.preventDefault();\n");
-	strcat(html, "var data = new FormData(e.currentTarget);\n");
-	strcat(html, "document.getElementById(\"submitTRACKER\").disabled=true;\n");
-	strcat(html, "$.ajax({\n");
-	strcat(html, "url: '/tracker',\n");
-	strcat(html, "type: 'POST',\n");
-	strcat(html, "data: data,\n");
-	strcat(html, "contentType: false,\n");
-	strcat(html, "processData: false,\n");
-	strcat(html, "success: function (data) {\n");
-	strcat(html, "alert(\"Submited Successfully\");\n");
-	strcat(html, "},\n");
-	strcat(html, "error: function (data) {\n");
-	strcat(html, "alert(\"An error occurred.\");\n");
-	strcat(html, "}\n");
-	strcat(html, "});\n");
-	strcat(html, "});\n");
-	strcat(html, "</script>\n<script type=\"text/javascript\">\n");
-	strcat(html, "function openWindowSymbol(sel) {\n");
-	strcat(html, "var i, l, options = [{\n");
-	strcat(html, "value: 'first',\n");
-	strcat(html, "text: 'First'\n");
-	strcat(html, "}, {\n");
-	strcat(html, "value: 'second',\n");
-	strcat(html, "text: 'Second'\n");
-	strcat(html, "}],\n");
-	strcat(html, "newWindow = window.open(\"/symbol?sel=\"+sel.toString(), null, \"height=400,width=400,status=no,toolbar=no,menubar=no,location=no\");\n");
-	strcat(html, "}\n");
+	JsonDocument data;
+	data["enabled"] = config.trk_en;
+	data["myCall"] = config.trk_mycall;
 
-	strcat(html, "function setValue(sel,symbol,table) {\n");
-	strcat(html, "var txtsymbol=document.getElementById('trackerSymbol');\n");
-	strcat(html, "var txttable=document.getElementById('trackerTable');\n");
-	strcat(html, "var imgicon=document.getElementById('trackerImgSymbol');\n");
-	strcat(html, "if(sel==1){\n");
-	strcat(html, "txtsymbol=document.getElementById('moveSymbol');\n");
-	strcat(html, "txttable=document.getElementById('moveTable');\n");
-	strcat(html, "imgicon= document.getElementById('moveImgSymbol');\n");
-	strcat(html, "}else if(sel==2){\n");
-	strcat(html, "txtsymbol=document.getElementById('stopSymbol');\n");
-	strcat(html, "txttable=document.getElementById('stopTable');\n");
-	strcat(html, "imgicon= document.getElementById('stopImgSymbol');\n");
-	strcat(html, "}\n");
-	strcat(html, "txtsymbol.value = String.fromCharCode(symbol);\n");
-	strcat(html, "if(table==1){\n txttable.value='/';\n");
-	strcat(html, "}else if(table==2){\n txttable.value='\\\\';\n}\n");
-	strcat(html, "imgicon.src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n");
-	strcat(html, "\n}\n");
-	strcat(html, "function onSmartCheck() {\n");
-	strcat(html, "if (document.querySelector('#smartBcnEnable').checked) {\n");
-	// Checkbox has been checked
-	strcat(html, "document.getElementById(\"smartbcnGrp\").disabled=false;\n");
-	strcat(html, "} else {\n");
-	// Checkbox has been unchecked
-	strcat(html, "document.getElementById(\"smartbcnGrp\").disabled=true;\n");
-	strcat(html, "}\n}\n");
-
-	strcat(html, "function selPrecision(idx) {\n");
-	strcat(html, "var x=0;\n");
-	strcat(html, "x = document.getElementsByName(\"precision\"+idx)[0].value;\n");
-	strcat(html, "document.getElementsByName(\"eqns\"+idx+\"b\")[0].value=1/Math.pow(10,x);\n");
-	strcat(html, "}\n");
-	strcat(html, "function selOffset(idx) {\n");
-	strcat(html, "var x=0;\n");
-	strcat(html, "x = document.getElementsByName(\"offset\"+idx)[0].value;\n");
-	strcat(html, "document.getElementsByName(\"eqns\"+idx+\"c\")[0].value=x*(-1);\n");
-	strcat(html, "}\n");
-	strcat(html, "</script>\n");
-
-	delay(1);
-	/************************ tracker Mode **************************/
-	strcat(html, "<form id='formtracker' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-	// strcat(html, "<h2>[TRACKER] Tracker Position Mode</h2>\n");
-	strcat(html, "<table>\n");
-	// strcat(html, "<tr>\n");
-	// strcat(html, "<th width=\"200\"><span><b>Setting</b></span></th>\n");
-	// strcat(html, "<th><span><b>Value</b></span></th>\n");
-	// strcat(html, "</tr>\n");
-	strcat(html, "<th colspan=\"2\"><span><b>[TRACKER] Tracker Position Mode</b></span></th>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-	char trackerEnFlag[10] = "";
-	if (config.trk_en)
-		strcpy(trackerEnFlag, "checked");
-	else
-		strcpy(trackerEnFlag, "");
-
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"trackerEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", trackerEnFlag);
-	strcat(html, tempHtml);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Station Callsign:</b></td>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"7\" size=\"6\" id=\"myCall\" name=\"myCall\" type=\"text\" value=\"%s\" /></td>\n", config.trk_mycall);
-	strcat(html, tempHtml);
-
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Station SSID:</b></td>\n");
-	strcat(html, "<td style=\"text-align: left;\">\n");
-	strcat(html, "<select name=\"mySSID\" id=\"mySSID\">\n");
+	JsonArray ssidOptions = data["ssidOptions"].to<JsonArray>();
 	for (uint8_t ssid = 0; ssid <= 15; ssid++)
 	{
-		if (config.trk_ssid == ssid)
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%d</option>\n", ssid, ssid);
-		}
-		else
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%d</option>\n", ssid, ssid);
-		}
-		strcat(html, tempHtml);
+		JsonObject o = ssidOptions.add<JsonObject>();
+		o["value"] = ssid;
+		o["selected"] = (config.trk_ssid == ssid);
 	}
-	strcat(html, "</select></td>\n");
-	strcat(html, "</tr>\n");
 
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Item/Obj Name:</b></td>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"9\" size=\"9\" id=\"trackerObject\" name=\"trackerObject\" type=\"text\" value=\"%s\" /><i> *If not used, leave it blank.In use 3-9 charactor</i></td>\n", config.trk_item);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>PATH:</b></td>\n");
-	strcat(html, "<td style=\"text-align: left;\">\n");
-	strcat(html, "<select name=\"trackerPath\" id=\"trackerPath\">\n");
+	data["object"] = config.trk_item;
+
+	JsonArray pathOptions = data["pathOptions"].to<JsonArray>();
 	for (uint8_t pthIdx = 0; pthIdx < PATH_LEN; pthIdx++)
 	{
-		if (config.trk_path == pthIdx)
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-		}
-		else
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%s</option>\n", pthIdx, PATH_NAME[pthIdx]);
-		}
-		strcat(html, tempHtml);
+		JsonObject o = pathOptions.add<JsonObject>();
+		o["value"] = pthIdx;
+		o["label"] = PATH_NAME[pthIdx];
+		o["selected"] = (config.trk_path == pthIdx);
 	}
-	strcat(html, "</select></td>\n");
-	// strcat(html, "<td style=\"text-align: left;\"><input maxlength=\"72\" size=\"72\" id=\"trackerPath\" name=\"trackerPath\" type=\"text\" value=\"" + String(config.trk_path) + "\" /></td>\n";
-	strcat(html, "</tr>\n");
 
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Text Comment:</b></td>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"25\" size=\"30\" id=\"trackerComment\" name=\"trackerComment\" type=\"text\" value=\"%s\" /></td>\n", config.trk_comment);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Text Status:</b></td>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"50\" size=\"60\" id=\"trkStatus\" name=\"trkStatus\" type=\"text\" value=\"%s\" />  Interval:<input min=\"0\" max=\"3600\" step=\"1\" name=\"trkSTSInv\" type=\"number\" value=\"%d\" />Sec.</td>\n", config.trk_status, config.trk_sts_interval);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Smart Beacon:</b></td>\n");
-	char smartBcnEnFlag[10] = "";
-	if (config.trk_smartbeacon)
-		strcpy(smartBcnEnFlag, "checked");
+	data["comment"] = config.trk_comment;
+	data["status"] = config.trk_status;
+	data["statusInterval"] = config.trk_sts_interval;
+	data["smartBcnEn"] = config.trk_smartbeacon;
+	data["compressEn"] = config.trk_compress;
 
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" id=\"smartBcnEnable\" name=\"smartBcnEnable\" onclick=\"onSmartCheck()\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch use to smart beacon mode</i></label></td>\n", smartBcnEnFlag);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Compress:</b></td>\n");
-	char compressEnFlag[10] = "";
-	if (config.trk_compress)
-		strcpy(compressEnFlag, "checked");
-
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"compressEnable\" value=\"OK\" %s><span class=\"slider round\"></span></label><label style=\"vertical-align: bottom;font-size: 8pt;\"><i> *Switch compress packet</i></label></td>\n", compressEnFlag);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Mic-E Type:</b></td>\n");
-	strcat(html, "<td style=\"text-align: left;\">\n");
-	strcat(html, "<select name=\"trkMicEType\" id=\"trkMicEType\">\n");
-	for (uint8_t micEIdx = 0; micEIdx < 8; micEIdx++)
+	JsonArray micEOptions = data["micEOptions"].to<JsonArray>();
+	for (uint8_t micEIdx = 0; micEIdx < 9; micEIdx++)
 	{
-		if (config.trk_mice_type == micEIdx)
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%s</option>\n", micEIdx, MIC_E_MSG[micEIdx]);
-		}
-		else
-		{
-			snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">%s</option>\n", micEIdx, MIC_E_MSG[micEIdx]);
-		}
-		strcat(html, tempHtml);
+		JsonObject o = micEOptions.add<JsonObject>();
+		o["value"] = micEIdx;
+		o["label"] = MIC_E_MSG[micEIdx];
+		o["selected"] = (config.trk_mice_type == micEIdx);
 	}
-	strcat(html, "</select><label style=\"vertical-align: bottom;font-size: 8pt;\"><i>*Support if Compress is enabled and not use Item/Obj,Time Stamp</i></label></td>\n");
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Time Stamp:</b></td>\n");
 
-	char timeStampFlag[10] = "";
-	if (config.trk_timestamp)
-		strcpy(timeStampFlag, "checked");
+	data["timestamp"] = config.trk_timestamp;
+	data["pos2RF"] = config.trk_loc2rf;
+	data["pos2INET"] = config.trk_loc2inet;
+	data["optCST"] = config.trk_log;
+	data["optAlt"] = config.trk_altitude;
+	data["optBat"] = config.trk_rssi;
+
+	data["posInterval"] = config.trk_interval;
+	data["posFix"] = !config.trk_gps;
+	data["posGPS"] = config.trk_gps;
+
+	char cbuf[2];
+	auto tableFor = [](char first) -> const char *
 	{
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"trackerTimeStamp\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", timeStampFlag);
-		strcat(html, tempHtml);
-	}
-	strcat(html, "</tr>\n");
-	char trackerPos2RFFlag[10] = "";
-	char trackerPos2INETFlag[10] = "";
-	if (config.trk_loc2rf)
-		strcpy(trackerPos2RFFlag, "checked");
-	if (config.trk_loc2inet)
-		strcpy(trackerPos2INETFlag, "checked");
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerPos2RF\" value=\"OK\" %s/>RF <input type=\"checkbox\" name=\"trackerPos2INET\" value=\"OK\" %s/>Internet </td></tr>\n", trackerPos2RFFlag, trackerPos2INETFlag);
-	strcat(html, tempHtml);
-	char trackeroptRSSIFlag[10] = "";
-	char trackerOptSNRFlag[10] = "";
-	char trackerOptFreqErrFlag[10] = "";
-	char trackerOptSatFlag[10] = "";
-	char trackerOptAltFlag[10] = "";
-	char trackerOptCSTFlag[10] = "";
-	if (config.trk_rssi)
-		strcpy(trackeroptRSSIFlag, "checked");
-	if (config.trk_snr)
-		strcpy(trackerOptSNRFlag, "checked");
-	if (config.trk_freqerr)
-		strcpy(trackerOptFreqErrFlag, "checked");
-	if (config.trk_sat)
-		strcpy(trackerOptSatFlag, "checked");
-	if (config.trk_altitude)
-		strcpy(trackerOptAltFlag, "checked");
-	if (config.trk_log)
-		strcpy(trackerOptCSTFlag, "checked");
+		if (first == 92)
+			return "2";
+		return "1"; // default and table==47 ('/') both map to "1", matching original
+	};
 
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\"><b>Option:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerOptCST\" value=\"OK\" %s/>Telemetry <input type=\"checkbox\" name=\"trackerOptAlt\" value=\"OK\" %s/>Altutude <input type=\"checkbox\" name=\"trackeroptRSSI\" value=\"OK\" %s/>RSSI Request  <input type=\"checkbox\" name=\"trackerOptSNR\" value=\"OK\" %s/>SNR Request <input type=\"checkbox\" name=\"trackerOptFreqErr\" value=\"OK\" %s/>Frequency Error Request</td></tr>\n",
-			 trackerOptCSTFlag, trackerOptAltFlag, trackeroptRSSIFlag, trackerOptSNRFlag, trackerOptFreqErrFlag);
-	strcat(html, tempHtml);
+	cbuf[0] = config.trk_symbol[0];
+	cbuf[1] = 0;
+	data["symTable"] = cbuf;
+	cbuf[0] = config.trk_symbol[1];
+	cbuf[1] = 0;
+	data["symSymbol"] = cbuf;
+	data["symImgNum"] = (int)config.trk_symbol[1];
+	data["symImgTable"] = tableFor(config.trk_symbol[0]);
 
-	strcat(html, "<tr>");
-	strcat(html, "<td align=\"right\"><b>POSITION:</b></td>\n");
-	strcat(html, "<td align=\"center\">\n");
-	strcat(html, "<table>");
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"3600\" step=\"1\" id=\"trackerPosInv\" name=\"trackerPosInv\" type=\"number\" value=\"%d\" />Sec.</label></td></tr>", config.trk_interval);
-	strcat(html, tempHtml);
-	char trackerPosFixFlag[20] = "";
-	char trackerPosGPSFlag[20] = "";
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%.5f", config.trk_lat);
+	data["lat"] = buf;
+	snprintf(buf, sizeof(buf), "%.5f", config.trk_lon);
+	data["lon"] = buf;
+	snprintf(buf, sizeof(buf), "%.2f", config.trk_alt);
+	data["alt"] = buf;
 
-	if (config.trk_gps)
-		strcpy(trackerPosGPSFlag, "checked=\"checked\"");
-	else
-		strcpy(trackerPosFixFlag, "checked=\"checked\"");
+	data["smartbeaconDisabled"] = !config.trk_smartbeacon;
 
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"trackerPosSel\" value=\"0\" %s/>Fix <input type=\"radio\" name=\"trackerPosSel\" value=\"1\" %s/>GPS </td></tr>\n",
-			 trackerPosFixFlag, trackerPosGPSFlag);
-	strcat(html, tempHtml);
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\">Symbol Icon:</td>\n");
-	char table[5] = "1";
-	if (config.trk_symbol[0] == 47)
-		strcpy(table, "1");
-	if (config.trk_symbol[0] == 92)
-		strcpy(table, "2");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"trackerTable\" name=\"trackerTable\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"trackerSymbol\" name=\"trackerSymbol\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"trackerImgSymbol\" onclick=\"openWindowSymbol(0);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-%s.png\"> <i>*Click icon for select symbol</i></td>\n",
-			 config.trk_symbol[0], config.trk_symbol[1], (int)config.trk_symbol[1], table);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"trackerPosLat\" name=\"trackerPosLat\" type=\"number\" value=\"%.5f\" />degrees (positive for North, negative for South)</td></tr>\n", config.trk_lat);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"trackerPosLon\" name=\"trackerPosLon\" type=\"number\" value=\"%.5f\" />degrees (positive for East, negative for West)</td></tr>\n", config.trk_lon);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Altitude:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"10000\" step=\"0.1\" id=\"trackerPosAlt\" name=\"trackerPosAlt\" type=\"number\" value=\"%.2f\" /> meter. *Value 0 is not send height</td></tr>\n", config.trk_alt);
-	strcat(html, tempHtml);
-	strcat(html, "</table></td>");
-	strcat(html, "</tr>\n");
+	cbuf[0] = config.trk_symmove[0];
+	cbuf[1] = 0;
+	data["moveTable"] = cbuf;
+	cbuf[0] = config.trk_symmove[1];
+	cbuf[1] = 0;
+	data["moveSymbol"] = cbuf;
+	data["moveImgNum"] = (int)config.trk_symmove[1];
+	data["moveImgTable"] = tableFor(config.trk_symmove[0]);
 
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Smart Beacon:</b></td>\n");
-	strcat(html, "<td align=\"center\">\n");
-	if (config.trk_smartbeacon)
-		strcat(html, "<fieldset id=\"smartbcnGrp\">\n");
-	else
-		strcat(html, "<fieldset id=\"smartbcnGrp\" disabled>\n");
-	strcat(html, "<legend>Smart beacon configuration</legend>\n<table>");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\">Move Symbol:</td>\n");
-	strcpy(table, "1");
-	if (config.trk_symmove[0] == 47)
-		strcpy(table, "1");
-	if (config.trk_symmove[0] == 92)
-		strcpy(table, "2");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"moveTable\" name=\"moveTable\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"moveSymbol\" name=\"moveSymbol\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"moveImgSymbol\" onclick=\"openWindowSymbol(1);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-%s.png\"> <i>*Click icon for select MOVE symbol</i></td>\n",
-			 config.trk_symmove[0], config.trk_symmove[1], (int)config.trk_symmove[1], table);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\">Stop Symbol:</td>\n");
-	strcpy(table, "1");
-	if (config.trk_symstop[0] == 47)
-		strcpy(table, "1");
-	if (config.trk_symstop[0] == 92)
-		strcpy(table, "2");
-	snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"stopTable\" name=\"stopTable\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"stopSymbol\" name=\"stopSymbol\" type=\"text\" value=\"%c\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"stopImgSymbol\" onclick=\"openWindowSymbol(2);\" src=\"http://aprs.nakhonthai.net/symbols/icons/%d-%s.png\"> <i>*Click icon for select STOP symbol</i></td>\n",
-			 config.trk_symstop[0], config.trk_symstop[1], (int)config.trk_symstop[1], table);
-	strcat(html, tempHtml);
-	strcat(html, "</tr>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">High Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"10\" max=\"1000\" step=\"1\" id=\"hspeed\" name=\"hspeed\" type=\"number\" value=\"%d\" /> km/h</td></tr>\n", config.trk_hspeed);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Low Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"250\" step=\"1\" id=\"lspeed\" name=\"lspeed\" type=\"number\" value=\"%d\" /> km/h</td></tr>\n", config.trk_lspeed);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Slow Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"60\" max=\"3600\" step=\"1\" id=\"slowInterval\" name=\"slowInterval\" type=\"number\" value=\"%d\" /> Sec.</td></tr>\n", config.trk_slowinterval);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Max Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"10\" max=\"255\" step=\"1\" id=\"maxInterval\" name=\"maxInterval\" type=\"number\" value=\"%d\" /> Sec.</td></tr>\n", config.trk_maxinterval);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Min Interval:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"100\" step=\"1\" id=\"minInterval\" name=\"minInterval\" type=\"number\" value=\"%d\" /> Sec.</td></tr>\n", config.trk_mininterval);
-	strcat(html, tempHtml);
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Min Angle:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"359\" step=\"1\" id=\"minAngle\" name=\"minAngle\" type=\"number\" value=\"%d\" /> Degree.</td></tr>\n", config.trk_minangle);
-	strcat(html, tempHtml);
+	cbuf[0] = config.trk_symstop[0];
+	cbuf[1] = 0;
+	data["stopTable"] = cbuf;
+	cbuf[0] = config.trk_symstop[1];
+	cbuf[1] = 0;
+	data["stopSymbol"] = cbuf;
+	data["stopImgNum"] = (int)config.trk_symstop[1];
+	data["stopImgTable"] = tableFor(config.trk_symstop[0]);
 
-	strcat(html, "</table></fieldset></tr>");
+	data["hspeed"] = config.trk_hspeed;
+	data["lspeed"] = config.trk_lspeed;
+	data["slowInterval"] = config.trk_slowinterval;
+	data["maxInterval"] = config.trk_maxinterval;
+	data["minInterval"] = config.trk_mininterval;
+	data["minAngle"] = config.trk_minangle;
 
-	strcat(html, "<tr>\n");
-	strcat(html, "<td align=\"right\"><b>Telemetry:</b><br />(v=0->8280)</td>\n");
-	strcat(html, "<td align=\"center\"><table>\n");
-	snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">Interval:</td><td style=\"text-align: left;\"><input min=\"0\" max=\"1000\" step=\"1\" id=\"trkTlmInv\" name=\"trkTlmInv\" type=\"number\" value=\"%d\" /> *Number of packets interval,<i>Example: 0 not send,1 send every packet</i></label></td></tr>", config.trk_tlm_interval);
-	strcat(html, tempHtml);
+	data["tlmInterval"] = config.trk_tlm_interval;
+
+	JsonArray tlmChannels = data["tlmChannels"].to<JsonArray>();
 	for (int ax = 0; ax < 5; ax++)
 	{
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td align=\"right\"><b>CH A%d:</b></td>\n", ax + 1);
-		strcat(html, tempHtml);
-		strcat(html, "<td align=\"center\">\n");
-		strcat(html, "<table>");
+		JsonObject c = tlmChannels.add<JsonObject>();
+		c["idx"] = ax;
+		c["num"] = ax + 1;
+		c["param"] = config.trk_tlm_PARM[ax];
+		c["unit"] = config.trk_tlm_UNIT[ax];
+		c["precision"] = config.trk_tlm_precision[ax];
+		snprintf(buf, sizeof(buf), "%.5f", config.trk_tlm_EQNS[ax][0]);
+		c["eqnsA"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.trk_tlm_EQNS[ax][1]);
+		c["eqnsB"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.trk_tlm_EQNS[ax][2]);
+		c["eqnsC"] = buf;
+		snprintf(buf, sizeof(buf), "%.5f", config.trk_tlm_offset[ax]);
+		c["offset"] = buf;
 
-		strcat(html, "<tr><td style=\"text-align: right;\">Sensor:</td>\n");
-		strcat(html, "<td style=\"text-align: left;\">CH: ");
-		snprintf(tempHtml, sizeof(tempHtml), "<select name=\"sensorCH%d\" id=\"sensorCH%d\">\n", ax, ax);
-		strcat(html, tempHtml);
+		JsonArray sensorOptions = c["sensorOptions"].to<JsonArray>();
 		for (uint8_t idx = 0; idx < 11; idx++)
 		{
-			if (idx == 0)
-			{
-				if (config.trk_tlm_sensor[ax] == idx)
-				{
-					snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>NONE</option>\n", idx);
-				}
-				else
-				{
-					snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">NONE</option>\n", idx);
-				}
-			}
-			else
-			{
-				if (config.trk_tlm_sensor[ax] == idx)
-				{
-					snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>SENSOR#%d</option>\n", idx, idx);
-				}
-				else
-				{
-					snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\">SENSOR#%d</option>\n", idx, idx);
-				}
-			}
-			strcat(html, tempHtml);
+			JsonObject o = sensorOptions.add<JsonObject>();
+			o["value"] = idx;
+			o["label"] = (idx == 0) ? String("NONE") : ("SENSOR#" + String(idx));
+			o["selected"] = (config.trk_tlm_sensor[ax] == idx);
 		}
-		strcat(html, "</select></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Name: <input maxlength=\"10\" size=\"8\" name=\"param%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.trk_tlm_PARM[ax]);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Unit: <input maxlength=\"8\" size=\"5\" name=\"unit%d\" type=\"text\" value=\"%s\" /></td>\n", ax, config.trk_tlm_UNIT[ax]);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Precision: <input min=\"0\" max=\"5\" step=\"1\" type=\"number\" style=\"width: 2em\" name=\"precision%d\" type=\"text\" value=\"%d\" onchange=\"selPrecision(%d)\" /></td></tr>\n", ax, config.trk_tlm_precision[ax], ax);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<tr><td style=\"text-align: right;\">EQNS:</td><td colspan=\"3\" style=\"text-align: left;\">a:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%da\" type=\"number\" value=\"%.5f\" />  b:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%db\" type=\"number\" value=\"%.5f\" /> c:<input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" name=\"eqns%dc\" type=\"number\" value=\"%.5f\" /> (av<sup>2</sup>+bv+c) </td>\n",
-				 ax, config.trk_tlm_EQNS[ax][0], ax, config.trk_tlm_EQNS[ax][1], ax, config.trk_tlm_EQNS[ax][2]);
-		strcat(html, tempHtml);
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\">Offset: <input min=\"-9999\" max=\"9999\" step=\"0.00001\" style=\"width: 5em\" type=\"number\" name=\"offset%d\" type=\"text\" value=\"%.5f\"  onchange=\"selOffset(%d)\" /></td></tr>\n", ax, config.trk_tlm_offset[ax], ax);
-		strcat(html, tempHtml);
-		strcat(html, "</table></td>");
-		strcat(html, "</tr>\n");
 	}
-	strcat(html, "</table></td></tr>\n");
-	strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-	strcat(html, "<div><button class=\"button\" type='submit' id='submitTRACKER'  name=\"commitTRACKER\"> Apply Change </button></div>\n");
-	strcat(html, "<input type=\"hidden\" name=\"commitTRACKER\"/>\n");
-	strcat(html, "</td></tr></table><br />\n");
-	strcat(html, "</form><br />");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-	response->addHeader("Tracker", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(html); // Free the allocated memory
+	delay(1);
+	esp_task_wdt_reset();
+	String html_str = renderTemplate(TRACKER_TEMPLATE, data.as<JsonVariant>());
+	// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+	sendHtmlChunked(request, html_str, "Tracker");
 }
+
+static const char *WIRELESS_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"if(e.currentTarget.id===\"formBluetooth\") document.getElementById(\"submitBluetooth\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formWiFiAP\") document.getElementById(\"submitWiFiAP\").disabled=true;\n"
+	"if(e.currentTarget.id===\"formWiFiClient\") document.getElementById(\"submitWiFiClient\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/wireless',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"</script>\n"
+	"<form id='formWiFiAP' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>WiFi Access Point</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\" width=\"120\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wifiAP\" value=\"OK\" {{#if wifiAPEnabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi AP SSID:</b></td>\n"
+	"<td style=\"text-align: left;\"><input size=\"32\" maxlength=\"32\" class=\"form-control\" id=\"wifi_ssidAP\" name=\"wifi_ssidAP\" type=\"text\" value=\"{{apSSID}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi AP PASSWORD:</b></td>\n"
+	"<td style=\"text-align: left;\"><input size=\"63\" maxlength=\"63\" class=\"form-control\" id=\"wifi_passAP\" name=\"wifi_passAP\" type=\"password\" value=\"{{apPass}}\" /></td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitWiFiAP'  name=\"commitWiFiAP\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitWiFiAP\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />"
+	"<br />\n"
+	"<form id='formWiFiClient' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>WiFi Multi Station</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi STA Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wificlient\" value=\"OK\" {{#if wifiClientEnabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi RF Power:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"wifi_pwr\" id=\"wifi_pwr\">\n"
+	"{{#each wifiPowerOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n"
+	"{{/each}}"
+	"</select>\n"
+	"</td>\n"
+	"</tr>\n"
+	"{{#each stations}}<tr>\n"
+	"<td align=\"right\"><b>Station #{{num}}:</b></td>\n"
+	"<td align=\"center\">\n"
+	"<fieldset id=\"filterDispGrp{{num}}\">\n"
+	"<legend>WiFi Station #{{num}}</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
+	"<tr style=\"background:unset;\">"
+	"<td align=\"right\" width=\"120\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wifiStation{{n}}\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi SSID:</b></td>\n"
+	"<td style=\"text-align: left;\"><input size=\"32\" maxlength=\"32\" name=\"wifi_ssid{{n}}\" type=\"text\" value=\"{{ssid}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>WiFi PASSWORD:</b></td>\n"
+	"<td style=\"text-align: left;\"><input size=\"63\" maxlength=\"63\" name=\"wifi_pass{{n}}\" type=\"password\" value=\"{{pass}}\" /></td>\n"
+	"</tr>\n"
+	"</tr></table></fieldset>\n"
+	"</td></tr>\n"
+	"{{/each}}"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitWiFiClient'  name=\"commitWiFiClient\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitWiFiClient\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form><br />"
+	"{{#if bluetooth}}"
+	"<br />\n"
+	"<form id='formBluetooth' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>Bluetooth Master (BLE)</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"btMaster\" value=\"OK\" {{#if btEnabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>NAME:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"20\" id=\"bt_name\" name=\"bt_name\" type=\"text\" value=\"{{btName}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>PIN:</b></td>\n"
+	"<td style=\"text-align: left;\"><input min=\"0\" max=\"999999\" id=\"bt_pin\" name=\"bt_pin\" type=\"number\" value=\"{{btPin}}\" /></td> <i>*Value 0 is no auth.</i>\n"
+	"</tr>\n"
+	"{{#if btUuidSupport}}"
+	"<tr>\n"
+	"<td align=\"right\"><b>UUID:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid\" name=\"bt_uuid\" type=\"text\" value=\"{{btUuid}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>UUID RX:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid_rx\" name=\"bt_uuid_rx\" type=\"text\" value=\"{{btUuidRx}}\" /></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>UUID TX:</b></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid_tx\" name=\"bt_uuid_tx\" type=\"text\" value=\"{{btUuidTx}}\" /></td>\n"
+	"</tr>\n"
+	"{{/if}}"
+	"<td align=\"right\"><b>MODE:</b></td>\n"
+	"<td style=\"text-align: left;\">\n"
+	"<select name=\"bt_mode\" id=\"bt_mode\">\n"
+	"<option value=\"0\" {{#if btModeOff}}selected{{/if}}>NONE</option>\n"
+	"<option value=\"1\" {{#if btModeTNC2}}selected{{/if}}>TNC2</option>\n"
+	"<option value=\"2\" {{#if btModeKISS}}selected{{/if}}>KISS</option>\n"
+	"</select>\n"
+	"<label style=\"font-size: 8pt;text-align: right;\">*See the following for generating UUIDs: <a href=\"https://www.uuidgenerator.net\" target=\"_blank\">https://www.uuidgenerator.net</a></label></td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">\n"
+	"<div><button class=\"button\" type='submit' id='submitBluetooth'  name=\"commitBluetooth\"> Apply Change </button></div>\n"
+	"<input type=\"hidden\" name=\"commitBluetooth\"/>\n"
+	"</td></tr></table><br />\n"
+	"</form>"
+	"{{/if}}";
 
 void handle_wireless(AsyncWebServerRequest *request)
 {
@@ -10868,14 +10310,14 @@ void handle_wireless(AsyncWebServerRequest *request)
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.wifi_ap_ssid, request->arg(i).c_str());
+					strlcpy(config.wifi_ap_ssid, request->arg(i).c_str(), sizeof(config.wifi_ap_ssid));
 				}
 			}
 			if (request->argName(i) == "wifi_passAP")
 			{
 				if (request->arg(i) != "")
 				{
-					strcpy(config.wifi_ap_pass, request->arg(i).c_str());
+					strlcpy(config.wifi_ap_pass, request->arg(i).c_str(), sizeof(config.wifi_ap_pass));
 				}
 			}
 		}
@@ -11030,317 +10472,153 @@ void handle_wireless(AsyncWebServerRequest *request)
 	#endif
 	else
 	{
-		// Allocate initial memory for HTML content
-		char tempHtml[256];
-		char *html = allocateStringMemory(12000); // Start with 12KB buffer
-		if (!html)
-		{
-			request->send(500, "text/html", "Memory allocation failed");
-			return;
-		}
-		strcpy(html, "<script type=\"text/javascript\">\n");
-		strcat(html, "$('form').submit(function (e) {\n");
-		strcat(html, "e.preventDefault();\n");
-		strcat(html, "var data = new FormData(e.currentTarget);\n");
-		strcat(html, "if(e.currentTarget.id===\"formBluetooth\") document.getElementById(\"submitBluetooth\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formWiFiAP\") document.getElementById(\"submitWiFiAP\").disabled=true;\n");
-		strcat(html, "if(e.currentTarget.id===\"formWiFiClient\") document.getElementById(\"submitWiFiClient\").disabled=true;\n");
-		strcat(html, "$.ajax({\n");
-		strcat(html, "url: '/wireless',\n");
-		strcat(html, "type: 'POST',\n");
-		strcat(html, "data: data,\n");
-		strcat(html, "contentType: false,\n");
-		strcat(html, "processData: false,\n");
-		strcat(html, "success: function (data) {\n");
-		strcat(html, "alert(\"Submited Successfully\");\n");
-		strcat(html, "},\n");
-		strcat(html, "error: function (data) {\n");
-		strcat(html, "alert(\"An error occurred.\");\n");
-		strcat(html, "}\n");
-		strcat(html, "});\n");
-		strcat(html, "});\n");
-		strcat(html, "</script>\n");
-		/************************ WiFi AP **************************/
-		strcat(html, "<form id='formWiFiAP' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// strcat(html, "<h2>WiFi Access Point</h2>\n");
-		strcat(html, "<table>\n");
-		// strcat(html, "<tr>\n");
-		// strcat(html, "<th width=\"200\"><span><b>Setting</b></span></th>\n");
-		// strcat(html, "<th><span><b>Value</b></span></th>\n");
-		// strcat(html, "</tr>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>WiFi Access Point</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\" width=\"120\"><b>Enable:</b></td>\n");
-		const char *wifiAPEnFlag = (config.wifi_mode & WIFI_AP_FIX) ? "checked" : "";
-		{
-			char *temp_flag = allocateStringMemory(512);
-			if (temp_flag)
-			{
-				snprintf(temp_flag, 512, "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wifiAP\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", wifiAPEnFlag);
-				strcat(html, temp_flag);
-				free(temp_flag);
-			}
-		}
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>WiFi AP SSID:</b></td>\n");
-		{
-			char *temp_ssid = allocateStringMemory(512);
-			if (temp_ssid)
-			{
-				snprintf(temp_ssid, 512, "<td style=\"text-align: left;\"><input size=\"32\" maxlength=\"32\" class=\"form-control\" id=\"wifi_ssidAP\" name=\"wifi_ssidAP\" type=\"text\" value=\"%s\" /></td>\n", config.wifi_ap_ssid);
-				strcat(html, temp_ssid);
-				free(temp_ssid);
-			}
-		}
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>WiFi AP PASSWORD:</b></td>\n");
-		{
-			char *temp_pass = allocateStringMemory(512);
-			if (temp_pass)
-			{
-				snprintf(temp_pass, 512, "<td style=\"text-align: left;\"><input size=\"63\" maxlength=\"63\" class=\"form-control\" id=\"wifi_passAP\" name=\"wifi_passAP\" type=\"password\" value=\"%s\" /></td>\n", config.wifi_ap_pass);
-				strcat(html, temp_pass);
-				free(temp_pass);
-			}
-		}
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitWiFiAP'  name=\"commitWiFiAP\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitWiFiAP\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
-		/************************ WiFi Client **************************/
-		strcat(html, "<br />\n");
-		strcat(html, "<form id='formWiFiClient' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		strcat(html, "<table>\n");
-		strcat(html, "<th colspan=\"2\"><span><b>WiFi Multi Station</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>WiFi STA Enable:</b></td>\n");
-		String wifiClientEnFlag = "";
-		if (config.wifi_mode & WIFI_STA_FIX)
-			wifiClientEnFlag = "checked";
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wificlient\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", wifiClientEnFlag.c_str());
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>WiFi RF Power:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"wifi_pwr\" id=\"wifi_pwr\">\n");
+		JsonDocument data;
+		data["wifiAPEnabled"] = (config.wifi_mode & WIFI_AP_FIX) != 0;
+		data["apSSID"] = config.wifi_ap_ssid;
+		data["apPass"] = config.wifi_ap_pass;
+		data["wifiClientEnabled"] = (config.wifi_mode & WIFI_STA_FIX) != 0;
+
+		JsonArray wifiPowerOptions = data["wifiPowerOptions"].to<JsonArray>();
 		for (int i = 0; i < 12; i++)
 		{
-			if (config.wifi_power == (int8_t)wifiPwr[i][0])
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" selected>%.1f dBm</option>\n", (int8_t)wifiPwr[i][0], wifiPwr[i][1]);
-			else
-				snprintf(tempHtml, sizeof(tempHtml), "<option value=\"%d\" >%.1f dBm</option>\n", (int8_t)wifiPwr[i][0], wifiPwr[i][1]);
-			strcat(html, tempHtml);
+			JsonObject o = wifiPowerOptions.add<JsonObject>();
+			o["value"] = (int8_t)wifiPwr[i][0];
+			char buf[16];
+			snprintf(buf, sizeof(buf), "%.1f dBm", wifiPwr[i][1]);
+			o["label"] = buf;
+			o["selected"] = (config.wifi_power == (int8_t)wifiPwr[i][0]);
 		}
-		strcat(html, "</select>\n");
-		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
+
+		JsonArray stations = data["stations"].to<JsonArray>();
 		for (int n = 0; n < 5; n++)
 		{
-			strcat(html, "<tr>\n");
-			snprintf(tempHtml, sizeof(tempHtml), "<td align=\"right\"><b>Station #%d:</b></td>\n", n + 1);
-			strcat(html, tempHtml);
-			strcat(html, "<td align=\"center\">\n");
-			snprintf(tempHtml, sizeof(tempHtml), "<fieldset id=\"filterDispGrp%d\">\n", n + 1);
-			strcat(html, tempHtml);
-			snprintf(tempHtml, sizeof(tempHtml), "<legend>WiFi Station #%d</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">", n + 1);
-			strcat(html, tempHtml);
-			strcat(html, "<tr style=\"background:unset;\">");
-			// strcat(html, "<tr>\n";
-			strcat(html, "<td align=\"right\" width=\"120\"><b>Enable:</b></td>\n");
-			char wifiClientEnFlag[10];
-			if (config.wifi_sta[n].enable)
-				strcpy(wifiClientEnFlag, "checked");
-			else
-				strcpy(wifiClientEnFlag, "");
-
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"wifiStation%d\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", n, wifiClientEnFlag);
-			strcat(html, tempHtml);
-			strcat(html, "</tr>\n");
-			strcat(html, "<tr>\n");
-			strcat(html, "<td align=\"right\"><b>WiFi SSID:</b></td>\n");
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input size=\"32\" maxlength=\"32\" name=\"wifi_ssid%d\" type=\"text\" value=\"%s\" /></td>\n", n, config.wifi_sta[n].wifi_ssid);
-			strcat(html, tempHtml);
-			strcat(html, "</tr>\n");
-			strcat(html, "<tr>\n");
-			strcat(html, "<td align=\"right\"><b>WiFi PASSWORD:</b></td>\n");
-			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input size=\"63\" maxlength=\"63\" name=\"wifi_pass%d\" type=\"password\" value=\"%s\" /></td>\n", n, config.wifi_sta[n].wifi_pass);
-			strcat(html, tempHtml);
-			strcat(html, "</tr>\n");
-			strcat(html, "</tr></table></fieldset>\n");
-			strcat(html, "</td></tr>\n");
+			JsonObject s = stations.add<JsonObject>();
+			s["n"] = n;
+			s["num"] = n + 1;
+			s["enabled"] = config.wifi_sta[n].enable;
+			s["ssid"] = config.wifi_sta[n].wifi_ssid;
+			s["pass"] = config.wifi_sta[n].wifi_pass;
 		}
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitWiFiClient'  name=\"commitWiFiClient\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitWiFiClient\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form><br />");
-		/************************ Bluetooth **************************/
+
 #ifdef BLUETOOTH
-		strcat(html, "<br />\n");
-		strcat(html, "<form id='formBluetooth' method=\"POST\" action='#' enctype='multipart/form-data'>\n");
-		// strcat(html, "<h2>Bluetooth Master (BLE)</h2>\n";
-		strcat(html, "<table>\n");
-		// strcat(html, "<tr>\n";
-		// strcat(html, "<th width=\"200\"><span><b>Setting</b></span></th>\n";
-		// strcat(html, "<th><span><b>Value</b></span></th>\n";
-		// strcat(html, "</tr>\n";
-		strcat(html, "<th colspan=\"2\"><span><b>Bluetooth Master (BLE)</b></span></th>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>Enable:</b></td>\n");
-
-		char btFlag[10];
-		if (config.bt_master)
-			strcpy(btFlag, "checked");
-		else
-			strcpy(btFlag, "");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"btMaster\" value=\"OK\" %s><span class=\"slider round\"></span></label></td>\n", btFlag);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>NAME:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"20\" id=\"bt_name\" name=\"bt_name\" type=\"text\" value=\"%s\" /></td>\n", config.bt_name);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>PIN:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input min=\"0\" max=\"999999\" id=\"bt_pin\" name=\"bt_pin\" type=\"number\" value=\"%d\" /></td> <i>*Value 0 is no auth.</i>\n", config.bt_pin);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		#if !defined(CONFIG_IDF_TARGET_ESP32)
-		strcat(html, "<tr>\n");		
-		strcat(html, "<td align=\"right\"><b>UUID:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid\" name=\"bt_uuid\" type=\"text\" value=\"%s\" /></td>\n", config.bt_uuid);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>UUID RX:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid_rx\" name=\"bt_uuid_rx\" type=\"text\" value=\"%s\" /></td>\n", config.bt_uuid_rx);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr>\n");
-		strcat(html, "<td align=\"right\"><b>UUID TX:</b></td>\n");
-		snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input maxlength=\"37\" size=\"38\" id=\"bt_uuid_tx\" name=\"bt_uuid_tx\" type=\"text\" value=\"%s\" /></td>\n", config.bt_uuid_tx);
-		strcat(html, tempHtml);
-		strcat(html, "</tr>\n");
-		#endif
-		strcat(html, "<td align=\"right\"><b>MODE:</b></td>\n");
-		strcat(html, "<td style=\"text-align: left;\">\n");
-		strcat(html, "<select name=\"bt_mode\" id=\"bt_mode\">\n");
-		const char *btModeOff = (config.bt_mode == 0) ? "selected" : "";
-		const char *btModeTNC2 = (config.bt_mode == 1) ? "selected" : "";
-		const char *btModeKISS = (config.bt_mode == 2) ? "selected" : "";
-		snprintf(tempHtml, sizeof(tempHtml), "<option value=\"0\" %s>NONE</option>\n<option value=\"1\" %s>TNC2</option>\n<option value=\"2\" %s>KISS</option>\n", btModeOff, btModeTNC2, btModeKISS);
-		strcat(html, tempHtml);
-		strcat(html, "</select>\n");
-
-		strcat(html, "<label style=\"font-size: 8pt;text-align: right;\">*See the following for generating UUIDs: <a href=\"https://www.uuidgenerator.net\" target=\"_blank\">https://www.uuidgenerator.net</a></label></td>\n");
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
-		strcat(html, "<div><button class=\"button\" type='submit' id='submitBluetooth'  name=\"commitBluetooth\"> Apply Change </button></div>\n");
-		strcat(html, "<input type=\"hidden\" name=\"commitBluetooth\"/>\n");
-		strcat(html, "</td></tr></table><br />\n");
-		strcat(html, "</form>");
+		data["bluetooth"] = true;
+		data["btEnabled"] = config.bt_master;
+		data["btName"] = config.bt_name;
+		data["btPin"] = config.bt_pin;
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+		data["btUuidSupport"] = true;
+		data["btUuid"] = config.bt_uuid;
+		data["btUuidRx"] = config.bt_uuid_rx;
+		data["btUuidTx"] = config.bt_uuid_tx;
+#else
+		data["btUuidSupport"] = false;
+#endif
+		data["btModeOff"] = (config.bt_mode == 0);
+		data["btModeTNC2"] = (config.bt_mode == 1);
+		data["btModeKISS"] = (config.bt_mode == 2);
+#else
+		data["bluetooth"] = false;
 #endif
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
-		response->addHeader("wifi", "content");
-		response->addHeader("Cache-Control", "no-cache");
-		request->send(response);
-		free(html); // Free the allocated memory
+		esp_task_wdt_reset();
+		String html_str = renderTemplate(WIRELESS_TEMPLATE, data.as<JsonVariant>());
+		// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+		sendHtmlChunked(request, html_str, "wifi");
 	}
 }
 
-extern bool afskSync;
-extern String lastPkgRaw;
-extern float rssi;
-extern float snr;
-extern float freqErr;
+// extern String lastPkgRaw;
+// extern float dBV;
+// extern int mVrms;
+//  void handle_realtime(AsyncWebServerRequest *request)
+//  {
+//  	// char jsonMsg[1000];
+//  	char *jsonMsg;
+//  	time_t timeStamp;
+//  	time(&timeStamp);
 
-void handle_realtime(AsyncWebServerRequest *request)
+// 	if (afskSync && (lastPkgRaw.length() > 5))
+// 	{
+// 		int input_length = lastPkgRaw.length();
+// 		jsonMsg = (char *)malloc((input_length * 2) + 200);
+// 		char *input_buffer = (char *)malloc(input_length + 2);
+// 		char *output_buffer = (char *)malloc(input_length * 2);
+// 		if (output_buffer)
+// 		{
+// 			// lastPkgRaw.toCharArray(input_buffer, lastPkgRaw.length(), 0);
+// 			memcpy(input_buffer, lastPkgRaw.c_str(), lastPkgRaw.length());
+// 			lastPkgRaw.clear();
+// 			encode_base64((unsigned char *)input_buffer, input_length, (unsigned char *)output_buffer);
+// 			// Serial.println(output_buffer);
+// 			sprintf(jsonMsg, "{\"Active\":\"1\",\"mVrms\":\"%d\",\"RAW\":\"%s\",\"timeStamp\":\"%li\"}", mVrms, output_buffer, timeStamp);
+// 			// Serial.println(jsonMsg);
+// 			free(input_buffer);
+// 			free(output_buffer);
+// 		}
+// 	}
+// 	else
+// 	{
+// 		jsonMsg = (char *)malloc(100);
+// 		if (afskSync)
+// 			sprintf(jsonMsg, "{\"Active\":\"1\",\"mVrms\":\"%d\",\"RAW\":\"REVDT0RFIEZBSUwh\",\"timeStamp\":\"%li\"}", mVrms, timeStamp);
+// 		else
+// 			sprintf(jsonMsg, "{\"Active\":\"0\",\"mVrms\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
+// 	}
+// 	afskSync = false;
+// 	request->send(200, "text/html", String(jsonMsg));
+
+// 	delay(100);
+// 	free(jsonMsg);
+// }
+
+// void handle_ws(String Raw,uint16_t mVrms)
+void handle_ws(char *Raw, size_t len, uint16_t mVrms)
 {
-	// char jsonMsg[1000];
+	if (ws.count() < 1)
+		return;
+
 	char *jsonMsg;
 	time_t timeStamp;
 	time(&timeStamp);
 
-	if (afskSync && (lastPkgRaw.length() > 5))
+	if (len > 5)
 	{
-		int input_length = lastPkgRaw.length();
-		jsonMsg = (char *)calloc((input_length * 2) + 100, sizeof(char));
-		char *input_buffer = (char *)calloc(input_length + 2, sizeof(char));
-		char *output_buffer = (char *)calloc(input_length * 2, sizeof(char));
-		if (output_buffer)
+		int input_length = len;
+		jsonMsg = (char *)calloc((input_length * 2) + 200, sizeof(char));
+		if (jsonMsg)
 		{
-			// lastPkgRaw.toCharArray(input_buffer, lastPkgRaw.length(), 0);
-			memcpy(input_buffer, lastPkgRaw.c_str(), lastPkgRaw.length());
-			lastPkgRaw.clear();
-			encode_base64((unsigned char *)input_buffer, input_length, (unsigned char *)output_buffer);
-			// Serial.println(output_buffer);
-			sprintf(jsonMsg, "{\"Active\":\"1\",\"rssi\":\"%d\",\"snr\":\"%d\",\"freqErr\":\"%d\",\"RAW\":\"%s\",\"timeStamp\":\"%li\"}", (int)rssi, (int)snr, (int)freqErr, output_buffer, timeStamp);
-			// Serial.println(jsonMsg);
-			free(input_buffer);
-			free(output_buffer);
+			char *input_buffer = (char *)calloc(input_length + 2, sizeof(char));
+			char *output_buffer = (char *)calloc(input_length * 2, sizeof(char));
+			if (output_buffer)
+			{
+				memset(input_buffer, 0, (input_length + 2));
+				memset(output_buffer, 0, (input_length * 2));
+				// lastPkgRaw.toCharArray(input_buffer, input_length, 0);
+				memcpy(input_buffer, Raw, len);
+				encode_base64((unsigned char *)input_buffer, input_length, (unsigned char *)output_buffer);
+				// Serial.println(output_buffer);
+				sprintf(jsonMsg, "{\"Active\":\"1\",\"mVrms\":\"%d\",\"RAW\":\"%s\",\"timeStamp\":\"%li\"}", mVrms, output_buffer, timeStamp);
+				// Serial.println(jsonMsg);
+				free(input_buffer);
+				free(output_buffer);
+			}
+			ws.textAll(jsonMsg);
+			free(jsonMsg);
 		}
 	}
 	else
 	{
-		jsonMsg = (char *)calloc(200, sizeof(char));
-		if (afskSync)
-			sprintf(jsonMsg, "{\"Active\":\"1\",\"rssi\":\"%d\",\"snr\":\"%d\",\"freqErr\":\"%d\",\"RAW\":\"REVDT0RFIEZBSUwh\",\"timeStamp\":\"%li\"}", (int)rssi, (int)snr, (int)freqErr, timeStamp);
-		else
-			sprintf(jsonMsg, "{\"Active\":\"0\",\"rssi\":\"-140\",\"snr\":\"0\",\"freqErr\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
-	}
-	afskSync = false;
-	request->send(200, "text/html", String(jsonMsg));
-
-	delay(100);
-	free(jsonMsg);
-}
-
-void handle_ws()
-{
-	// char jsonMsg[1000];
-	char *jsonMsg;
-	time_t timeStamp;
-	time(&timeStamp);
-
-	if (afskSync && (lastPkgRaw.length() > 5))
-	{
-		int input_length = lastPkgRaw.length();
-		jsonMsg = (char *)calloc((input_length * 2) + 100, sizeof(char));
-		char *input_buffer = (char *)calloc(input_length + 2, sizeof(char));
-		char *output_buffer = (char *)calloc(input_length * 2, sizeof(char));
-		if (output_buffer)
+		jsonMsg = (char *)calloc(300, sizeof(char));
+		if (jsonMsg)
 		{
-			memset(input_buffer, 0, (input_length + 2));
-			memset(output_buffer, 0, (input_length * 2));
-			// lastPkgRaw.toCharArray(input_buffer, input_length, 0);
-			memcpy(input_buffer, lastPkgRaw.c_str(), lastPkgRaw.length());
-			lastPkgRaw.clear();
-			encode_base64((unsigned char *)input_buffer, input_length, (unsigned char *)output_buffer);
-			// Serial.println(output_buffer);
-			sprintf(jsonMsg, "{\"Active\":\"1\",\"rssi\":\"%d\",\"snr\":\"%d\",\"freqErr\":\"%d\",\"RAW\":\"%s\",\"timeStamp\":\"%li\"}", (int)rssi, (int)snr, (int)freqErr, output_buffer, timeStamp);
-			// Serial.println(jsonMsg);
-			free(input_buffer);
-			free(output_buffer);
+			if (mVrms > 0)
+				sprintf(jsonMsg, "{\"Active\":\"1\",\"mVrms\":\"%d\",\"RAW\":\"REVDT0RFIEZBSUwh\",\"timeStamp\":\"%li\"}", mVrms, timeStamp);
+			else
+				sprintf(jsonMsg, "{\"Active\":\"0\",\"mVrms\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
+			ws.textAll(jsonMsg);
+			free(jsonMsg);
 		}
 	}
-	else
-	{
-		jsonMsg = (char *)calloc(200, sizeof(char));
-		if (afskSync)
-			sprintf(jsonMsg, "{\"Active\":\"1\",\"rssi\":\"%d\",\"snr\":\"%d\",\"freqErr\":\"%d\",\"RAW\":\"REVDT0RFIEZBSUwh\",\"timeStamp\":\"%li\"}", (int)rssi, (int)snr, (int)freqErr, timeStamp);
-		else
-			sprintf(jsonMsg, "{\"Active\":\"0\",\"rssi\":\"-140\",\"snr\":\"0\",\"freqErr\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
-	}
-	afskSync = false;
-	ws.textAll(jsonMsg);
-	free(jsonMsg);
 }
 
 void handle_ws_gnss(char *nmea, size_t size)
@@ -11350,18 +10628,27 @@ void handle_ws_gnss(char *nmea, size_t size)
 
 	time_t timeStamp;
 	time(&timeStamp);
-
-	unsigned int output_length = encode_base64_length(size);
-	unsigned char nmea_enc[output_length];
-	// char jsonMsg[output_length + 200];
+	// unsigned int output_length = encode_base64_length(size);
+	// unsigned char nmea_enc[output_length];
+	// char jsonMsg[output_length + 100];
 	// encode_base64((unsigned char *)nmea, size, (unsigned char *)nmea_enc);
-	// sprintf(jsonMsg, "{\"en\":\"%d\",\"lat\":\"%.5f\",\"lng\":\"%.5f\",\"alt\":\"%.2f\",\"spd\":\"%.2f\",\"csd\":\"%.1f\",\"hdop\":\"%.2f\",\"sat\":\"%d\",\"time\":\"%d\",\"timeStamp\":\"%li\",\"RAW\":\"%s\"}", (int)config.gnss_enable, gps.location.lat(), gps.location.lng(), gps.altitude.meters(), gps.speed.kmph(), gps.course.deg(), gps.hdop.hdop(), gps.satellites.value(), gps.time.value(), timeStamp, nmea_enc);
-	char jsonMsg[output_length + 100];
-	encode_base64((unsigned char *)nmea, size, (unsigned char *)nmea_enc);
-	sprintf(jsonMsg, "{\"en\":\"%d\",\"lat\":\"%.5f\",\"lng\":\"%.5f\",\"alt\":\"%.2f\",\"spd\":\"%.2f\",\"csd\":\"%.1f\",\"hdop\":\"%.2f\",\"sat\":\"%d\",\"time\":\"%d\",\"timeStamp\":\"%li\",\"RAW\":\"", (int)config.gnss_enable, gps.location.lat(), gps.location.lng(), gps.altitude.meters(), gps.speed.kmph(), gps.course.deg(), gps.hdop.hdop(), gps.satellites.value(), gps.time.value(), timeStamp);
-	strncat(jsonMsg, (const char *)nmea_enc, output_length);
-	strcat(jsonMsg, "\"}");
-	ws_gnss.textAll(jsonMsg);
+	// sprintf(jsonMsg, "{\"en\":\"%d\",\"lat\":\"%.5f\",\"lng\":\"%.5f\",\"alt\":\"%.2f\",\"spd\":\"%.2f\",\"csd\":\"%.1f\",\"hdop\":\"%.2f\",\"sat\":\"%d\",\"time\":\"%d\",\"timeStamp\":\"%li\",\"RAW\":\"", (int)config.gnss_enable, gps.location.lat(), gps.location.lng(), gps.altitude.meters(), gps.speed.kmph(), gps.course.deg(), gps.hdop.hdop(), gps.satellites.value(), gps.time.value(), timeStamp);
+	// strncat(jsonMsg, (const char *)nmea_enc, output_length);
+	// strcat(jsonMsg, "\"}");
+	unsigned int output_length = encode_base64_length(size);
+	unsigned char *nmea_enc = (unsigned char *)calloc(output_length + 2, sizeof(unsigned char));
+	char *jsonMsg = (char *)calloc(output_length + 200, sizeof(char));
+	if (nmea_enc && jsonMsg)
+	{
+		encode_base64((unsigned char *)nmea, size, (unsigned char *)nmea_enc);
+		sprintf(jsonMsg, "{\"en\":\"%d\",\"lat\":\"%.5f\",\"lng\":\"%.5f\",\"alt\":\"%.2f\",\"spd\":\"%.2f\",\"csd\":\"%.1f\",\"hdop\":\"%.2f\",\"sat\":\"%d\",\"time\":\"%d\",\"timeStamp\":\"%li\",\"RAW\":\"", (int)config.gnss_enable, gps.location.lat(), gps.location.lng(), gps.altitude.meters(), gps.speed.kmph(), gps.course.deg(), gps.hdop.hdop(), gps.satellites.value(), gps.time.value(), timeStamp);
+		strncat(jsonMsg, (const char *)nmea_enc, output_length);
+		strcat(jsonMsg, "\"}");
+		ws_gnss.textAll(jsonMsg);
+		free(nmea_enc);
+		free(jsonMsg);
+	}
+	
 }
 
 void handle_test(AsyncWebServerRequest *request)
@@ -11395,127 +10682,76 @@ void handle_test(AsyncWebServerRequest *request)
 	// }
 	// setHTML(6);
 
-	String webString = "<html>\n<head>\n";
-	webString += "<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n";
-	webString += "<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n";
-	webString += "<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n";
-	webString += "<script language=\"JavaScript\">";
-	webString += "$(document).ready(function() {\nvar chart = {\ntype: 'gauge',plotBorderWidth: 1,plotBackgroundColor: {linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },stops: [[0, '#FFFFC6'],[0.3, '#FFFFFF'],[1, '#FFF4C6']]},plotBackgroundImage: null,height: 200};\n";
-	webString += "var credits = {enabled: false};\n";
-	webString += "var title = {text: 'RX Meter'};\n";
-	webString += "var pane = [{startAngle: -45,endAngle: 45,background: null,center: ['50%', '145%'],size: 300}];\n";
-	webString += "var yAxis = [{min: -140,max: 1,minorTickPosition: 'outside',tickPosition: 'outside',labels: {rotation: 'auto',distance: 20},\n";
-	webString += "plotBands: [{from: -60,to: 0,color: '#C02316',innerRadius: '100%',outerRadius: '105%'},{from: -90,to: -60,color: '#00C000',innerRadius: '100%',outerRadius: '105%'},{from: -120,to: -90,color: '#AFFF0F',innerRadius: '100%',outerRadius: '105%'},{from: -140,to: -120,color: '#C0A316',innerRadius: '100%',outerRadius: '105%'}],\n";
-	webString += "pane: 0,title: {text: '<span style=\"font-size:14px\">dBm</span>',y: -40}}];\n";
-	webString += "var plotOptions = {gauge: {dataLabels: {enabled: false},dial: {radius: '100%'}}};\n";
-	webString += "var series= [{data: [-140],yAxis: 0}];\n";
-	webString += "var json = {};\n json.chart = chart;\n json.credits = credits;\n json.title = title;\n json.pane = pane;\n json.yAxis = yAxis;\n json.plotOptions = plotOptions;\n json.series = series;\n";
+	// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+	AsyncResponseStream *webString = request->beginResponseStream("text/html", 9000);
+	if (!webString)
+	{
+		request->send(500, "text/html", "Memory allocation failed");
+		return;
+	}
+	webString->print("<html>\n<head>\n");
+	webString->print("<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
+	webString->print("<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
+	webString->print("<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
+	webString->print("<script language=\"JavaScript\">");
+	webString->print("$(document).ready(function() {\nvar chart = {\ntype: 'gauge',plotBorderWidth: 1,plotBackgroundColor: {linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },stops: [[0, '#FFFFC6'],[0.3, '#FFFFFF'],[1, '#FFF4C6']]},plotBackgroundImage: null,height: 200};\n");
+	webString->print("var credits = {enabled: false};\n");
+	webString->print("var title = {text: 'RX/AUDIO VU Meter'};\n");
+	webString->print("var pane = [{startAngle: -45,endAngle: 45,background: null,center: ['50%', '145%'],size: 300}];\n");
+	webString->print("var yAxis = [{min: -40,max: 1,minorTickPosition: 'outside',tickPosition: 'outside',labels: {rotation: 'auto',distance: 20},\n");
+	webString->print("plotBands: [{from: -10,to: 1,color: '#C02316',innerRadius: '100%',outerRadius: '105%'},{from: -20,to: -10,color: '#00C000',innerRadius: '100%',outerRadius: '105%'},{from: -30,to: -20,color: '#AFFF0F',innerRadius: '100%',outerRadius: '105%'},{from: -40,to: -30,color: '#C0A316',innerRadius: '100%',outerRadius: '105%'}],\n");
+	webString->print("pane: 0,title: {text: '<span style=\"font-size:12px\">dBV</span>',y: -40}}];\n");
+	webString->print("var plotOptions = {gauge: {dataLabels: {enabled: false},dial: {radius: '100%'}}};\n");
+	webString->print("var series= [{data: [-40],yAxis: 0}];\n");
+	webString->print("var json = {};\n json.chart = chart;\n json.credits = credits;\n json.title = title;\n json.pane = pane;\n json.yAxis = yAxis;\n json.plotOptions = plotOptions;\n json.series = series;\n");
 	// Add some life
-	webString += "var chartFunction = function (chart) { \n"; // the chart may be destroyed
-	webString += "var rssi=-140;\nvar snr=0;\nvar freqErr=0;\nvar active=0;var raw=\"\";var timeStamp;\n";
-	webString += "if (chart.series) {\n";
-	webString += "var left = chart.series[0].points[0];\n";
-	webString += "var host='ws://'+location.hostname+':81/ws'\n";
-	webString += "const ws = new WebSocket(host);\n";
-	webString += "ws.onopen = function() { console.log('Connection opened');};\n ws.onclose = function() { console.log('Connection closed');};\n";
-	webString += "ws.onmessage = function(event) {\n  console.log(event.data);\n";
-	webString += "const jsonR=JSON.parse(event.data);\n";
-	webString += "active=parseInt(jsonR.Active);\n";
-	webString += "rssi=parseFloat(jsonR.rssi);\n";
-	webString += "snr=parseFloat(jsonR.snr);\n";
-	webString += "freqErr=parseFloat(jsonR.freqErr);\n";
-	webString += "if(rssi<-140) rssi=-140;\n";
-	webString += "raw=jsonR.RAW;\n";
-	webString += "timeStamp=Number(jsonR.timeStamp);\n";
-	webString += "if(active==1){\nleft.update(rssi,false);\nchart.redraw();\n";
-	webString += "var d=new Date(timeStamp * 1000);\n";
-	webString += "var head=d.getFullYear()+\"-\"+(d.getMonth()+1)+\"-\"+d.getDate()+\",\"+d.getHours()+\":\"+d.getMinutes()+\":\"+d.getSeconds()+\" [RSSI:\"+rssi.toFixed(0)+\"dBm,SNR:\"+snr.toFixed(0)+\"dB,FreqErr:\"+freqErr.toFixed(0)+\"Hz]\\n\";\n";
-	// webString += "document.getElementById(\"raw_txt\").value+=head+atob(raw)+\"\\n\";\n";
-	webString += "var textArea=document.getElementById(\"raw_txt\");\n";
-	webString += "textArea.value+=head+atob(raw)+\"\\n\";\n";
-	webString += "textArea.scrollTop = textArea.scrollHeight;\n";
-	webString += "}\n";
-	webString += "}\n";
-	webString += "}};\n";
-	webString += "$('#vumeter').highcharts(json, chartFunction);\n";
-	webString += "});\n</script>\n";
-	webString += "</head><body>\n<table>\n";
-	// webString += "<tr><td><form accept-charset=\"UTF-8\" action=\"/test\" class=\"form-horizontal\" id=\"test_form\" method=\"post\">\n";
-	// webString += "<div style=\"margin-left: 20px;\"><input type='submit' class=\"btn btn-danger\" name=\"sendBeacon\" value='SEND BEACON'></div><br />\n";
-	// webString += "<div style=\"margin-left: 20px;\">TNC2 RAW: <input id=\"raw\" name=\"raw\" type=\"text\" size=\"60\" value=\"" + String(config.igate_mycall) + ">APE32I,WIDE1-1:>Test Status\"/></div>\n";
-	// webString += "<div style=\"margin-left: 20px;\"><input type='submit' class=\"button\" name=\"sendRaw\" value='SEND RAW'></div> <br />\n";
-	// webString += "</form></td></tr>\n";
-	// webString += "<tr><td><hr width=\"80%\" /></td></tr>\n";
-	webString += "<tr><td><div id=\"vumeter\" style=\"width: 300px; height: 200px; margin: 10px;\"></div></td>\n";
-	webString += "<tr><td><div style=\"margin: 15px;\">Terminal<br /><textarea id=\"raw_txt\" name=\"raw_txt\" rows=\"50\" cols=\"80\" /></textarea></div></td></tr>\n";
-	webString += "</table>\n";
+	webString->print("var chartFunction = function (chart) { \n"); // the chart may be destroyed
+	webString->print("var Vrms=0;\nvar dBV=-40;\nvar active=0;var raw=\"\";var timeStamp;\n");
+	webString->print("if (chart.series) {\n");
+	webString->print("var left = chart.series[0].points[0];\n");
+	webString->print("var host='ws://'+location.hostname+':81/ws'\n");
+	webString->print("const ws = new WebSocket(host);\n");
+	webString->print("ws.onopen = function() { console.log('Connection opened');};\n ws.onclose = function() { console.log('Connection closed');};\n");
+	webString->print("ws.onmessage = function(event) {\n  console.log(event.data);\n");
+	webString->print("const jsonR=JSON.parse(event.data);\n");
+	webString->print("active=parseInt(jsonR.Active);\n");
+	webString->print("Vrms=parseFloat(jsonR.mVrms)/1000;\n");
+	webString->print("dBV=20.0*Math.log10(Vrms);\n");
+	webString->print("if(dBV<-40) dBV=-40;\n");
+	webString->print("raw=jsonR.RAW;\n");
+	webString->print("timeStamp=Number(jsonR.timeStamp);\n");
+	webString->print("if(active==1){\nleft.update(dBV,false);\nchart.redraw();\n");
+	webString->print("var date=new Date(timeStamp * 1000);\n");
+	webString->print("var head=date+\"[\"+Vrms.toFixed(3)+\"Vrms,\"+dBV.toFixed(1)+\"dBV]\\n\";\n");
+	// webString->print("document.getElementById(\"raw_txt\").value+=head+atob(raw)+\"\\n\";\n");
+	webString->print("var textArea=document.getElementById(\"raw_txt\");\n");
+	webString->print("textArea.value+=head+atob(raw)+\"\\n\";\n");
+	webString->print("textArea.scrollTop = textArea.scrollHeight;\n");
+	webString->print("}\n");
+	webString->print("}\n");
+	webString->print("}};\n");
+	webString->print("$('#vumeter').highcharts(json, chartFunction);\n");
+	webString->print("});\n</script>\n");
+	webString->print("</head><body>\n<table>\n");
+	// webString->print("<tr><td><form accept-charset=\"UTF-8\" action=\"/test\" class=\"form-horizontal\" id=\"test_form\" method=\"post\">\n");
+	// webString->print("<div style=\"margin-left: 20px;\"><input type='submit' class=\"btn btn-danger\" name=\"sendBeacon\" value='SEND BEACON'></div><br />\n");
+	// webString->print("<div style=\"margin-left: 20px;\">TNC2 RAW: <input id=\"raw\" name=\"raw\" type=\"text\" size=\"60\" value=\"" + String(config.aprs_mycall) + ">APE32I,WIDE1-1:>Test Status\"/></div>\n");
+	// webString->print("<div style=\"margin-left: 20px;\"><input type='submit' class=\"btn btn-primary\" name=\"sendRaw\" value='SEND RAW'></div> <br />\n");
+	// webString->print("</form></td></tr>\n");
+	// webString->print("<tr><td><hr width=\"80%\" /></td></tr>\n");
+	webString->print("<tr><td><div id=\"vumeter\" style=\"width: 300px; height: 200px; margin: 10px;\"></div></td>\n");
+	webString->print("<tr><td><div style=\"margin: 15px;\">Terminal<br /><textarea id=\"raw_txt\" name=\"raw_txt\" rows=\"50\" cols=\"80\" /></textarea></div></td></tr>\n");
+	webString->print("</table>\n");
 
-	webString += "</body></html>\n";
-	request->send(200, "text/html", webString); // send to someones browser when asked
+	webString->print("</body></html>\n");
 
-	delay(100);
-	webString.clear();
+	webString->addHeader("Test", "content");
+	webString->addHeader("Cache-Control", "no-cache");
+	request->send(webString);
 }
-
-static void ota_url_task(void *pvParameters)
-{
-	char *url = (char *)pvParameters;
-	HTTPClient http;
-	http.begin(url);
-	http.setTimeout(30000);
-	int httpCode = http.GET();
-	if (httpCode == HTTP_CODE_OK) {
-		int contentLength = http.getSize();
-		WiFiClient *stream = http.getStreamPtr();
-		if (contentLength > 0 && Update.begin(contentLength)) {
-			disableLoopWDT();
-			disableCore0WDT();
-			Update.writeStream(*stream);
-			if (Update.end(true)) {
-				log_i("OTA URL update success, rebooting");
-				delay(500);
-				esp_restart();
-			} else {
-				Update.printError(Serial);
-			}
-		} else {
-			log_e("OTA URL: bad content length or Update.begin failed");
-		}
-	} else {
-		log_e("OTA URL: HTTP GET failed, code=%d", httpCode);
-	}
-	http.end();
-	free(url);
-	vTaskDelete(NULL);
-}
-
-void handle_ota_url(AsyncWebServerRequest *request)
-{
-	if (!request->authenticate(config.http_username, config.http_password)) {
-		return request->requestAuthentication();
-	}
-	if (!request->hasParam("url", true)) {
-		request->send(400, "text/plain", "Missing url parameter");
-		return;
-	}
-	String urlStr = request->getParam("url", true)->value();
-	if (urlStr.length() == 0) {
-		request->send(400, "text/plain", "Empty url");
-		return;
-	}
-	char *urlBuf = (char *)malloc(urlStr.length() + 1);
-	if (!urlBuf) {
-		request->send(500, "text/plain", "Out of memory");
-		return;
-	}
-	strcpy(urlBuf, urlStr.c_str());
-	request->send(200, "text/plain", "OTA update started");
-	xTaskCreate(ota_url_task, "ota_url_task", 8192, urlBuf, 5, NULL);
-}
-
 // Remote version file published by copy_firmware.py, checked against the
 // running VERSION/VERSION_BUILD to let the "about" page report new releases.
-#define VERSION_CHECK_URL "http://fw.nakhonthai.net/LoRa/version.json"
+#define VERSION_CHECK_URL "https://raw.githubusercontent.com/marceloferreirachile/ESP32APRS_Audio/master/version.json"
 
 void handle_check_version(AsyncWebServerRequest *request)
 {
@@ -11552,574 +10788,1771 @@ void handle_check_version(AsyncWebServerRequest *request)
 	const char *latestVersion = doc["version"] | "";
 	const char *latestBuild = doc["build"] | "";
 	const char *latestDate = doc["date"] | "";
+	const char *latestTag = doc["tag"] | "";
+	const char *latestFilename = doc["filename"] | "";
 
 	bool updateAvailable = (strcmp(latestVersion, VERSION) != 0) || (strcmp(latestBuild, VERSION_BUILD) != 0);
 
 	char resp[400];
 	snprintf(resp, sizeof(resp),
-			 "{\"current_version\":\"%s\",\"current_build\":\"%s\",\"latest_version\":\"%s\",\"latest_build\":\"%s\",\"latest_date\":\"%s\",\"update_available\":%s}",
-			 VERSION, VERSION_BUILD, latestVersion, latestBuild, latestDate, updateAvailable ? "true" : "false");
+			 "{\"current_version\":\"%s\",\"current_build\":\"%s\","
+			 "\"latest_version\":\"%s\",\"latest_build\":\"%s\",\"latest_date\":\"%s\","
+			 "\"latest_tag\":\"%s\",\"latest_filename\":\"%s\",\"update_available\":%s}",
+			 VERSION, VERSION_BUILD, latestVersion, latestBuild, latestDate,
+			 latestTag, latestFilename, updateAvailable ? "true" : "false");
 	request->send(200, "application/json", resp);
 }
 
-extern char lu6jmfPrevRebootInfo[48]; // main.cpp - reason of the previous boot
+// LU6JMF - Marcelo Ferreira:
+// Fase 6 (motor de templates): handle_about reescrito pra usar renderTemplate()
+// em vez de ~430 linhas de webString->print()/snprintf espalhados. O template
+// fica embutido no firmware (string normal, NAO no LittleFS - nao precisamos
+// de espaco extra de filesystem pra isso, so estabilidade). Mesma saida HTML
+// de antes, so que montada como 1 String e enviada com tamanho exato (elimina
+// a classe de bug do buffer "chutado" que achamos na pagina IGATE).
+static const char *ABOUT_TEMPLATE =
+	"<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;\"><td width=\"49%\" style=\"border:unset;\">"
+	"<table style=\"height:100%;\">"
+	"<th colspan=\"2\"><span><b>System Information</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Hardware Version: </b></td><td align=\"left\">{{hwVersion}}</td></tr>"
+	"<tr><td align=\"right\"><b>Firmware Version: </b></td><td align=\"left\"> V{{firmwareVersion}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>RF Module: </b></td><td align=\"left\"> {{rfModule}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>ESP32 Model: </b></td><td align=\"left\"> {{chipModel}}</td></tr>"
+	"<tr><td align=\"right\"><b>Revision: </b></td><td align=\"left\"> {{chipRevision}}</td></tr>"
+	"<tr><td align=\"right\"><b>Chip ID: </b></td><td align=\"left\"> {{chipId}}</td></tr>"
+	"<tr><td align=\"right\"><b>Flash: </b></td><td align=\"left\">{{flashKB}} KByte</td></tr>"
+	"<tr><td align=\"right\"><b>PSRAM: </b></td><td align=\"left\">{{psram}} KByte</td></tr>"
+	"<tr><td align=\"right\"><b>FILE SYSTEM: </b></td><td align=\"left\">{{filesystem}} KByte</td></tr>"
+	"</table>"
+	"</td><td width=\"2%\" style=\"border:unset;\"></td>"
+	"<td width=\"49%\" style=\"border:unset;\">"
+	"<table style=\"height:100%;\">"
+	"<th colspan=\"2\"><span><b>Developer/Support Information</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Author: </b></td><td align=\"left\">Marcelo Ferreira (fork/mods)</td></tr>"
+	"<tr><td align=\"right\"><b>Callsign: </b></td><td align=\"left\">LU6JMF-10</td></tr>"
+	"<tr><td align=\"right\"><b>Country: </b></td><td align=\"left\">Concepcion del Uruguay, Entre Rios, Argentina</td></tr>\n"
+	"<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio\" target=\"_blank\">github.com/marceloferreirachile/ESP32APRS_Audio</a></td></tr>"
+	"<tr><td align=\"right\"><b>Original: </b></td><td align=\"left\">Mr.Somkiat Nakhonthai (HS5TQA) - <a href=\"https://github.com/nakhonthai\" target=\"_blank\">github.com/nakhonthai</a></td></tr>\n"
+	"<tr><td align=\"right\"><b>License: </b></td><td align=\"left\">GNU GPL v3. Source code of this exact version available on request, free of charge, for at least 3 years: <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a> (include the version number)</td></tr>\n"
+	"<tr><td align=\"right\"><b>WhatsApp: </b></td><td align=\"left\"><a href=\"https://wa.me/5493442311119\" target=\"_blank\">wa.me/5493442311119</a></td></tr>"
+	"<tr><td align=\"right\"><b>Donate: </b></td><td align=\"left\"><a href=\"https://www.paypal.me/MarceloFerreira673\" target=\"_blank\">paypal.me/MarceloFerreira673</a></td></tr>"
+	"</table>"
+	"</td></tr></table><br />"
+	"<table>\n"
+	"<tr><td align=\"right\"><b>Contributor: </b></td><td align=\"left\">LU6JMF Marcelo</td></tr>\n"
+	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\">v2.0-lu6jmf (custom mods on top of V1.8a)</td></tr>\n"
+	"<tr><td align=\"right\" style=\"vertical-align:top;\"><b>Changes: </b></td><td align=\"left\" style=\"white-space:normal;\">\n"
+	"See README / git log in the repository for full change history, or "
+	"<a href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio/releases\" target=\"_blank\">"
+	"the Releases page</a> for per-version notes."
+	"</td></tr>\n"
+	"</table><br />\n"
+	"<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;\"><td width=\"49%\" style=\"border:unset;\">"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>WiFi Status</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Mode:</b></td>\n"
+	"<td align=\"left\">{{wifiMode}} ({{wifiProto}}){{wifiPowerSuffix}}</td></tr>\n"
+	"<tr><td align=\"right\" width=\"30%\"><b>MAC:</b></td>\n<td align=\"left\">{{mac}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Channel:</b></td>\n<td align=\"left\">{{channel}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>TX Power:</b></td>\n<td align=\"left\">{{wifiPower}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>SSID:</b></td>\n<td align=\"left\">{{ssid}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Local IP:</b></td>\n<td align=\"left\">{{localIP}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Gateway IP:</b></td>\n<td align=\"left\">{{gatewayIP}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>DNS:</b></td>\n<td align=\"left\">{{dns}}</td></tr>\n"
+	"</table>\n"
+	"</td><td width=\"2%\" style=\"border:unset;\"></td>"
+	"<td width=\"49%\" style=\"border:unset;\">"
+	"<table>\n"
+	"{{#if pppos}}"
+	"<th colspan=\"2\"><span><b>PPPoS Status</b></span></th>\n"
+	"<tr><td align=\"right\" width=\"30%\"><b>Manufacturer:</b></td>\n<td align=\"left\">{{pppos.manufacturer}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Model:</b></td>\n<td align=\"left\">{{pppos.model}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>IMEI:</b></td>\n<td align=\"left\">{{pppos.imei}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>IMSI:</b></td>\n<td align=\"left\">{{pppos.imsi}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Operator:</b></td>\n<td align=\"left\">{{pppos.oper}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>RSSI:</b></td>\n<td align=\"left\">{{pppos.rssi}} dBm</td></tr>\n"
+	"<tr><td align=\"right\"><b>IP:</b></td>\n<td align=\"left\">{{pppos.ip}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Gateway:</b></td>\n<td align=\"left\">{{pppos.gateway}}</td></tr>\n"
+	"{{/if}}"
+	"</table>\n"
+	"</td></tr></table><br />"
+	"{{#if ota}}"
+	"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form' class=\"form-horizontal\">\n"
+	"<table>"
+	"<th colspan=\"2\"><span><b>Manual Firmware Update</b></span></th>\n"
+	"<tr><td align=\"right\"><b>File:</b></td><td align=\"left\"><input id=\"file\" name=\"update\" type=\"file\" onchange='sub(this)' /></td></tr>\n"
+	"<tr><td align=\"right\"><b>Progress:</b></td><td><div id='prgbar'><div id='bar' style=\"width: 0px;\"><label id='prg'></label></div></div></td></tr>\n"
+	"<tr><td align=\"right\"><b>Support Firmware:</b></td><td align=\"left\"><a target=\"_download\" href=\"https://github.com/marceloferreirachile/ESP32APRS_Audio/releases\">https://github.com/marceloferreirachile/ESP32APRS_Audio/releases</a></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\"><input type='submit' class=\"btn btn-danger\" id=\"update_sumbit\" value='Firmware UpLoad'></div></td></tr>\n"
+	"</table><br />\n"
+	"</form>\n"
+	"<script>"
+	"function sub(obj){"
+	"var fileName = obj.value.split('\\\\');"
+	"document.getElementById('file-input').innerHTML = '   '+ fileName[fileName.length-1];"
+	"};"
+	"$('#upload_form').submit(function(e){"
+	"e.preventDefault();"
+	"var form = $('#upload_form')[0];"
+	"var data = new FormData(form);"
+	"document.getElementById('update_sumbit').disabled = true;"
+	"$.ajax({"
+	"url: '/update',"
+	"type: 'POST',"
+	"data: data,"
+	"contentType: false,"
+	"processData:false,"
+	"xhr: function() {"
+	"var xhr = new window.XMLHttpRequest();"
+	"xhr.upload.addEventListener('progress', function(evt) {"
+	"if (evt.lengthComputable) {"
+	"var per = evt.loaded / evt.total;"
+	"$('#prg').html(Math.round(per*100) + '%');"
+	"$('#bar').css('width',Math.round(per*100) + '%');"
+	"}"
+	"}, false);"
+	"return xhr;"
+	"},"
+	"success:function(d, s) {"
+	"alert('Wait for system reboot 10sec');"
+	"},"
+	"error: function (a, b, c) {"
+	"}"
+	"});"
+	"});"
+	"</script>"
+	// LU6JMF - Marcelo Ferreira: "Manual Filesystem Update (icons/data)" form
+	// removido antes (postava pro /updatefs, que apaga o LittleFS inteiro
+	// incluindo a config salva). O endpoint /updatefs continua existindo no
+	// servidor, so o botao que convidava a usa-lo por engano foi tirado.
+	"<table>"
+	"<th colspan=\"2\"><span><b>OTA Online Firmware Update</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Firmware File:</b></td><td align=\"left\"><a id=\"fw_file_link\" href=\"{{otaUrl}}\" target=\"_blank\">{{otaFile}}</a></td></tr>\n"
+	"<tr><td align=\"right\"><b>Current Version:</b></td><td align=\"left\">V{{firmwareVersion}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Status:</b></td><td><span id='ota_prg'>Ready</span></td></tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\"><input type='button' class=\"btn btn-danger\" id=\"check_ver_btn\" value='Check New Version'></div></td></tr>\n"
+	"</table><br />\n"
+	"<script>"
+	"document.getElementById('check_ver_btn').addEventListener('click', function(){"
+	"document.getElementById('check_ver_btn').disabled = true;"
+	"document.getElementById('ota_prg').innerHTML = 'Checking...';"
+	"$.ajax({"
+	"url: '/check_version',"
+	"type: 'GET',"
+	"dataType: 'json',"
+	"success: function(d) {"
+	"document.getElementById('check_ver_btn').disabled = false;"
+	"if (d.update_available) {"
+	"var newUrl = 'https://github.com/marceloferreirachile/ESP32APRS_Audio/releases/download/' + d.latest_tag + '/' + d.latest_filename;"
+	"var fwLink = document.getElementById('fw_file_link');"
+	"fwLink.href = newUrl;"
+	"fwLink.innerHTML = d.latest_filename;"
+	"document.getElementById('ota_prg').innerHTML = 'New version available: V' + d.latest_version + d.latest_build + '. Download link above, install via Manual Firmware Update.';"
+	"} else {"
+	"document.getElementById('ota_prg').innerHTML = 'You are using the latest version.';"
+	"}"
+	"},"
+	"error: function(a, b, c) {"
+	"document.getElementById('check_ver_btn').disabled = false;"
+	"document.getElementById('ota_prg').innerHTML = 'Error checking version: ' + c;"
+	"}"
+	"});"
+	"});"
+	"</script>"
+	"{{/if}}"
+	"</body></html>\n";
 
 void handle_about(AsyncWebServerRequest *request)
+{
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+	char strCID[50];
+	uint64_t chipid = ESP.getEfuseMac();
+	sprintf(strCID, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+
+	JsonDocument data;
+	char temp_buffer[512];
+
+	char FirmwareOTA[50];
+	char hwVersion[48];
+	// Build a dot-free version string for use in firmware filenames
+	// 2.1.5: was char[20] + sprintf. "v2.1.5-dev-lu6jmf.bin" is 21 chars + NUL, so the dev build
+	// overflowed this buffer into the next stack variables (garbled "Firmware File" on About).
+	char ver[48];
+	snprintf(ver, sizeof(ver), "v%s-%s.bin", VERSION, VERSION_BUILD);
+#if defined(TTGO_TWR)
+	strcpy(hwVersion, "LiLyGo T-TWRPlus");
+	sprintf(FirmwareOTA, "ESP32S3_TWR_%s", ver);
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+	#ifdef SH1106
+		strcpy(hwVersion, "ESP32-WROOM+SH1106 OLED");
+		sprintf(FirmwareOTA, "ESP32_SH1106_%s", ver);
+	#elif defined(SSD1306)
+		strcpy(hwVersion, "ESP32-WROOM+SSD1306 OLED");
+		sprintf(FirmwareOTA, "ESP32_SSD1306_%s", ver);
+	#elif defined(NO_OTA)
+		strcpy(hwVersion, "ESP32-WROOM NO OTA,ESP32 DoIt DevKit");
+		sprintf(FirmwareOTA, "ESP32_NOOTA_%s", ver);
+	#else
+		strcpy(hwVersion, "ESP32-WROOM,ESP32 DoIt DevKit");
+		sprintf(FirmwareOTA, "ESP32_NODISP_%s", ver);
+	#endif
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+	#ifdef SH1106
+		strcpy(hwVersion, "ESP32C3+SH1106 OLED");
+		sprintf(FirmwareOTA, "ESP32C3_SH1106_%s", ver);
+	#elif defined(SSD1306)
+		strcpy(hwVersion, "ESP32C3+SSD1306 OLED");
+		sprintf(FirmwareOTA, "ESP32C3_SSD1306_%s", ver);
+	#elif defined(NO_OTA)
+		strcpy(hwVersion, "ESP32C3 NO OTA,ESP32-C3 DIY");
+		sprintf(FirmwareOTA, "ESP32C3_NOOTA_%s", ver);
+	#else
+		strcpy(hwVersion, "ESP32C3,ESP32-C3 DIY");
+		sprintf(FirmwareOTA, "ESP32C3_NODISP_%s", ver);
+	#endif
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+	#ifdef SH1106
+		strcpy(hwVersion, "ESP32C6+SH1106 OLED");
+		sprintf(FirmwareOTA, "ESP32C6_SH1106_%s", ver);
+	#elif defined(SSD1306)
+		strcpy(hwVersion, "ESP32C6+SSD1306 OLED");
+		sprintf(FirmwareOTA, "ESP32C6_SSD1306_%s", ver);
+	#elif defined(NO_OTA)
+		strcpy(hwVersion, "ESP32C6_NOOTA,ESP32-C6 DIY");
+		sprintf(FirmwareOTA, "ESP32C6_NOOTA_%s", ver);
+	#else
+		strcpy(hwVersion, "ESP32C6,ESP32-C6 DIY");
+		sprintf(FirmwareOTA, "ESP32C6_%s", ver);
+	#endif
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+	#ifdef ESP32S3_N16R8
+		strcpy(hwVersion, "ESP32-S3_16MB,ESP32-S3-DevKit");
+		sprintf(FirmwareOTA, "ESP32S3_N16R8_%s", ver);
+	#elif defined(SH1106)
+		strcpy(hwVersion, "ESP32-S3_8MB,SH1106 OLED");
+		sprintf(FirmwareOTA, "ESP32S3_SH1106_%s", ver);
+	#elif defined(SSD1306)
+		strcpy(hwVersion, "ESP32-S3_8MB,SSD1306 OLED");
+		sprintf(FirmwareOTA, "ESP32S3_SSD1306_%s", ver);
+	#elif defined(NO_OTA)
+		strcpy(hwVersion, "ESP32-S3 Super mini,No OTA");
+		sprintf(FirmwareOTA, "ESP32S3_NOOTA_%s", ver);
+	#endif
+#else
+	strcpy(hwVersion, "UNKNOWN,ESP32 DIY");
+#endif
+
+	data["hwVersion"] = hwVersion;
+	snprintf(temp_buffer, sizeof(temp_buffer), "%s%s", VERSION, VERSION_BUILD);
+	data["firmwareVersion"] = temp_buffer;
+	data["rfModule"] = RF_TYPE[config.rf_type];
+	data["chipModel"] = ESP.getChipModel();
+	data["chipRevision"] = ESP.getChipRevision();
+	data["chipId"] = strCID;
+	data["flashKB"] = ESP.getFlashChipSize() / 1024;
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.1f/%.1f", (float)ESP.getFreePsram() / 1024, (float)ESP.getPsramSize() / 1024);
+	data["psram"] = temp_buffer;
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.1f/%.1f", (float)LITTLEFS.usedBytes() / 1024, (float)LITTLEFS.totalBytes() / 1024);
+	data["filesystem"] = temp_buffer;
+
+	if (config.wifi_mode == WIFI_AP_FIX)
+		data["wifiMode"] = "AP";
+	else if (config.wifi_mode == WIFI_STA_FIX)
+		data["wifiMode"] = "STA";
+	else if (config.wifi_mode == WIFI_AP_STA_FIX)
+		data["wifiMode"] = "AP+STA";
+	else
+		data["wifiMode"] = "OFF";
+
+	uint8_t proto = 0;
+	esp_wifi_get_protocol(WIFI_IF_STA, &proto);
+	{
+		String protoStr = "802.11";
+		if (proto & WIFI_PROTOCOL_11B) protoStr += "b";
+		if (proto & WIFI_PROTOCOL_11G) protoStr += "g";
+		if (proto & WIFI_PROTOCOL_11N) protoStr += "n";
+		if (proto & WIFI_PROTOCOL_LR) protoStr += "lr";
+		data["wifiProto"] = protoStr;
+	}
+	data["wifiPowerSuffix"] = ""; // kept for template parity, unused (power shown in its own row below, same as before)
+
+	wifi_power_t wpr = WiFi.getTxPower();
+	const char *wifipower;
+	if (wpr < 8) wifipower = "-1 dBm";
+	else if (wpr < 21) wifipower = "2 dBm";
+	else if (wpr < 29) wifipower = "5 dBm";
+	else if (wpr < 35) wifipower = "8.5 dBm";
+	else if (wpr < 45) wifipower = "11 dBm";
+	else if (wpr < 53) wifipower = "13 dBm";
+	else if (wpr < 61) wifipower = "15 dBm";
+	else if (wpr < 69) wifipower = "17 dBm";
+	else if (wpr < 75) wifipower = "18.5 dBm";
+	else if (wpr < 77) wifipower = "19 dBm";
+	else if (wpr < 80) wifipower = "19.5 dBm";
+	else wifipower = "20 dBm";
+	data["wifiPower"] = wifipower;
+
+	data["mac"] = WiFi.macAddress();
+	data["channel"] = WiFi.channel();
+	data["ssid"] = WiFi.SSID();
+	data["localIP"] = WiFi.localIP().toString();
+	data["gatewayIP"] = WiFi.gatewayIP().toString();
+	data["dns"] = WiFi.dnsIP().toString();
+
+#ifdef PPPOS
+	JsonObject pppos = data["pppos"].to<JsonObject>();
+	pppos["manufacturer"] = pppStatus.manufacturer;
+	pppos["model"] = pppStatus.model;
+	pppos["imei"] = pppStatus.imei;
+	pppos["imsi"] = pppStatus.imsi;
+	pppos["oper"] = pppStatus.oper;
+	pppos["rssi"] = pppStatus.rssi;
+	pppos["ip"] = IPAddress(pppStatus.ip).toString();
+	pppos["gateway"] = IPAddress(pppStatus.gateway).toString();
+#endif
+
+#ifndef NO_OTA
+	data["ota"] = true;
+	char ota_url_buf[200];
+	snprintf(ota_url_buf, sizeof(ota_url_buf), "https://github.com/marceloferreirachile/ESP32APRS_Audio/releases/download/v%s-%s/%s", VERSION, VERSION_BUILD, FirmwareOTA);
+	data["otaUrl"] = ota_url_buf;
+	data["otaFile"] = FirmwareOTA;
+#endif
+
+	String html = renderTemplate(ABOUT_TEMPLATE, data.as<JsonVariant>());
+	sendHtmlChunked(request, html, "About");
+}
+
+// -----------------------------------------------------------------------------
+// LU6JMF - Marcelo Ferreira: PRIME account system, ported from TX-SCHEDULER-TEST.
+// -----------------------------------------------------------------------------
+void handle_prime_login(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
-	char FirmwareOTA[50];
-	char strCID[50];
-	uint64_t chipid = ESP.getEfuseMac();
-	sprintf(strCID, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
 
-	// Allocate memory for HTML content
-	char *webString = allocateStringMemory(16384); // Start with 16KB buffer
-	if (!webString)
+	if (!request->hasParam("email", true) ||
+		!request->hasParam("password", true))
 	{
-		request->send(500, "text/html", "Memory allocation failed");
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"missing_credentials\"}"
+		);
 		return;
 	}
-	strcpy(webString, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;\"><td width=\"49%\" style=\"border:unset;\">");
 
-	strcat(webString, "<table>");
-	strcat(webString, "<th colspan=\"2\"><span><b>System Information</b></span></th>\n");
-	// strcat(webString, "<tr><th width=\"200\"><span><b>Name</b></span></th><th><span><b>Information</b></span></th></tr>";
-	strcat(webString, "<tr><td align=\"right\"><b>Hardware Version: </b></td><td align=\"left\">");
+	String email = request->getParam("email", true)->value();
+	String password = request->getParam("password", true)->value();
 
-	// Build a dot-free version string for use in firmware filenames
-	char verNoDot[20];
+	email.trim();
+
+	if (email.length() == 0 || password.length() == 0)
 	{
-		const char *src = VERSION;
-		char *dst = verNoDot;
-		while (*src) { if (*src != '.') *dst++ = *src; src++; }
-		*dst = '\0';
-	}
-	char ver[20];
-	sprintf(ver, "V%s%s.bin", verNoDot, VERSION_BUILD);
-#ifdef HT_CT62
-	strcat(webString, "HT-CT62,ESP32-C3 DIY");
-	sprintf(FirmwareOTA, "HTCT62_%s", ver);
-#elif LORA_TRACKER
-	strcat(webString, "APRS LoRa Tracker Rev.1");
-	sprintf(FirmwareOTA, "LoRaTracker_%s", ver);
-#elif ESP32C3_MINI
-	strcat(webString, "ESP32-C3-Mini,ESP32-C3 DIY");
-	sprintf(FirmwareOTA, "ESP32C3mini_%s", ver);
-#elif defined(TTGO_LORA32_V1)
-	strcat(webString, "TTGO LORA32 V1,ESP32 DIY");
-	sprintf(FirmwareOTA, "TTGO_LoRa32V1_%s", ver);
-#elif defined(TTGO_LORA32_V1_6)
-	strcat(webString, "TTGO LORA32(T3) V1.6,ESP32 DIY");
-	sprintf(FirmwareOTA, "TTGO_LoRa32_V16_%s", ver);
-#elif defined(TTGO_T_Beam_V1_2)
-	strcat(webString, "TTGO_T_Beam_V1.2,ESP32 DIY");
-	sprintf(FirmwareOTA, "TTGO_TBeam_V12_%s", ver);
-#elif defined(TTGO_LORA32_V21)
-	strcat(webString, "TTGO_T_LORA32_V2.1-GPS,ESP32 DIY");
-	sprintf(FirmwareOTA, "TTGO_LoRa32_V21_%s", ver);
-#elif defined(T_BEAM_S3_SUPREME)
-	strcat(webString, "T_BEAM_S3_SUPREME");
-	sprintf(FirmwareOTA, "TBEAM_S3_SUPREME_%s", ver);
-#elif defined(T_BEAM_S3_BPF)
-	strcat(webString, "LilyGo T-Beam-BPF");
-	sprintf(FirmwareOTA, "TBEAM_S3_BPF_%s", ver);
-#elif defined(T_BEAM_S3_1W)
-	strcat(webString, "LilyGo T-Beam-1W");
-	sprintf(FirmwareOTA, "TBEAM_S3_1W_%s", ver);
-#elif defined(HELTEC_HTIT_TRACKER)
-	strcat(webString, "HELTEC HTIT-TRACKER,ESP32-S3 DIY");
-	sprintf(FirmwareOTA, "HTITTracker_%s", ver);
-#elif defined(HELTEC_V3_GPS)
-	strcat(webString, "HELTEC WiFi LoRa32 V3,ESP32-S3 DIY");
-	sprintf(FirmwareOTA, "HELTEC_LoRa32_V3_%s", ver);
-#elif defined(APRS_LORA_HT)
-	strcat(webString, "HELTEC WiFi LoRa32 V3,ESP32-S3 DIY");
-	sprintf(FirmwareOTA, "LoRaHT_%s", ver);
-#elif defined(NAWS4)
-	strcat(webString, "NAWS4,ESP32-S3 DIY");
-	sprintf(FirmwareOTA, "NAWS4_%s", ver);
-#elif defined(APRS_LORA_DONGLE)
-	strcat(webString, "APRS LoRa Dongle,ESP32-S3 DIY");
-	sprintf(FirmwareOTA, "LoRaDongle_V%s%s.bin", verNoDot, VERSION_BUILD);
-#elif defined(TTGO_T_Beam_V1_2_SX1262) || defined(TTGO_T_Beam_V1_2_SX1268)
-	strcat(webString, "TTGO_T_Beam_V1_2_SX1262,TTGO_T_Beam_V1_2_SX1268");
-#elif defined(BV5DJ_BOARD)
-	strcat(webString, "BV5DJ BOARD");
-#else
-	strcat(webString, "UNKNOW BOARD");
-#endif
-	strcat(webString, "</td></tr>");
-
-	char *temp_str = allocateStringMemory(512);
-	if (temp_str)
-	{
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Firmware Version: </b></td><td align=\"left\"> V%s%s</td></tr>\n", VERSION, VERSION_BUILD);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>RF Module: </b></td><td align=\"left\"> %s</td></tr>\n", RF_TYPE[config.rf_type]);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>ESP32 Model: </b></td><td align=\"left\"> %s</td></tr>", ESP.getChipModel());
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Revision: </b></td><td align=\"left\"> %d</td></tr>", ESP.getChipRevision());
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Chip ID: </b></td><td align=\"left\"> %s</td></tr>", strCID);
-		strcat(webString, temp_str);
-
-		// LU6JMF: stability diagnostics - why the last boot happened and heap health.
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Last reset: </b></td><td align=\"left\"> %s</td></tr>", lu6jmfPrevRebootInfo);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Heap min / largest block: </b></td><td align=\"left\">%.1f / %.1f KByte</td></tr>",
-				 (float)ESP.getMinFreeHeap() / 1024, (float)ESP.getMaxAllocHeap() / 1024);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Flash: </b></td><td align=\"left\">%d KByte</td></tr>", ESP.getFlashChipSize() / 1024);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>PSRAM: </b></td><td align=\"left\">%.1f/%.1f KByte</td></tr>",
-				 (float)ESP.getFreePsram() / 1024, (float)ESP.getPsramSize() / 1024);
-		strcat(webString, temp_str);
-
-		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>FILE SYSTEM: </b></td><td align=\"left\">%.1f/%.1f KByte</td></tr>",
-				 (float)LITTLEFS.usedBytes() / 1024, (float)LITTLEFS.totalBytes() / 1024);
-		strcat(webString, temp_str);
-
-		free(temp_str);
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"missing_credentials\"}"
+		);
+		return;
 	}
 
-	strcat(webString, "</table>");
-	strcat(webString, "</td><td width=\"2%\" style=\"border:unset;\"></td>");
-	strcat(webString, "<td width=\"49%\" style=\"border:unset;\">");
+	bool success = primeLogin(email, password);
 
-	strcat(webString, "<table>");
-	strcat(webString, "<th colspan=\"2\"><span><b>Developer/Support Information</b></span></th>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Author: </b></td><td align=\"left\">Mr.Somkiat Nakhonthai </td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Callsign: </b></td><td align=\"left\">HS5TQA,Atten,Nakhonthai</td></tr>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Country: </b></td><td align=\"left\">Bangkok,Thailand</td></tr>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"https://github.com/nakhonthai\" target=\"_github\">https://github.com/nakhonthai</a></td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Youtube: </b></td><td align=\"left\"><a href=\"https://www.youtube.com/@HS5TQA\" target=\"_youtube\">https://www.youtube.com/@HS5TQA</a></td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Facebook: </b></td><td align=\"left\"><a href=\"https://www.facebook.com/atten\" target=\"_facebook\">https://www.facebook.com/atten</a></td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Chat: </b></td><td align=\"left\">Telegram:<a href=\"https://t.me/HS5TQA\" target=\"_line\">@HS5TQA</a> , WeChat:HS5TQA</td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Sponsors: </b></td><td align=\"left\"><a href=\"https://github.com/sponsors/nakhonthai\" target=\"_sponsor\">https://github.com/sponsors/nakhonthai</a></td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>Donate: </b></td><td align=\"left\"><a href=\"https://www.paypal.me/0hs5tqa0\" target=\"_sponsor\">https://www.paypal.me/0hs5tqa0</a></td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>LoRa fork: </b></td><td align=\"left\">Marcelo Ferreira LU6JMF</td></tr>");
-	strcat(webString, "<tr><td align=\"right\"><b>License: </b></td><td align=\"left\">GNU GPL v3. Source code of this exact version available on request, free of charge, for at least 3 years: <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a> (include the version number)</td></tr>");
+	// Remove credentials from the temporary Strings as soon as possible.
+	password = "";
 
-	strcat(webString, "</table>");
-	strcat(webString, "</td></tr></table><br />");
-
-	strcat(webString, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;\"><td width=\"49%\" style=\"border:unset;\">");
-
-	strcat(webString, "<table>\n");
-	strcat(webString, "<th colspan=\"2\"><span><b>WiFi Status</b></span></th>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Mode:</b></td>\n");
-	strcat(webString, "<td align=\"left\">");
-	if (config.wifi_mode == WIFI_AP_FIX)
+	if (!success)
 	{
-		strcat(webString, "AP");
-	}
-	else if (config.wifi_mode == WIFI_STA_FIX)
-	{
-		strcat(webString, "STA");
-	}
-	else if (config.wifi_mode == WIFI_AP_STA_FIX)
-	{
-		strcat(webString, "AP+STA");
-	}
-	else
-	{
-		strcat(webString, "OFF");
-	}
-	uint8_t proto = 0;
-	esp_wifi_get_protocol(WIFI_IF_STA, &proto);
-	strcat(webString, " (802.11");
-	if (proto & WIFI_PROTOCOL_11B)
-		strcat(webString, "b");
-	if (proto & WIFI_PROTOCOL_11G)
-		strcat(webString, "g");
-	if (proto & WIFI_PROTOCOL_11N)
-		strcat(webString, "n");
-	if (proto & WIFI_PROTOCOL_LR)
-		strcat(webString, "lr");
-	strcat(webString, ")");
-
-	wifi_power_t wpr = WiFi.getTxPower();
-	char wifipower[20] = "";
-	if (wpr < 8)
-	{
-		strcpy(wifipower, "-1 dBm");
-	}
-	else if (wpr < 21)
-	{
-		strcpy(wifipower, "2 dBm");
-	}
-	else if (wpr < 29)
-	{
-		strcpy(wifipower, "5 dBm");
-	}
-	else if (wpr < 35)
-	{
-		strcpy(wifipower, "8.5 dBm");
-	}
-	else if (wpr < 45)
-	{
-		strcpy(wifipower, "11 dBm");
-	}
-	else if (wpr < 53)
-	{
-		strcpy(wifipower, "13 dBm");
-	}
-	else if (wpr < 61)
-	{
-		strcpy(wifipower, "15 dBm");
-	}
-	else if (wpr < 69)
-	{
-		strcpy(wifipower, "17 dBm");
-	}
-	else if (wpr < 75)
-	{
-		strcpy(wifipower, "18.5 dBm");
-	}
-	else if (wpr < 77)
-	{
-		strcpy(wifipower, "19 dBm");
-	}
-	else if (wpr < 80)
-	{
-		strcpy(wifipower, "19.5 dBm");
-	}
-	else
-	{
-		strcpy(wifipower, "20 dBm");
+		request->send(
+			401,
+			"application/json",
+			"{\"success\":false,\"error\":\"login_failed\"}"
+		);
+		return;
 	}
 
-	strcat(webString, "</td></tr>\n");
+	request->send(
+		200,
+		"application/json",
+		"{\"success\":true}"
+	);
+}
 
-	char *temp_str1 = allocateStringMemory(512);
-	if (temp_str1)
+// -----------------------------------------------------------------------------
+// LU6JMF - Marcelo Ferreira:
+// PRIME account registration bridge.
+// -----------------------------------------------------------------------------
+void handle_prime_register(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
-		snprintf(temp_str1, 512, "<tr><td align=\"right\" width=\"30%%\"><b>MAC:</b></td>\n<td align=\"left\">%s</td></tr>\n", WiFi.macAddress().c_str());
-		strcat(webString, temp_str1);
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>Channel:</b></td>\n<td align=\"left\">%d</td></tr>\n", WiFi.channel());
-		strcat(webString, temp_str1);
-
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>TX Power:</b></td>\n<td align=\"left\">%s</td></tr>\n", wifipower);
-		strcat(webString, temp_str1);
-
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>SSID:</b></td>\n<td align=\"left\">%s</td></tr>\n", WiFi.SSID().c_str());
-		strcat(webString, temp_str1);
-
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>Local IP:</b></td>\n<td align=\"left\">%s</td></tr>\n", WiFi.localIP().toString().c_str());
-		strcat(webString, temp_str1);
-
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>Gateway IP:</b></td>\n<td align=\"left\">%s</td></tr>\n", WiFi.gatewayIP().toString().c_str());
-		strcat(webString, temp_str1);
-		snprintf(temp_str1, 512, "<tr><td align=\"right\"><b>DNS:</b></td>\n<td align=\"left\">%s</td></tr>\n", WiFi.dnsIP().toString().c_str());
-		strcat(webString, temp_str1);
-
-		free(temp_str1);
+		return request->requestAuthentication();
 	}
 
-	strcat(webString, "</table>\n");
-
-	strcat(webString, "</td><td width=\"2%\" style=\"border:unset;\"></td>");
-	strcat(webString, "<td width=\"49%\" style=\"border:unset;\">");
-	strcat(webString, "<table>\n");
-#ifdef PPPOS
-	strcat(webString, "<th colspan=\"2\"><span><b>PPPoS Status</b></span></th>\n");
-
-	char *temp_str2 = allocateStringMemory(512);
-	if (temp_str2)
+	if (!request->hasParam("callsign", true) ||
+		!request->hasParam("email", true) ||
+		!request->hasParam("password", true))
 	{
-		snprintf(temp_str2, 512, "<tr><td align=\"right\" width=\"30%%\"><b>Manufacturer:</b></td>\n<td align=\"left\">%s</td></tr>\n", pppStatus.manufacturer);
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>Model:</b></td>\n<td align=\"left\">%s</td></tr>\n", pppStatus.model);
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>IMEI:</b></td>\n<td align=\"left\">%s</td></tr>\n", pppStatus.imei);
-		strcat(webString, temp_str2);
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>IMSI:</b></td>\n<td align=\"left\">%s</td></tr>\n", pppStatus.imsi);
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>Operator:</b></td>\n<td align=\"left\">%s</td></tr>\n", pppStatus.oper);
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>RSSI:</b></td>\n<td align=\"left\">%d dBm</td></tr>\n", pppStatus.rssi);
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>IP:</b></td>\n<td align=\"left\">%s</td></tr>\n", IPAddress(pppStatus.ip).toString().c_str());
-		strcat(webString, temp_str2);
-
-		snprintf(temp_str2, 512, "<tr><td align=\"right\"><b>Gateway:</b></td>\n<td align=\"left\">%s</td></tr>\n", IPAddress(pppStatus.gateway).toString().c_str());
-		strcat(webString, temp_str2);
-		free(temp_str2);
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"missing_fields\"}"
+		);
+		return;
 	}
 
-// strcat(webString, "<tr><td align=\"right\"><b>DNS:</b></td>\n");
-// strcat(webString, "<td align=\"left\">%s</td></tr>\n", IPAddress(pppStatus.dns).toString().c_str());
-#endif
-	strcat(webString, "</table>\n");
-	strcat(webString, "</td></tr></table><br />");
+	String callsign = request->getParam("callsign", true)->value();
+	String email = request->getParam("email", true)->value();
+	String password = request->getParam("password", true)->value();
 
-// strcat(webString, "<table style=\"text-align:unset;border-width:0px;background:unset\"><tr style=\"background:unset;\"><td width=\"96%\" style=\"border:unset;\">");
-#ifndef NO_OTA
-	strcat(webString, "<form method='POST' action='#' enctype='multipart/form-data' id='upload_form' class=\"form-horizontal\">\n");
-	strcat(webString, "<table>");
-	strcat(webString, "<th colspan=\"2\"><span><b>Manual Firmware Update</b></span></th>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>File:</b></td><td align=\"left\"><input id=\"file\" name=\"update\" type=\"file\" onchange='sub(this)' /></td></tr>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Progress:</b></td><td><div id='prgbar'><div id='bar' style=\"width: 0px;\"><label id='prg'></label></div></div></td></tr>\n");
-	strcat(webString, "<tr><td align=\"right\"><b>Support Firmware:</b></td><td align=\"left\"><a target=\"_download\" href=\"https://github.com/nakhonthai/ESP32APRS_LoRa/releases\">https://github.com/nakhonthai/ESP32APRS_LoRa/releases</a></td></tr>\n");
-	
-	strcat(webString, "<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\"><input type='submit' class=\"btn btn-danger\" id=\"update_sumbit\" value='Firmware UpLoad'></div></td></tr>\n");
-	strcat(webString, "</table><br />\n");
-	strcat(webString, "</form>\n");
-	// strcat(webString, "</td></tr></table><br />");
+	callsign.trim();
+	callsign.toUpperCase();
+	email.trim();
+	email.toLowerCase();
 
-	strcat(webString, "<script>"
-					  "function sub(obj){"
-					  "var fileName = obj.value.split('\\\\');"
-					  "document.getElementById('file-input').innerHTML = '   '+ fileName[fileName.length-1];"
-					  "};"
-					  "$('form').submit(function(e){"
-					  "e.preventDefault();"
-					  "var form = $('#upload_form')[0];"
-					  "var data = new FormData(form);"
-					  "document.getElementById('update_sumbit').disabled = true;"
-					  "$.ajax({"
-					  "url: '/update',"
-					  "type: 'POST',"
-					  "data: data,"
-					  "contentType: false,"
-					  "processData:false,"
-					  "xhr: function() {"
-					  "var xhr = new window.XMLHttpRequest();"
-					  "xhr.upload.addEventListener('progress', function(evt) {"
-					  "if (evt.lengthComputable) {"
-					  "var per = evt.loaded / evt.total;"
-					  "$('#prg').html(Math.round(per*100) + '%');"
-					  "$('#bar').css('width',Math.round(per*100) + '%');"
-					  "}"
-					  "}, false);"
-					  "return xhr;"
-					  "},"
-					  "success:function(d, s) {"
-					  "alert('Wait for system reboot 10sec');"
-					  "},"
-					  "error: function (a, b, c) {"
-					  "}"
-					  "});"
-					  "});"
-					  "</script>");
-
+	if (callsign.length() < 2 ||
+		callsign.length() > 20 ||
+		email.length() == 0 ||
+		password.length() < 8)
 	{
-		char ota_url_buf[200];
-		snprintf(ota_url_buf, sizeof(ota_url_buf), "http://fw.nakhonthai.net/LoRa/%s", FirmwareOTA);
+		password = "";
 
-		// Derive the board-specific firmware name prefix (FirmwareOTA minus the
-		// trailing "_V<ver><build>.bin") so the client JS can rebuild the filename
-		// for a newer release once /check_version reports one is available.
-		char FirmwarePrefix[50] = "";
-		{
-			char suffix[40];
-			snprintf(suffix, sizeof(suffix), "_V%s%s.bin", verNoDot, VERSION_BUILD);
-			size_t suffixLen = strlen(suffix);
-			size_t fwLen = strlen(FirmwareOTA);
-			if (fwLen > suffixLen)
-			{
-				size_t prefixLen = fwLen - suffixLen;
-				if (prefixLen >= sizeof(FirmwarePrefix))
-					prefixLen = sizeof(FirmwarePrefix) - 1;
-				memcpy(FirmwarePrefix, FirmwareOTA, prefixLen);
-				FirmwarePrefix[prefixLen] = '\0';
-			}
-		}
-
-		strcat(webString, "<table>");
-		strcat(webString, "<th colspan=\"2\"><span><b>OTA Online Firmware Update</b></span></th>\n");
-		char ota_row[512];
-		snprintf(ota_row, sizeof(ota_row),
-			"<tr><td align=\"right\"><b>Firmware File:</b></td><td align=\"left\"><a id=\"fw_file_link\" href=\"%s\" target=\"_blank\">%s</a></td></tr>\n",
-			ota_url_buf, FirmwareOTA);
-		strcat(webString, ota_row);
-		snprintf(ota_row, sizeof(ota_row),
-			"<tr><td align=\"right\"><b>Current Version:</b></td><td align=\"left\">V%s%s</td></tr>\n",
-			VERSION, VERSION_BUILD);
-		strcat(webString, ota_row);
-		strcat(webString, "<tr><td align=\"right\"><b>Status:</b></td><td><span id='ota_prg'>Ready</span></td></tr>\n");
-		snprintf(ota_row, sizeof(ota_row),
-			"<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\">"
-			"<input type='hidden' id='ota_url' value='%s'>"
-			"<input type='hidden' id='fw_prefix' value='%s'>"
-			"<input type='button' class=\"btn btn-danger\" id=\"check_ver_btn\" value='Check New Version'>"
-			"<input type='button' class=\"btn btn-danger\" id=\"ota_sumbit\" value='Firmware Update'>"
-			"</div></td></tr>\n",
-			ota_url_buf, FirmwarePrefix);
-		strcat(webString, ota_row);
-		strcat(webString, "</table><br />\n");
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"invalid_fields\"}"
+		);
+		return;
 	}
 
-	// strcat(webString, "<table>");
-	// strcat(webString, "<th colspan=\"2\"><span><b>Check for New Version</b></span></th>\n");
-	// strcat(webString, "<tr><td align=\"right\"><b>Update Server:</b></td><td align=\"left\"><a href=\"" VERSION_CHECK_URL "\" target=\"_blank\">" VERSION_CHECK_URL "</a></td></tr>\n");
-	// strcat(webString, "<tr><td align=\"right\"><b>Status:</b></td><td align=\"left\"><span id='ver_check_result'>-</span></td></tr>\n");
-	// strcat(webString, "<tr><td colspan=\"2\" align=\"right\"><div class=\"col-sm-3 col-xs-4\"><input type='button' class=\"btn btn-danger\" id=\"check_ver_btn\" value='Check New Version'></div></td></tr>\n");
-	// strcat(webString, "</table><br />\n");
+	bool success = primeRegister(callsign, email, password);
 
-	strcat(webString, "<script>"
-					  "document.getElementById('check_ver_btn').addEventListener('click', function(){"
-					  "document.getElementById('check_ver_btn').disabled = true;"
-					  "document.getElementById('ota_prg').innerHTML = 'Checking...';"
-					  "$.ajax({"
-					  "url: '/check_version',"
-					  "type: 'GET',"
-					  "dataType: 'json',"
-					  "success: function(d) {"
-					  "document.getElementById('check_ver_btn').disabled = false;"
-					  "if (d.update_available) {"
-					  "var noDotVer = d.latest_version.replace(/\\./g, '');"
-					  "var prefix = document.getElementById('fw_prefix').value;"
-					  "var newFile = prefix + '_V' + noDotVer + d.latest_build + '.bin';"
-					  "var newUrl = 'http://fw.nakhonthai.net/LoRa/' + newFile;"
-					  "var fwLink = document.getElementById('fw_file_link');"
-					  "fwLink.href = newUrl;"
-					  "fwLink.innerHTML = newFile;"
-					  "document.getElementById('ota_url').value = newUrl;"
-					  "document.getElementById('ota_prg').innerHTML = 'New version available: V' + d.latest_version + d.latest_build + ' (' + d.latest_date + ') - firmware link updated.';"
-					  "} else {"
-					  "document.getElementById('ota_prg').innerHTML = 'You are using the latest version.';"
-					  "}"
-					  "},"
-					  "error: function(a, b, c) {"
-					  "document.getElementById('check_ver_btn').disabled = false;"
-					  "document.getElementById('ota_prg').innerHTML = 'Error checking version: ' + c;"
-					  "}"
-					  "});"
-					  "});"
-					  "</script>");
+	password = "";
 
-	strcat(webString, "<script>"
-					  "document.getElementById('ota_sumbit').addEventListener('click', function(){"
-					  "if (!confirm('Download and install firmware from URL?\\n' + document.getElementById('ota_url').value)) return;"
-					  "document.getElementById('ota_sumbit').disabled = true;"
-					  "document.getElementById('ota_prg').innerHTML = 'Downloading... Please wait ~30 sec';"
-					  "$.ajax({"
-					  "url: '/ota_url',"
-					  "type: 'POST',"
-					  "data: { url: document.getElementById('ota_url').value },"
-					  "success: function(d, s) {"
-					  "document.getElementById('ota_prg').innerHTML = 'Update started. Rebooting...';"
-					  "alert('OTA update started. Wait for system reboot (~30sec).');"
-					  "},"
-					  "error: function(a, b, c) {"
-					  "document.getElementById('ota_prg').innerHTML = 'Error: ' + c;"
-					  "document.getElementById('ota_sumbit').disabled = false;"
-					  "alert('OTA update failed: ' + c);"
-					  "}"
-					  "});"
-					  "});"
-					  "</script>");
-#endif
-	strcat(webString, "</body></html>\n");
+	if (!success)
+	{
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"register_failed\"}"
+		);
+		return;
+	}
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("About", "content");
-	response->addHeader("Cache-Control", "no-cache");
+	request->send(
+		200,
+		"application/json",
+		"{\"success\":true}"
+	);
+}
+
+// -----------------------------------------------------------------------------
+// LU6JMF - Marcelo Ferreira:
+// PRIME password recovery bridge.
+// -----------------------------------------------------------------------------
+void handle_prime_recover(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	if (!request->hasParam("email", true))
+	{
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"missing_email\"}"
+		);
+		return;
+	}
+
+	String email = request->getParam("email", true)->value();
+
+	email.trim();
+	email.toLowerCase();
+
+	if (email.length() == 0)
+	{
+		request->send(
+			400,
+			"application/json",
+			"{\"success\":false,\"error\":\"missing_email\"}"
+		);
+		return;
+	}
+
+	bool success = primeRecover(email);
+
+	if (!success)
+	{
+		request->send(
+			502,
+			"application/json",
+			"{\"success\":false,\"error\":\"recovery_failed\"}"
+		);
+		return;
+	}
+
+	request->send(
+		200,
+		"application/json",
+		"{\"success\":true}"
+	);
+}
+
+// LU6JMF - Marcelo Ferreira: fase 6 - template embutido no firmware (ver about).
+// A pagina tem 0 dados de config interpolados - so 2 booleans (autenticado,
+// feature txdebug liberada) decidem qual bloco estatico aparece.
+static const char *PRIME_TEMPLATE =
+	"{{#if authenticated}}"
+	"<div style='width:100%;max-width:520px;margin:20px auto;'>"
+	"<table style='width:100%;table-layout:fixed;'>"
+	"<tr><th>"
+	"<span><b>AR-APRS PRIME</b></span>"
+	"</th></tr>"
+	"<tr><td style='text-align:center;padding:15px;white-space:normal;'>"
+	"<h2 style='margin:5px 0 8px;'>PRIME</h2>"
+	"<div style='font-weight:bold;'>Authenticated</div>"
+	"</td></tr>"
+	"<tr><td style='padding:15px;white-space:normal;'>"
+	"<h3 style='text-align:center;margin:0 0 15px;'>PRIME RESOURCES</h3>"
+	"{{#if txDebugAllowed}}"
+	"<div style='border:1px solid #aaa;padding:15px;"
+	"box-sizing:border-box;width:100%;white-space:normal;"
+	"overflow-wrap:anywhere;text-align:center;'>"
+	"<div style='font-size:16px;font-weight:bold;margin-bottom:8px;'>"
+	"TX DEBUG"
+	"</div>"
+	"<div style='margin-bottom:15px;white-space:normal;'>"
+	"Advanced scheduler and RF transmission diagnostics."
+	"</div>"
+	"<a href='/txdebug' target='_blank' rel='noopener' "
+	"style='display:inline-block;border:1px solid #777;"
+	"border-radius:3px;padding:6px 16px;"
+	"background:#eee;color:#000;text-decoration:none;'>"
+	"OPEN"
+	"</a>"
+	"</div>"
+	"{{else}}"
+	"<div style='text-align:center;white-space:normal;'>"
+	"No PRIME resources available for this account."
+	"</div>"
+	"{{/if}}"
+	"</td></tr>"
+	"</table>"
+	"</div>"
+	// LU6JMF - Marcelo Ferreira:
+	// Refresh the authenticated view every 5s so a plan/feature change on
+	// the PRIME server reflects here without a manual reload - but only
+	// while this tab is actually visible AND the user hasn't navigated
+	// away from PRIME inside the app's own tab system (checked via the
+	// marker text still being present in #contentmain).
+	"<script>"
+	"(function(){"
+	"var primeTimer=null;"
+	"function primeTick(){"
+	"if(document.hidden){return;}"
+	"var c=document.getElementById('contentmain');"
+	"if(!c||c.innerHTML.indexOf('AR-APRS PRIME')===-1){"
+	"clearInterval(primeTimer);primeTimer=null;return;"
+	"}"
+	"$('#contentmain').load('/prime');"
+	"}"
+	"primeTimer=setInterval(primeTick,5000);"
+	"document.addEventListener('visibilitychange',function(){"
+	"if(document.hidden&&primeTimer){clearInterval(primeTimer);primeTimer=null;}"
+	"});"
+	"})();"
+	"</script>"
+	"{{else}}"
+	"<div style='width:100%;max-width:520px;margin:20px auto;'>"
+	"<table style='width:100%;table-layout:fixed;'>"
+	"<tr><th colspan='2'>"
+	"<span><b>AR-APRS PRIME</b></span>"
+	"</th></tr>"
+	"<tr><td colspan='2' style='text-align:center;padding:15px;'>"
+	"<h2 style='margin:5px 0 8px;'>PRIME</h2>"
+	"<p style='margin:0;'>Exclusive features and services for AR-APRS users.</p>"
+	"</td></tr>"
+	"<tr><td colspan='2' style='padding:15px;'>"
+	"<div id='primeLoginBox'>"
+	"<form id='primeLoginForm' style='width:100%;box-sizing:border-box;'>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>E-mail</b></label>"
+	"<input id='primeEmail' type='email' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 14px;padding:8px;' "
+	"required>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>Password</b></label>"
+	"<input id='primePassword' type='password' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 16px;padding:8px;' "
+	"required>"
+	"<button type='submit' class='btn btn-primary' style='display:block;margin:0 auto;'>"
+	"ENTRAR</button>"
+	"</form>"
+	"<hr style='margin:20px 0;'>"
+	"<div style='text-align:center;white-space:normal;'>"
+	"<button type='button' class='btn btn-success' "
+	"onclick='primeShowRegister()'>CRIAR CONTA</button>"
+	"&nbsp;"
+	"<button type='button' class='btn btn-secondary' "
+	"onclick='primeRecover()'>RECUPERAR SENHA</button>"
+	"</div>"
+	"</div>"
+	"<div id='primeRegisterBox' style='display:none;'>"
+	"<h3 style='text-align:center;margin-top:0;'>Criar conta PRIME</h3>"
+	"<form id='primeRegisterForm' style='width:100%;box-sizing:border-box;'>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>Indicativo</b></label>"
+	"<input id='primeRegisterCallsign' type='text' maxlength='20' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 14px;padding:8px;' "
+	"required>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>E-mail</b></label>"
+	"<input id='primeRegisterEmail' type='email' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 14px;padding:8px;' "
+	"required>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>Password</b></label>"
+	"<input id='primeRegisterPassword' type='password' minlength='8' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 14px;padding:8px;' "
+	"required>"
+	"<label style='display:block;text-align:left;margin-bottom:4px;'><b>Confirm Password</b></label>"
+	"<input id='primeRegisterPassword2' type='password' minlength='8' "
+	"style='display:block;width:100%;box-sizing:border-box;margin:0 0 16px;padding:8px;' "
+	"required>"
+	"<div style='text-align:center;'>"
+	"<button type='submit' class='btn btn-success'>CRIAR CONTA</button>"
+	"&nbsp;"
+	"<button type='button' class='btn btn-secondary' "
+	"onclick='primeShowLogin()'>VOLTAR</button>"
+	"</div>"
+	"</form>"
+	"</div>"
+	"<div id='primeMessage' style='margin:15px auto 0;width:100%;max-width:100%;padding:0 8px;box-sizing:border-box;text-align:center;white-space:normal;overflow-wrap:anywhere;word-break:normal;'></div>"
+	"</td></tr>"
+	"</table>"
+	"</div>"
+	"<script>"
+	"$('#primeLoginForm').on('submit',function(e){"
+	"e.preventDefault();"
+	"$('#primeMessage').html('Autenticando...');"
+	"$.post('/prime/login',"
+	"{email:$('#primeEmail').val(),password:$('#primePassword').val()},"
+	"function(data){"
+	"if(data.success){"
+	"$('#contentmain').load('/prime');"
+	"}else{"
+	"$('#primeMessage').html('<b>Login não autorizado.</b>');"
+	"}"
+	"},'json').fail(function(xhr){"
+	"if(xhr.status===401){"
+	"$('#primeMessage').html('<b>E-mail ou senha incorretos.</b>');"
+	"}else{"
+	"$('#primeMessage').html('<b>Erro ao conectar ao PRIME.</b>');"
+	"}"
+	"});"
+	"});"
+	"function primeShowRegister(){"
+	"$('#primeMessage').html('');"
+	"$('#primeLoginBox').hide();"
+	"$('#primeRegisterBox').show();"
+	"var e=$('#primeEmail').val();"
+	"if(e){$('#primeRegisterEmail').val(e);}"
+	"}"
+	"function primeShowLogin(){"
+	"$('#primeMessage').html('');"
+	"$('#primeRegisterBox').hide();"
+	"$('#primeLoginBox').show();"
+	"}"
+	"$('#primeRegisterForm').on('submit',function(e){"
+	"e.preventDefault();"
+	"var callsign=$('#primeRegisterCallsign').val().trim().toUpperCase();"
+	"var email=$('#primeRegisterEmail').val().trim();"
+	"var p1=$('#primeRegisterPassword').val();"
+	"var p2=$('#primeRegisterPassword2').val();"
+	"if(p1.length<8){"
+	"$('#primeMessage').html('<b>A senha deve ter pelo menos 8 caracteres.</b>');"
+	"return;"
+	"}"
+	"if(p1!==p2){"
+	"$('#primeMessage').html('<b>As senhas não coincidem.</b>');"
+	"return;"
+	"}"
+	"$('#primeMessage').html('Criando conta PRIME...');"
+	"$.post('/prime/register',"
+	"{callsign:callsign,email:email,password:p1},"
+	"function(data){"
+	"if(data.success){"
+	"$('#primeEmail').val(email);"
+	"$('#primePassword').val('');"
+	"$('#primeRegisterPassword').val('');"
+	"$('#primeRegisterPassword2').val('');"
+	"$('#primeRegisterBox').hide();"
+	"$('#primeLoginBox').show();"
+	"$('#primeMessage').html('<b>Conta PRIME criada com sucesso. Agora você pode entrar.</b>');"
+	"}else{"
+	"$('#primeMessage').html('<b>Não foi possível criar a conta.</b>');"
+	"}"
+	"},'json').fail(function(){"
+	"$('#primeMessage').html('<b>Não foi possível criar a conta. Verifique os dados ou se a conta já existe.</b>');"
+	"});"
+	"});"
+	"function primeRecover(){"
+	"var email=$('#primeEmail').val().trim();"
+	"if(!email){"
+	"$('#primeMessage').html('<b>Digite seu e-mail para recuperar a senha.</b>');"
+	"$('#primeEmail').focus();"
+	"return;"
+	"}"
+	"$('#primeMessage').html('Solicitando recuperação de senha...');"
+	"$.post('/prime/recover',"
+	"{email:email},"
+	"function(data){"
+	"if(data.success){"
+	"$('#primeMessage').html('<b>Se o e-mail estiver cadastrado, você receberá as instruções para redefinir sua senha.</b>');"
+	"}else{"
+	"$('#primeMessage').html('<b>Não foi possível solicitar a recuperação.</b>');"
+	"}"
+	"},'json').fail(function(){"
+	"$('#primeMessage').html('<b>Não foi possível conectar ao serviço de recuperação.</b>');"
+	"});"
+	"}"
+	"</script>"
+	"{{/if}}";
+
+void handle_prime(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	// LU6JMF - Marcelo Ferreira:
+	// A valid PRIME token changes this page from the login form to the
+	// authenticated PRIME resources view.
+	JsonDocument data;
+	bool authenticated = primeValidate();
+	data["authenticated"] = authenticated;
+	if (authenticated)
+	{
+		data["txDebugAllowed"] = primeFeature("txdebug");
+	}
+
+	String html_str = renderTemplate(PRIME_TEMPLATE, data.as<JsonVariant>());
+	AsyncResponseStream *response = request->beginResponseStream("text/html", html_str.length() + 200);
+	response->addHeader("Cache-Control", "no-store");
+	response->print(html_str);
 	request->send(response);
-	free(webString);
+}
+
+void handle_txdebug(AsyncWebServerRequest *request)
+{
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
+    // LU6JMF - Marcelo Ferreira:
+    // TX DEBUG is a PRIME resource. Hiding the link is not authorization;
+    // direct access to /txdebug must pass the same PRIME checks.
+    if (!request->authenticate(config.http_username, config.http_password))
+    {
+        return request->requestAuthentication();
+    }
+
+    if (!primeValidate() || !primeFeature("txdebug"))
+    {
+        request->send(
+            403,
+            "text/plain",
+            "PRIME authorization required."
+        );
+        return;
+    }
+
+    bool schedulerBusy = false;
+    bool pttSeen = false;
+    bool txNow = false;
+    bool pttOffPending = false;
+    bool dcdBusy = false;
+
+    uint32_t completed = 0;
+    uint32_t rejected = 0;
+    uint32_t lastCycle = 0;
+    uint32_t lastWait = 0;
+    uint32_t currentCycle = 0;
+    uint32_t watchdogRecoveries = 0;
+
+    lu6jmfTxDebugSnapshot(
+        &schedulerBusy,
+        &pttSeen,
+        &txNow,
+        &pttOffPending,
+        &dcdBusy,
+        &completed,
+        &rejected,
+        &lastCycle,
+        &lastWait,
+        &currentCycle,
+        &watchdogRecoveries
+    );
+
+    // LU6JMF - Marcelo Ferreira
+    // Copy the circular RAM log to a local snapshot before rendering.
+    Lu6jmfTxDebugEvent curEvents[40]; // must match LU6JMF_TX_EVENT_COUNT in main.cpp
+    uint8_t eventCount = lu6jmfTxDebugEvents(curEvents, 40);
+
+    // LU6JMF (Oct/2026): crash black box - last TX events of the previous run,
+    // only present when it ended in PANIC/WDT/BROWNOUT/SW reset.
+    //
+    // Restricted to the owner: this runs only after the PRIME "txdebug" gate
+    // above, and additionally requires the PRIME-validated account callsign to
+    // be the owner's. primeUserCallsign() is the value returned by the PRIME
+    // server and is already in RAM (no extra network call per refresh).
+    //
+    // To open it to EVERYONE who already has the txdebug feature, set
+    // LU6JMF_BLACKBOX_OWNER to "" (empty string): the callsign check is skipped.
+    // 2.1.5: empty = visible to everyone who already has the /txdebug (PRIME) access,
+    // not only to the owner. Set to "LU6JMF" to restrict it to the owner again.
+    static const char *LU6JMF_BLACKBOX_OWNER = "";
+    Lu6jmfTxDebugEvent prevEvents[16];
+    char prevReason[24];
+    prevReason[0] = '\0';
+    uint8_t prevCount = 0;
+    if (LU6JMF_BLACKBOX_OWNER[0] == '\0' ||
+        primeUserCallsign().equalsIgnoreCase(LU6JMF_BLACKBOX_OWNER))
+        prevCount = lu6jmfCrumbPrevEvents(prevEvents, 16, prevReason, sizeof(prevReason));
+
+    // 2.1.5: about when the previous run ended and how long it ran (black box stamps, ~30 s
+    // resolution). Shown in the LAST RESTART banner at the TOP of the page and again in the
+    // BEFORE LAST RESET card at the bottom.
+    char endTxt[160];
+    endTxt[0] = '\0';
+    uint32_t prevEpoch = lu6jmfCrumbPrevEpoch();
+    if (prevCount != 0 && prevEpoch != 0)
+    {
+        time_t te = (time_t)prevEpoch;
+        struct tm tme;
+        localtime_r(&te, &tme);
+        snprintf(endTxt, sizeof(endTxt), " | previous run ended about %02d/%02d %02d:%02d (local)",
+                 tme.tm_mday, tme.tm_mon + 1, tme.tm_hour, tme.tm_min);
+    }
+    uint32_t prevUp = lu6jmfCrumbPrevUptimeS();
+    if (prevCount != 0 && prevUp != 0)
+    {
+        size_t used = strlen(endTxt);
+        snprintf(endTxt + used, sizeof(endTxt) - used, " | it ran for %lud %02luh %02lum",
+                 (unsigned long)(prevUp / 86400UL),
+                 (unsigned long)((prevUp % 86400UL) / 3600UL),
+                 (unsigned long)((prevUp % 3600UL) / 60UL));
+    }
+
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2J: local read-only snapshot of learned RF airtime.
+    Lu6jmfTxTimingDebug timing[15];
+    uint8_t timingCount = lu6jmfTxDebugTiming(timing, 15);
+
+    // -------------------------------------------------------------------------
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2K: local read-only snapshot of central queue health and
+    // queue-to-RF-acceptance wait statistics.
+    // -------------------------------------------------------------------------
+    Lu6jmfTxQueueDebug queueDebug = {};
+    lu6jmfTxDebugQueue(&queueDebug);
+
+    Lu6jmfTxQueueWaitDebug queueWait[5]; // LU6JMF: 5 priorities incl. VERY_LOW
+    uint8_t queueWaitCount = lu6jmfTxDebugQueueWait(queueWait, 5);
+
+    // -------------------------------------------------------------------------
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2L-A: persistent rejected-admission identity by producer.
+    // -------------------------------------------------------------------------
+    Lu6jmfTxQueueRejectDebug queueReject[15];
+    uint8_t queueRejectCount =
+        lu6jmfTxDebugQueueRejectedByJob(queueReject, 15);
+
+    const char *queueHealth = "NORMAL";
+    const char *queueHealthClass = "ok";
+
+    if (queueDebug.current >= queueDebug.capacity)
+    {
+        queueHealth = "SATURATED";
+        queueHealthClass = "bad";
+    }
+    else if (queueDebug.current >= 3)
+    {
+        queueHealth = "BUSY";
+        queueHealthClass = "on";
+    }
+
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+    response->addHeader("Cache-Control", "no-store");
+
+    response->print(
+        "<!DOCTYPE html>"
+        "<html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv='refresh' content='5'>"
+        "<title>AR-APRS TX Debug</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#111;color:#eee;"
+        "max-width:1180px;margin:24px auto;padding:15px}"
+        "h2{margin-bottom:4px}"
+        "h3{margin:0 0 4px 0}"
+        "table{width:100%;border-collapse:collapse;margin-top:14px}"
+        "td,th{padding:8px;border-bottom:1px solid #444}"
+        "td:last-child{text-align:right;font-weight:bold}"
+        "th{text-align:left;color:#aaa;font-size:12px}"
+        ".on{color:#ffb000}.ok{color:#5fd35f}.bad{color:#ff5f5f}"
+        ".log td{font-family:monospace;font-size:12px}"
+        ".log td:last-child{text-align:right;font-weight:normal}"
+        "small{color:#aaa}"
+        ".grid{display:grid;"
+        "grid-template-columns:repeat(2,minmax(0,1fr));"
+        "gap:18px;margin-top:24px;align-items:start}"
+        ".card{border:1px solid #333;border-radius:8px;"
+        "padding:15px;background:#151515;min-width:0}"
+        ".full{grid-column:1/-1}"
+        "@media(max-width:820px){"
+        ".grid{grid-template-columns:1fr}"
+        ".full{grid-column:auto}"
+        "body{margin:10px auto;padding:10px}"
+        "}"
+        "</style></head><body>"
+        "<h2>AR-APRS TX DEBUG</h2>"
+        "<small>Argentina APRS System | refresh 5s<br>LU6JMF &mdash; Marcelo Ferreira &middot; Creator</small>"
+    );
+
+    // 2.1.5: LAST RESTART banner at the top (easy to find; the page refreshes every 5 s so the
+    // card at the bottom was hard to reach). Reason + about when the previous run ended + how long
+    // it ran. Without black-box data (power-on, or first boot after an update) it says so.
+    if (prevCount != 0)
+        response->printf(
+            "<div style='margin-top:14px;padding:10px 14px;border:1px solid #ffb000;"
+            "border-radius:8px;background:#2a2200;color:#ffd466;font-size:13px'>"
+            "<b>LAST RESTART:</b> %s%s</div>",
+            prevReason, endTxt);
+    else
+        response->print(
+            "<div style='margin-top:14px;padding:10px 14px;border:1px solid #444;"
+            "border-radius:8px;background:#1a1a1a;color:#aaa;font-size:13px'>"
+            "<b>LAST RESTART:</b> no data (power-on or first boot after an update)</div>");
+
+    response->print(
+        "<div class='grid'>"
+        "<div class='card'>"
+        "<h3>RF SCHEDULER</h3>"
+        "<table>"
+    );
+
+    response->printf(
+        "<tr><td>RF Scheduler</td><td class='%s'>%s</td></tr>"
+        "<tr><td>PTT observed</td><td class='%s'>%s</td></tr>"
+        "<tr><td>TX state now</td><td class='%s'>%s</td></tr>"
+        "<tr><td>Deferred PTT OFF</td><td class='%s'>%s</td></tr>"
+        "<tr><td>DCD / Channel</td><td class='%s'>%s</td></tr>"
+        "<tr><td>Completed TX</td><td>%lu</td></tr>"
+        "<tr><td>AX.25 rejected</td><td>%lu</td></tr>"
+        "<tr><td>Last full cycle</td><td>%lu ms</td></tr>"
+        "<tr><td>Last wait to PTT</td><td>%lu ms</td></tr>"
+        "<tr><td>Current cycle</td><td>%lu ms</td></tr>"
+        "<tr><td>Watchdog recoveries</td><td class='%s'>%lu</td></tr>"
+        "</table>",
+
+        schedulerBusy ? "on" : "ok",
+        schedulerBusy ? "BUSY" : "FREE",
+
+        pttSeen ? "on" : "ok",
+        pttSeen ? "YES" : "NO",
+
+        txNow ? "on" : "ok",
+        txNow ? "YES" : "NO",
+
+        pttOffPending ? "on" : "ok",
+        pttOffPending ? "YES" : "NO",
+
+        dcdBusy ? "on" : "ok",
+        dcdBusy ? "BUSY" : "FREE",
+
+        (unsigned long)completed,
+        (unsigned long)rejected,
+        (unsigned long)lastCycle,
+        (unsigned long)lastWait,
+        (unsigned long)currentCycle,
+
+        watchdogRecoveries ? "on" : "ok",
+        (unsigned long)watchdogRecoveries
+    );
+
+    // -------------------------------------------------------------------------
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2K: central queue health.
+    //
+    // NORMAL / BUSY / SATURATED is diagnostic presentation only.
+    // It NEVER changes scheduler arbitration or queue admission.
+    // -------------------------------------------------------------------------
+    response->print(
+        "</div>"
+        "<div class='card'>"
+        "<h3>QUEUE HEALTH</h3>"
+        "<small>Central TX queue | RAM only | diagnostic</small>"
+        "<table>"
+    );
+
+    response->printf(
+        "<tr><td>Status</td><td class='%s'>%s</td></tr>"
+        "<tr><td>Current</td><td>%u / %u</td></tr>"
+        "<tr><td>Peak</td><td>%u / %u</td></tr>"
+        "<tr><td>Saturation events</td><td>%lu</td></tr>"
+        "<tr><td>Rejected admissions</td><td>%lu</td></tr>"
+        "</table>",
+        queueHealthClass,
+        queueHealth,
+        (unsigned int)queueDebug.current,
+        (unsigned int)queueDebug.capacity,
+        (unsigned int)queueDebug.peak,
+        (unsigned int)queueDebug.capacity,
+        (unsigned long)queueDebug.saturated,
+        (unsigned long)queueDebug.rejected
+    );
+
+    // 2.1.5: system health (heap + lowest free stack ever seen per task). Read-only,
+    // no allocation. Lets us watch the heap trend and catch a task about to overflow
+    // its stack (Task WDT / random resets) without a USB cable.
+    {
+        const char *stackTasks[] = {"taskAPRS", "taskAPRSPoll", "taskNetwork", "async_tcp", "loopTask"};
+        response->print(
+            "</div>"
+            "<div class='card'>"
+            "<h3>SYSTEM HEALTH</h3>"
+            "<small>Heap and lowest free stack ever seen (bytes) | diagnostic</small>"
+            "<table>"
+        );
+        response->printf(
+            "<tr><td>Free heap</td><td>%lu</td></tr>"
+            "<tr><td>Lowest free heap</td><td>%lu</td></tr>"
+            "<tr><td>Largest free block</td><td>%lu</td></tr>",
+            (unsigned long)ESP.getFreeHeap(),
+            (unsigned long)ESP.getMinFreeHeap(),
+            (unsigned long)ESP.getMaxAllocHeap()
+        );
+        {
+            // 2.1.5: boot time in local time (now - uptime); needs the clock to be synced (NTP/GPS).
+            uint32_t be = lu6jmfBootEpoch();
+            char bt[40];
+            if (be != 0)
+            {
+                time_t tb = (time_t)be;
+                struct tm tmb;
+                localtime_r(&tb, &tmb);
+                snprintf(bt, sizeof(bt), "%02d/%02d %02d:%02d:%02d",
+                         tmb.tm_mday, tmb.tm_mon + 1, tmb.tm_hour, tmb.tm_min, tmb.tm_sec);
+            }
+            else
+                snprintf(bt, sizeof(bt), "unknown (clock not synced)");
+            response->printf("<tr><td>Boot time (local)</td><td>%s</td></tr>", bt);
+        }
+        for (uint8_t t = 0; t < sizeof(stackTasks) / sizeof(stackTasks[0]); t++)
+        {
+            TaskHandle_t th = xTaskGetHandle(stackTasks[t]);
+            if (th == NULL)
+                continue;
+            unsigned long freeStack = (unsigned long)uxTaskGetStackHighWaterMark(th);
+            response->printf("<tr><td>Stack free: %s</td><td class='%s'>%lu</td></tr>",
+                             stackTasks[t],
+                             (freeStack < 512) ? "bad" : "ok",
+                             freeStack);
+        }
+        response->print("</table>");
+
+        // Heap history: one sample per hour (newest first). Falling steadily without ever
+        // recovering = leak; going up and down = normal use.
+        uint32_t hUp[24], hFree[24], hMax[24];
+        uint8_t hCount = lu6jmfHeapHistory(hUp, hFree, hMax, 24);
+        response->print(
+            "</div>"
+            "<div class='card'>"
+            "<h3>HEAP HISTORY</h3>"
+            "<small>One sample per hour, last 24 (RAM only, cleared on reset) | diagnostic</small>"
+            "<table class='log'>"
+            "<tr><th>Uptime</th><th>Free heap</th><th style='text-align:right'>Largest block</th></tr>");
+        if (hCount == 0)
+        {
+            response->print("<tr><td colspan='3'>First sample about 1 minute after boot.</td></tr>");
+        }
+        for (uint8_t n = 0; n < hCount; n++)
+        {
+            response->printf("<tr><td>%luh %02lum</td><td>%lu</td><td style='text-align:right'>%lu</td></tr>",
+                             (unsigned long)(hUp[n] / 60),
+                             (unsigned long)(hUp[n] % 60),
+                             (unsigned long)hFree[n],
+                             (unsigned long)hMax[n]);
+        }
+        response->print("</table>");
+        // Persistent watchdog snapshots (the TX event log rolls over in minutes).
+        uint32_t wAt[4], wStuck[4], wPacked[4], wStack[4], wHeap[4];
+        uint8_t wJob[4];
+        uint8_t wCount = lu6jmfWdSnapshotGet(wAt, wStuck, wPacked, wJob, wStack, wHeap, 4);
+        if (wCount > 0)
+        {
+            response->print(
+                "</div>"
+                "<div class='card full'>"
+                "<h3>WATCHDOG RECOVERIES (since boot)</h3>"
+                "<small>Last 4, newest first | kept even after the event log rolls over | diagnostic</small>"
+                "<table class='log'>"
+                "<tr><th>Uptime</th><th>Job</th><th>Stuck</th><th>State</th>"
+                "<th style='text-align:right'>taskAPRS stack / heap</th></tr>");
+            for (uint8_t n = 0; n < wCount; n++)
+            {
+                uint32_t v = wPacked[n];
+                uint8_t st = v & 0x03;
+                response->printf(
+                    "<tr><td>%lu.%03lu s</td><td>%s</td><td>%lu ms</td>"
+                    "<td>init=%s full=%u seen=%u keyed=%u rx=%u isr=%u dac=%u h%u t%u</td>"
+                    "<td style='text-align:right'>%lu / %lu</td></tr>",
+                    (unsigned long)(wAt[n] / 1000), (unsigned long)(wAt[n] % 1000),
+                    lu6jmfJobNameStr(wJob[n]),
+                    (unsigned long)wStuck[n],
+                    (st == 0) ? "OFF" : (st == 1) ? "WAITING" : "TRANSMITTING",
+                    (unsigned)((v >> 2) & 1), (unsigned)((v >> 3) & 1), (unsigned)((v >> 4) & 1),
+                    (unsigned)((v >> 5) & 1), (unsigned)((v >> 6) & 1), (unsigned)((v >> 7) & 1),
+                    (unsigned)((v >> 8) & 0xFF), (unsigned)((v >> 16) & 0xFF),
+                    (unsigned long)wStack[n], (unsigned long)wHeap[n]);
+            }
+            response->print("</table>");
+        }
+        if (hCount >= 3)
+        {
+            long delta = (long)hFree[0] - (long)hFree[hCount - 1];
+            response->printf("<small>Trend: %+ld bytes of free heap over %luh (oldest to newest).</small>",
+                             delta,
+                             (unsigned long)((hUp[0] - hUp[hCount - 1]) / 60));
+        }
+    }
+
+    response->print(
+        "</div>"
+        "<div class='card'>"
+        "<h3>QUEUE WAIT BY PRIORITY</h3>"
+        "<small>Queue admission to RF ACCEPTED | RAM only | diagnostic</small>"
+        "<table class='log'>"
+        "<tr><th>Priority</th><th>Samples</th><th>Last</th>"
+        "<th>Average</th><th style='text-align:right'>Max</th></tr>"
+    );
+
+    // Display highest priority first for easier operational reading.
+    for (int p = (int)queueWaitCount - 1; p >= 0; p--)
+    {
+        const char *priorityName = "UNKNOWN";
+
+        switch (queueWait[p].priority)
+        {
+            case LU6JMF_TXPRIO_VERY_LOW:
+                priorityName = "VERY_LOW";
+                break;
+
+            case LU6JMF_TXPRIO_LOW:
+                priorityName = "LOW";
+                break;
+
+            case LU6JMF_TXPRIO_NORMAL:
+                priorityName = "NORMAL";
+                break;
+
+            case LU6JMF_TXPRIO_HIGH:
+                priorityName = "HIGH";
+                break;
+
+            case LU6JMF_TXPRIO_CRITICAL:
+                priorityName = "CRITICAL";
+                break;
+        }
+
+        response->printf(
+            "<tr><td>%s</td><td>%lu</td><td>%lu ms</td>"
+            "<td>%lu ms</td><td>%lu ms</td></tr>",
+            priorityName,
+            (unsigned long)queueWait[p].samples,
+            (unsigned long)queueWait[p].lastMs,
+            (unsigned long)queueWait[p].avgMs,
+            (unsigned long)queueWait[p].maxMs
+        );
+    }
+
+    response->print("</table>");
+
+    response->print("</div><div class='card'>");
+
+    // -------------------------------------------------------------------------
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2J: learned real RF airtime.
+    // Observational only: these values never release or terminate RF TX.
+    // -------------------------------------------------------------------------
+    response->print(
+        "<h3>LEARNED RF AIRTIME</h3>"
+        "<small>PTT ON to real PTT OFF | RAM only | diagnostic</small>"
+        "<table class='log'>"
+        "<tr><th>Job</th><th>Samples</th><th>Last</th>"
+        "<th>Average</th><th style='text-align:right'>Max</th></tr>"
+    );
+
+    for (uint8_t i = 0; i < timingCount; i++)
+    {
+        const char *timingJobName = "GENERIC";
+
+        switch (timing[i].jobType)
+        {
+            case LU6JMF_TXJOB_ACK:
+                timingJobName = "ACK";
+                break;
+            case LU6JMF_TXJOB_MESSAGE:
+                timingJobName = "MESSAGE";
+                break;
+            case LU6JMF_TXJOB_MSG_RETRY:
+                timingJobName = "MSG RETRY";
+                break;
+            case LU6JMF_TXJOB_DIGI:
+                timingJobName = "DIGI";
+                break;
+            case LU6JMF_TXJOB_TRACKER:
+                timingJobName = "TRACKER";
+                break;
+            case LU6JMF_TXJOB_IGATE:
+                timingJobName = "IGATE";
+                break;
+            case LU6JMF_TXJOB_DIGI_POSITION:
+                timingJobName = "DIGI POS";
+                break;
+            case LU6JMF_TXJOB_WX:
+                timingJobName = "WX";
+                break;
+            case LU6JMF_TXJOB_TLM:
+                timingJobName = "TLM";
+                break;
+            case LU6JMF_TXJOB_BULLETIN:
+                timingJobName = "BULLETIN";
+                break;
+            case LU6JMF_TXJOB_NEWS:
+                timingJobName = "NEWS";
+                break;
+            case LU6JMF_TXJOB_OBJECT:
+                timingJobName = "OBJECT";
+                break;
+            case LU6JMF_TXJOB_INET2RF:
+                timingJobName = "INET->RF";
+                break;
+            case LU6JMF_TXJOB_EXTERNAL:
+                timingJobName = "EXTERNAL";
+                break;
+            default:
+                timingJobName = "GENERIC";
+                break;
+        }
+
+        response->printf(
+            "<tr><td>%s</td><td>%lu</td><td>%lu ms</td>"
+            "<td>%lu ms</td><td>%lu ms</td></tr>",
+            timingJobName,
+            (unsigned long)timing[i].samples,
+            (unsigned long)timing[i].lastAirMs,
+            (unsigned long)timing[i].avgAirMs,
+            (unsigned long)timing[i].maxAirMs
+        );
+    }
+
+    if (timingCount == 0)
+    {
+        response->print(
+            "<tr><td colspan='5'>Waiting for first completed RF TX...</td></tr>"
+        );
+    }
+
+    response->print("</table></div>");
+
+    // -------------------------------------------------------------------------
+    // LU6JMF - Marcelo Ferreira
+    // Phase 2L-A: identify actual producers rejected by a full central queue.
+    // Diagnostic only. No scheduler policy is changed here.
+    // -------------------------------------------------------------------------
+    response->print(
+        "<div class='card full'>"
+        "<h3>REJECTED ADMISSIONS BY PRODUCER</h3>"
+        "<small>Central queue full | accumulated since boot</small>"
+        "<table class='log'>"
+        "<tr><th>Job</th><th style='text-align:right'>Rejected</th></tr>"
+    );
+
+    for (uint8_t i = 0; i < queueRejectCount; i++)
+    {
+        const char *rejectJobName = "GENERIC";
+
+        switch (queueReject[i].jobType)
+        {
+            case LU6JMF_TXJOB_ACK:           rejectJobName = "ACK"; break;
+            case LU6JMF_TXJOB_MESSAGE:       rejectJobName = "MESSAGE"; break;
+            case LU6JMF_TXJOB_MSG_RETRY:     rejectJobName = "MSG RETRY"; break;
+            case LU6JMF_TXJOB_DIGI:          rejectJobName = "DIGI"; break;
+            case LU6JMF_TXJOB_TRACKER:       rejectJobName = "TRACKER"; break;
+            case LU6JMF_TXJOB_IGATE:         rejectJobName = "IGATE"; break;
+            case LU6JMF_TXJOB_DIGI_POSITION: rejectJobName = "DIGI POS"; break;
+            case LU6JMF_TXJOB_WX:            rejectJobName = "WX"; break;
+            case LU6JMF_TXJOB_TLM:           rejectJobName = "TLM"; break;
+            case LU6JMF_TXJOB_BULLETIN:      rejectJobName = "BULLETIN"; break;
+            case LU6JMF_TXJOB_NEWS:          rejectJobName = "NEWS"; break;
+            case LU6JMF_TXJOB_OBJECT:        rejectJobName = "OBJECT"; break;
+            case LU6JMF_TXJOB_INET2RF:       rejectJobName = "INET->RF"; break;
+            case LU6JMF_TXJOB_EXTERNAL:      rejectJobName = "EXTERNAL"; break;
+            default:                         rejectJobName = "GENERIC"; break;
+        }
+
+        response->printf(
+            "<tr><td>%s</td><td>%lu</td></tr>",
+            rejectJobName,
+            (unsigned long)queueReject[i].rejected
+        );
+    }
+
+    if (queueRejectCount == 0)
+    {
+        response->print(
+            "<tr><td colspan='2'>No rejected admissions since boot.</td></tr>"
+        );
+    }
+
+    response->print(
+        "</table>"
+        "</div>"
+        "<div class='card full'>"
+        "<h3>TX EVENT LOG</h3>"
+        "<small>RAM only | newest first | cleared on reboot</small>"
+        "<table class='log'>"
+        "<tr><th>Uptime</th><th>Event</th><th>Job</th><th style='text-align:right'>Value</th></tr>"
+    );
+
+    // Pass 0 = current run, pass 1 = black box of the previous (abnormal) run.
+    for (uint8_t pass = 0; pass < 2; pass++)
+    {
+    const Lu6jmfTxDebugEvent *events = (pass == 0) ? curEvents : prevEvents;
+    uint8_t srcCount = (pass == 0) ? eventCount : prevCount;
+
+    if (pass == 1)
+    {
+        if (prevCount == 0)
+            break;
+
+        response->printf(
+            "</table>"
+            "</div>"
+            // 2.1.5: always visible when the previous run ended abnormally (no hidden
+            // click-to-reveal any more). Only emitted for the owner (gate above).
+            "<div class='card full' id='lu6bb'>"
+            "<h3>BEFORE LAST RESET (%s)</h3>"
+            "<small>last TX events of the previous run | newest first | "
+            "uptime is from that previous boot%s</small>"
+            "<table class='log'>"
+            "<tr><th>Uptime</th><th>Event</th><th>Job</th>"
+            "<th style='text-align:right'>Value</th></tr>",
+            prevReason,
+            endTxt
+        );
+    }
+
+    for (uint8_t i = 0; i < srcCount; i++)
+    {
+        const char *eventName = "UNKNOWN";
+        const char *jobName = "GENERIC";
+        char value[96]; // LU6JMF: 96 for the WATCHDOG STATE decode below (2.1.5: +isr/dac)
+        value[0] = '\0';
+
+        // LU6JMF - Marcelo Ferreira
+        // Human-readable producer identity for RF Scheduler diagnostics.
+        switch (events[i].jobType)
+        {
+            case LU6JMF_TXJOB_ACK:           jobName = "ACK"; break;
+            case LU6JMF_TXJOB_MESSAGE:       jobName = "MESSAGE"; break;
+            case LU6JMF_TXJOB_MSG_RETRY:     jobName = "MSG RETRY"; break;
+            case LU6JMF_TXJOB_DIGI:          jobName = "DIGI"; break;
+            case LU6JMF_TXJOB_TRACKER:       jobName = "TRACKER"; break;
+            case LU6JMF_TXJOB_IGATE:         jobName = "IGATE"; break;
+            case LU6JMF_TXJOB_DIGI_POSITION: jobName = "DIGI POS"; break;
+            case LU6JMF_TXJOB_WX:            jobName = "WX"; break;
+            case LU6JMF_TXJOB_TLM:           jobName = "TLM"; break;
+            case LU6JMF_TXJOB_BULLETIN:      jobName = "BULLETIN"; break;
+            case LU6JMF_TXJOB_NEWS:          jobName = "NEWS"; break;
+            case LU6JMF_TXJOB_OBJECT:        jobName = "OBJECT"; break;
+            case LU6JMF_TXJOB_INET2RF:       jobName = "INET->RF"; break;
+            case LU6JMF_TXJOB_EXTERNAL:      jobName = "EXTERNAL"; break;
+            default:                         jobName = "GENERIC"; break;
+        }
+
+        switch (events[i].code)
+        {
+            case 1:
+                eventName = "RF ACCEPTED";
+                snprintf(value, sizeof(value), "slot %lu",
+                         (unsigned long)events[i].value);
+                break;
+
+            case 2:
+                eventName = "PTT ON";
+                snprintf(value, sizeof(value), "%lu ms",
+                         (unsigned long)events[i].value);
+                break;
+
+            case 3:
+                eventName = "PTT OFF TASK";
+                break;
+
+            case 4:
+                eventName = "PTT OFF DONE";
+                break;
+
+            case 5:
+                eventName = "RF RELEASE";
+                snprintf(value, sizeof(value), "%lu ms",
+                         (unsigned long)events[i].value);
+                break;
+
+            case 6:
+                eventName = "AX25 REJECT";
+                snprintf(value, sizeof(value), "count %lu",
+                         (unsigned long)events[i].value);
+                break;
+
+            // LU6JMF - Marcelo Ferreira
+            // Phase 2G: queue admission and queue saturation diagnostics.
+            // value carries Lu6jmfTxPriority for these event types.
+            case 7:
+            case 8:
+            {
+                eventName = (events[i].code == 7)
+                                ? "QUEUE PUSH"
+                                : "QUEUE FULL";
+
+                const char *priorityName = "UNKNOWN";
+
+                switch (events[i].value)
+                {
+                    case LU6JMF_TXPRIO_VERY_LOW:
+                        priorityName = "VERY_LOW";
+                        break;
+
+                    case LU6JMF_TXPRIO_LOW:
+                        priorityName = "LOW";
+                        break;
+
+                    case LU6JMF_TXPRIO_NORMAL:
+                        priorityName = "NORMAL";
+                        break;
+
+                    case LU6JMF_TXPRIO_HIGH:
+                        priorityName = "HIGH";
+                        break;
+
+                    case LU6JMF_TXPRIO_CRITICAL:
+                        priorityName = "CRITICAL";
+                        break;
+                }
+
+                snprintf(value, sizeof(value), "%s", priorityName);
+                break;
+            }
+
+            case 9:
+                eventName = "ACK WINDOW START";
+                snprintf(value, sizeof(value), "%lu ms",
+                         (unsigned long)events[i].value);
+                break;
+
+            case 10:
+                eventName = "ACK WINDOW END";
+                break;
+
+            case 11:
+            {
+                eventName = "QUEUE PREEMPT";
+
+                uint8_t displacedJob =
+                    (uint8_t)(events[i].value & 0xFF);
+
+                uint8_t displacedPriority =
+                    (uint8_t)((events[i].value >> 8) & 0xFF);
+
+                const char *displacedJobName = "GENERIC";
+                const char *displacedPriorityName = "UNKNOWN";
+
+                switch (displacedJob)
+                {
+                    case LU6JMF_TXJOB_ACK:           displacedJobName = "ACK"; break;
+                    case LU6JMF_TXJOB_MESSAGE:       displacedJobName = "MESSAGE"; break;
+                    case LU6JMF_TXJOB_MSG_RETRY:     displacedJobName = "MSG RETRY"; break;
+                    case LU6JMF_TXJOB_DIGI:          displacedJobName = "DIGI"; break;
+                    case LU6JMF_TXJOB_TRACKER:       displacedJobName = "TRACKER"; break;
+                    case LU6JMF_TXJOB_IGATE:         displacedJobName = "IGATE"; break;
+                    case LU6JMF_TXJOB_DIGI_POSITION: displacedJobName = "DIGI POS"; break;
+                    case LU6JMF_TXJOB_WX:            displacedJobName = "WX"; break;
+                    case LU6JMF_TXJOB_TLM:           displacedJobName = "TLM"; break;
+                    case LU6JMF_TXJOB_BULLETIN:      displacedJobName = "BULLETIN"; break;
+                    case LU6JMF_TXJOB_NEWS:          displacedJobName = "NEWS"; break;
+                    case LU6JMF_TXJOB_OBJECT:        displacedJobName = "OBJECT"; break;
+                    case LU6JMF_TXJOB_INET2RF:       displacedJobName = "INET->RF"; break;
+                    case LU6JMF_TXJOB_EXTERNAL:      displacedJobName = "EXTERNAL"; break;
+                    default:                         displacedJobName = "GENERIC"; break;
+                }
+
+                switch (displacedPriority)
+                {
+                    case LU6JMF_TXPRIO_VERY_LOW:
+                        displacedPriorityName = "VERY_LOW";
+                        break;
+
+                    case LU6JMF_TXPRIO_LOW:
+                        displacedPriorityName = "LOW";
+                        break;
+
+                    case LU6JMF_TXPRIO_NORMAL:
+                        displacedPriorityName = "NORMAL";
+                        break;
+
+                    case LU6JMF_TXPRIO_HIGH:
+                        displacedPriorityName = "HIGH";
+                        break;
+
+                    case LU6JMF_TXPRIO_CRITICAL:
+                        displacedPriorityName = "CRITICAL";
+                        break;
+                }
+
+                snprintf(value,
+                         sizeof(value),
+                         "%s %s",
+                         displacedJobName,
+                         displacedPriorityName);
+                break;
+            }
+
+            // LU6JMF - Marcelo Ferreira (Oct/2026)
+            // TX Scheduler watchdog recovery: value = ms the RF lifecycle was stuck.
+            case 12:
+                eventName = "WATCHDOG RECOVER";
+                snprintf(value, sizeof(value), "%lu ms",
+                         (unsigned long)events[i].value);
+                break;
+
+            // LU6JMF - Marcelo Ferreira (Oct/2026)
+            // Modem/AX.25 state snapshot taken when the watchdog fired.
+            // seen=0 -> stalled BEFORE PTT ON (AX.25 never keyed);
+            // seen=1 -> keyed, but the end-of-TX signal never arrived.
+            case 13:
+            {
+                eventName = "WATCHDOG STATE";
+                uint32_t v = events[i].value;
+                uint8_t st = v & 0x03;
+                const char *stName = (st == 0) ? "OFF"
+                                     : (st == 1) ? "WAITING"
+                                                 : "TRANSMITTING";
+                snprintf(value, sizeof(value),
+                         "init=%s full=%u seen=%u keyed=%u rx=%u isr=%u dac=%u h%u t%u",
+                         stName,
+                         (unsigned)((v >> 2) & 1),
+                         (unsigned)((v >> 3) & 1),
+                         (unsigned)((v >> 4) & 1),
+                         (unsigned)((v >> 5) & 1),
+                         (unsigned)((v >> 6) & 1),
+                         (unsigned)((v >> 7) & 1),
+                         (unsigned)((v >> 8) & 0xFF),
+                         (unsigned)((v >> 16) & 0xFF));
+                break;
+            }
+        }
+
+        uint32_t seconds = events[i].timestamp / 1000;
+        uint32_t milliseconds = events[i].timestamp % 1000;
+
+        response->printf(
+            "<tr><td>%lu.%03lu s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+            (unsigned long)seconds,
+            (unsigned long)milliseconds,
+            eventName,
+            jobName,
+            value
+        );
+    }
+
+    if (pass == 0 && eventCount == 0)
+    {
+        response->print(
+            "<tr><td>-</td><td>No TX events yet</td><td></td><td></td></tr>"
+        );
+    }
+    } // end pass loop
+
+    response->print(
+        "</table>"
+        "</div>"
+        "</div>"
+        "<p><small>"
+        "Scheduler completion is released only after real PTT OFF."
+        "</small></p>"
+    );
+
+    // 2.1.5: the black box card is now always shown (see above); the old
+    // click-on-"OFF." reveal script was removed.
+    response->print("</body></html>");
+
+    request->send(response);
 }
 
 void handle_gnss(AsyncWebServerRequest *request)
 {
-	// Allocate initial memory for HTML content
-	char *webString = allocateStringMemory(8192); // Start with 8KB buffer
+	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
+	esp_task_wdt_reset();
+	// AsyncResponseStream grows its internal cbuf incrementally (small chunks)
+	AsyncResponseStream *webString = request->beginResponseStream("text/html", 20000);
 	if (!webString)
 	{
 		request->send(500, "text/html", "Memory allocation failed");
 		return;
 	}
-	strcpy(webString, "<html>\n<head>\n");
-	strcat(webString, "<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
-	//strcat(webString, "<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
-	//strcat(webString, "<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
-	strcat(webString, "<script language=\"JavaScript\">");
+	webString->print("<html>\n<head>\n");
+	webString->print("<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
+	webString->print("<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
+	webString->print("<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
+	webString->print("<script language=\"JavaScript\">");
 
 	// Add some life
-	strcat(webString, "function gnss() { \n"); // the chart may be destroyed
-	strcat(webString, "var raw=\"\";var timeStamp;\n");
-	strcat(webString, "var host='ws://'+location.hostname+':81/ws_gnss'\n");
-	strcat(webString, "const ws = new WebSocket(host);\n");
-	strcat(webString, "ws.onopen = function() { console.log('Connection opened');};\n ws.onclose = function() { console.log('Connection closed');};\n");
-	strcat(webString, "ws.onmessage = function(event) {\n  console.log(event.data);\n");
-	strcat(webString, "const jsonR=JSON.parse(event.data);\n");
-	strcat(webString, "document.getElementById(\"en\").innerHTML=parseInt(jsonR.en);\n");
-	strcat(webString, "document.getElementById(\"lat\").innerHTML=parseFloat(jsonR.lat);\n");
-	strcat(webString, "document.getElementById(\"lng\").innerHTML=parseFloat(jsonR.lng);\n");
-	strcat(webString, "document.getElementById(\"alt\").innerHTML=parseFloat(jsonR.alt);\n");
-	strcat(webString, "document.getElementById(\"spd\").innerHTML=parseFloat(jsonR.spd);\n");
-	strcat(webString, "document.getElementById(\"csd\").innerHTML=parseFloat(jsonR.csd);\n");
-	strcat(webString, "document.getElementById(\"hdop\").innerHTML=parseFloat(jsonR.hdop);\n");
-	strcat(webString, "document.getElementById(\"sat\").innerHTML=parseInt(jsonR.sat);\n");
-	strcat(webString, "document.getElementById(\"time\").innerHTML=parseInt(jsonR.time);\n");
-	strcat(webString, "raw=jsonR.RAW;\n");
-	strcat(webString, "timeStamp=Number(jsonR.timeStamp);\n");
-	strcat(webString, "var textArea=document.getElementById(\"raw_txt\");\n");
-	strcat(webString, "textArea.value+=atob(raw)+\"\\n\";\n");
-	strcat(webString, "textArea.scrollTop = textArea.scrollHeight;\n");
-	strcat(webString, "}\n");
-	strcat(webString, "};\n</script>\n");
-	strcat(webString, "</head><body onload=\"gnss()\">\n");
+	webString->print("function gnss() { \n"); // the chart may be destroyed
+	webString->print("var raw=\"\";var timeStamp;\n");
+	webString->print("var host='ws://'+location.hostname+':81/ws_gnss'\n");
+	webString->print("const ws = new WebSocket(host);\n");
+	webString->print("ws.onopen = function() { console.log('Connection opened');};\n ws.onclose = function() { console.log('Connection closed');};\n");
+	webString->print("ws.onmessage = function(event) {\n  console.log(event.data);\n");
+	webString->print("const jsonR=JSON.parse(event.data);\n");
+	webString->print("document.getElementById(\"en\").innerHTML=parseInt(jsonR.en);\n");
+	webString->print("document.getElementById(\"lat\").innerHTML=parseFloat(jsonR.lat);\n");
+	webString->print("document.getElementById(\"lng\").innerHTML=parseFloat(jsonR.lng);\n");
+	webString->print("document.getElementById(\"alt\").innerHTML=parseFloat(jsonR.alt);\n");
+	webString->print("document.getElementById(\"spd\").innerHTML=parseFloat(jsonR.spd);\n");
+	webString->print("document.getElementById(\"csd\").innerHTML=parseFloat(jsonR.csd);\n");
+	webString->print("document.getElementById(\"hdop\").innerHTML=parseFloat(jsonR.hdop);\n");
+	webString->print("document.getElementById(\"sat\").innerHTML=parseInt(jsonR.sat);\n");
+	webString->print("document.getElementById(\"time\").innerHTML=parseInt(jsonR.time);\n");
+	webString->print("raw=jsonR.RAW;\n");
+	webString->print("timeStamp=Number(jsonR.timeStamp);\n");
+	webString->print("var textArea=document.getElementById(\"raw_txt\");\n");
+	webString->print("textArea.value+=atob(raw)+\"\\n\";\n");
+	webString->print("textArea.scrollTop = textArea.scrollHeight;\n");
+	webString->print("}\n");
+	webString->print("};\n</script>\n");
+	webString->print("</head><body onload=\"gnss()\">\n");
 
-	strcat(webString, "<table width=\"200\" border=\"1\">");
-	strcat(webString, "<th colspan=\"2\" style=\"background-color: #00BCD4;\"><span><b>GNSS Information</b></span></th>\n");
-	// strcat(webString, "<tr><th width=\"200\"><span><b>Name</b></span></th><th><span><b>Information</b></span></th></tr>");
+	webString->print("<table width=\"200\" border=\"1\">");
+	webString->print("<th colspan=\"2\" style=\"background-color: #00BCD4;\"><span><b>GNSS Information</b></span></th>\n");
+	// webString->print("<tr><th width=\"200\"><span><b>Name</b></span></th><th><span><b>Information</b></span></th></tr>");
 
-	char temp_buf[256];
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Enable: </b></td><td align=\"left\"> <label id=\"en\">%d</label></td></tr>", config.gnss_enable);
-	strcat(webString, temp_buf);
+	{
+		char *temp_en = allocateStringMemory(512);
+		if (temp_en)
+		{
+			snprintf(temp_en, 512, "<tr><td align=\"right\"><b>Enable: </b></td><td align=\"left\"> <label id=\"en\">%d</label></td></tr>", config.gnss_enable);
+			webString->print(temp_en);
+			free(temp_en);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Latitude: </b></td><td align=\"left\"> <label id=\"lat\">%.5f</label></td></tr>", gps.location.lat());
-	strcat(webString, temp_buf);
+	{
+		char *temp_lat = allocateStringMemory(512);
+		if (temp_lat)
+		{
+			snprintf(temp_lat, 512, "<tr><td align=\"right\"><b>Latitude: </b></td><td align=\"left\"> <label id=\"lat\">%.5f</label></td></tr>", gps.location.lat());
+			webString->print(temp_lat);
+			free(temp_lat);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Longitude: </b></td><td align=\"left\"> <label id=\"lng\">%.5f</label></td></tr>", gps.location.lng());
-	strcat(webString, temp_buf);
+	{
+		char *temp_lng = allocateStringMemory(512);
+		if (temp_lng)
+		{
+			snprintf(temp_lng, 512, "<tr><td align=\"right\"><b>Longitude: </b></td><td align=\"left\"> <label id=\"lng\">%.5f</label></td></tr>", gps.location.lng());
+			webString->print(temp_lng);
+			free(temp_lng);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Altitude: </b></td><td align=\"left\"> <label id=\"alt\">%.2f</label> m.</td></tr>", gps.altitude.meters());
-	strcat(webString, temp_buf);
+	{
+		char *temp_alt = allocateStringMemory(512);
+		if (temp_alt)
+		{
+			snprintf(temp_alt, 512, "<tr><td align=\"right\"><b>Altitude: </b></td><td align=\"left\"> <label id=\"alt\">%.2f</label> m.</td></tr>", gps.altitude.meters());
+			webString->print(temp_alt);
+			free(temp_alt);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Speed: </b></td><td align=\"left\"> <label id=\"spd\">%.2f</label> km/h</td></tr>", gps.speed.kmph());
-	strcat(webString, temp_buf);
+	{
+		char *temp_spd = allocateStringMemory(512);
+		if (temp_spd)
+		{
+			snprintf(temp_spd, 512, "<tr><td align=\"right\"><b>Speed: </b></td><td align=\"left\"> <label id=\"spd\">%.2f</label> km/h</td></tr>", gps.speed.kmph());
+			webString->print(temp_spd);
+			free(temp_spd);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Course: </b></td><td align=\"left\"> <label id=\"csd\">%.1f</label></td></tr>", gps.course.deg());
-	strcat(webString, temp_buf);
+	{
+		char *temp_csd = allocateStringMemory(512);
+		if (temp_csd)
+		{
+			snprintf(temp_csd, 512, "<tr><td align=\"right\"><b>Course: </b></td><td align=\"left\"> <label id=\"csd\">%.1f</label></td></tr>", gps.course.deg());
+			webString->print(temp_csd);
+			free(temp_csd);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>HDOP: </b></td><td align=\"left\"> <label id=\"hdop\">%.2f</label> </td></tr>", gps.hdop.hdop());
-	strcat(webString, temp_buf);
+	{
+		char *temp_hdop = allocateStringMemory(512);
+		if (temp_hdop)
+		{
+			snprintf(temp_hdop, 512, "<tr><td align=\"right\"><b>HDOP: </b></td><td align=\"left\"> <label id=\"hdop\">%.2f</label> </td></tr>", gps.hdop.hdop());
+			webString->print(temp_hdop);
+			free(temp_hdop);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>SAT: </b></td><td align=\"left\"> <label id=\"sat\">%d</label> </td></tr>", gps.satellites.value());
-	strcat(webString, temp_buf);
+	{
+		char *temp_sat = allocateStringMemory(512);
+		if (temp_sat)
+		{
+			snprintf(temp_sat, 512, "<tr><td align=\"right\"><b>SAT: </b></td><td align=\"left\"> <label id=\"sat\">%d</label> </td></tr>", gps.satellites.value());
+			webString->print(temp_sat);
+			free(temp_sat);
+		}
+	}
 
-	snprintf(temp_buf, sizeof(temp_buf), "<tr><td align=\"right\"><b>Time: </b></td><td align=\"left\"> <label id=\"time\">%d</label> </td></tr>", gps.time.value());
-	strcat(webString, temp_buf);
+	{
+		char *temp_time = allocateStringMemory(512);
+		if (temp_time)
+		{
+			snprintf(temp_time, 512, "<tr><td align=\"right\"><b>Time: </b></td><td align=\"left\"> <label id=\"time\">%d</label> </td></tr>", gps.time.value());
+			webString->print(temp_time);
+			free(temp_time);
+		}
+	}
 
-	strcat(webString, "</table><table>");
-	strcat(webString, "<tr><td><b>Terminal:</b><br /><textarea id=\"raw_txt\" name=\"raw_txt\" rows=\"30\" cols=\"80\" /></textarea></td></tr>\n");
-	strcat(webString, "</table>\n");
+	webString->print("</table><table>");
+	webString->print("<tr><td><b>Terminal:</b><br /><textarea id=\"raw_txt\" name=\"raw_txt\" rows=\"30\" cols=\"80\" /></textarea></td></tr>\n");
+	webString->print("</table>\n");
 
-	strcat(webString, "</body></html>\n");
+	webString->print("</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("GNSS", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(webString);
+	webString->addHeader("GNSS", "content");
+	webString->addHeader("Cache-Control", "no-cache");
+	request->send(webString);
 }
 
 void handle_default()
@@ -12129,32 +12562,86 @@ void handle_default()
 	defaultSetting = false;
 }
 
-void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
-{
-	if (!index)
-	{
-		// Open the file in write mode on the first chunk
-		request->_tempFile = LITTLEFS.open("/" + filename, "w");
-	}
-	if (len < (LITTLEFS.totalBytes() - LITTLEFS.usedBytes()))
-	{
-		// Write the data chunk to the file
-		request->_tempFile.write(data, len);
-	}
-	else
-	{
+// LU6JMF - Marcelo Ferreira:
+// The route's main callback (see async_server.on("/upload", ...)) used to
+// unconditionally reply "File uploaded successfully!" no matter what
+// happened in here - so a failed mkdir/open/write (silently swallowed,
+// nothing here ever checked a return value) still showed "Upload Success"
+// to the user. Track the real outcome here and let the route callback
+// report it truthfully.
+bool lastUploadOk = false;
+String lastUploadError = "";
+
+void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    // LU6JMF - Marcelo Ferreira:
+    // The generic uploader saves to LittleFS root, but the firmware reads
+    // the packed symbol icons from /symbols/icons.dat (see ICON_PACK_PATH).
+    // Special-case this one filename so it lands where the firmware expects
+    // it - this lets the icon set be updated in place via the normal
+    // single-file upload, without touching /updatefs (which reflashes the
+    // whole partition and wipes the saved config).
+    String targetPath = "/" + filename;
+    if (filename == "icons.dat")
+    {
+        targetPath = "/symbols/icons.dat";
+    }
+    // LU6JMF - Marcelo Ferreira:
+    // Fase 6 - main_shell.html originally went under /templates/, but this
+    // vendored LittleFS_esp32 port doesn't reliably create/use a runtime
+    // mkdir()'d subfolder on this hardware (write silently produced nothing,
+    // reproduced live: "Upload Success" but file never actually landed).
+    // Keep it flat at root, same as style.css - avoids the whole issue.
+    else if (filename == "main_shell.html")
+    {
+        targetPath = "/main_shell.html";
+    }
+    else if (filename == "style.css")
+    {
+        targetPath = "/style.css";
+    }
+    if (!index) {
+        lastUploadOk = false;
+        lastUploadError = "";
+        // Open the file in write mode on the first chunk
+        request->_tempFile = LITTLEFS.open(targetPath, "w");
+        if (!request->_tempFile) {
+            lastUploadError = "Could not open " + targetPath + " for writing (missing parent dir?)";
+            log_e("%s", lastUploadError.c_str());
+            return;
+        }
+    }
+    if (!request->_tempFile) {
+        return; // open already failed on chunk 0 - nothing more we can do with later chunks
+    }
+    if (len < (LITTLEFS.totalBytes()-LITTLEFS.usedBytes())) {
+        // Write the data chunk to the file
+        size_t written = request->_tempFile.write(data, len);
+        if (written != len) {
+            lastUploadError = "Write failed at offset " + String(index) + " (" + String(written) + "/" + String(len) + " bytes)";
+            log_e("%s", lastUploadError.c_str());
+            request->_tempFile.close();
+            LITTLEFS.remove(targetPath);
+            return;
+        }
+    }else{
 		// Not enough space to write the file
+		lastUploadError = "Not enough space to upload the file";
 		request->_tempFile.close();
-		LITTLEFS.remove("/" + filename); // Remove the incomplete file
-		request->send(500, "text/plain", "Not enough space to upload the file");
+		LITTLEFS.remove(targetPath); // Remove the incomplete file
 		return;
 	}
-	if (final)
-	{
-		// Close the file on the last chunk and redirect
-		request->_tempFile.close();
-		request->redirect("/"); // Redirect back to the main page
-	}
+    if (final) {
+        // Close the file on the last chunk, then verify it actually landed
+        // with the expected content before calling it a success.
+        request->_tempFile.close();
+        File check = LITTLEFS.open(targetPath, "r");
+        if (check && check.size() > 0) {
+            lastUploadOk = true;
+        } else if (lastUploadError == "") {
+            lastUploadError = "File missing or empty after write: " + targetPath;
+        }
+        if (check) check.close();
+    }
 }
 
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
@@ -12171,6 +12658,31 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 		log_d("Client disconnected");
 	}
 }
+
+// void handle_vpn_request(AsyncWebServerRequest *request) {
+//     HTTPClient http;
+
+//     String url = "http://vpn.nakhonthai.net:82/wg/create";
+
+//     String mac = WiFi.macAddress();
+//     mac.replace(":", "");
+
+//     String payload = "{\"name\":\"" + mac + "\"}";
+
+//     http.begin(url);
+//     http.addHeader("Content-Type", "application/json");
+
+//     int httpCode = http.POST(payload);
+
+//     if (httpCode > 0) {
+//         String res = http.getString();
+//         request->send(200, "application/json", res);
+//     } else {
+//         request->send(500, "text/plain", "Error contacting VPN server");
+//     }
+
+//     http.end();
+// }
 
 bool webServiceBegin = true;
 void webService()
@@ -12196,6 +12708,9 @@ void webService()
 					{ handle_logout(request); });
 	async_server.on("/radio", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_radio(request); });
+	// v2.1.3.1-audiotest: TX audio calibration tone, see handle_calibrate_tone() above.
+	async_server.on("/calibrate_tone", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_calibrate_tone(request); });
 	async_server.on("/vpn", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_vpn(request); });
 #ifdef MQTT
@@ -12204,22 +12719,32 @@ void webService()
 #endif
 	async_server.on("/msg", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_msg(request); });
+	async_server.on("/object", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_object(request); });
 	async_server.on("/mod", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_mod(request); });
+	async_server.on("/mod2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_mod2(request); });
 	async_server.on("/default", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_default(); });
 	async_server.on("/igate", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_igate(request); });
+	async_server.on("/igate2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_igate2(request); });
 	async_server.on("/digi", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_digi(request); });
 	async_server.on("/tracker", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_tracker(request); });
 	async_server.on("/wx", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_wx(request); });
+	async_server.on("/wx2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_wx2(request); });
 	async_server.on("/tlm", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_tlm(request); });
 	async_server.on("/sensor", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_sensor(request); });
+	async_server.on("/sensor2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_sensor2(request); });
 	async_server.on("/system", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_system(request); });
 	async_server.on("/wireless", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12228,12 +12753,30 @@ void webService()
 					{ handle_test(request); });
 	async_server.on("/gnss", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_gnss(request); });
-	async_server.on("/realtime", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_realtime(request); });
+	// async_server.on("/realtime", HTTP_GET, [](AsyncWebServerRequest *request)
+	// 				{ handle_realtime(request); });
 	async_server.on("/about", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_about(request); });
+	async_server.on("/prime", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_prime(request); });
+
+	// LU6JMF - Marcelo Ferreira: PRIME authentication endpoint.
+	async_server.on("/prime/login", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_prime_login(request); });
+
+	// LU6JMF - Marcelo Ferreira: PRIME account creation endpoint.
+	async_server.on("/prime/register", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_prime_register(request); });
+
+	// LU6JMF - Marcelo Ferreira: PRIME password recovery endpoint.
+	async_server.on("/prime/recover", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_prime_recover(request); });
 	async_server.on("/dashboard", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_dashboard(request); });
+
+	// LU6JMF - Marcelo Ferreira: temporary TX Scheduler diagnostics.
+	async_server.on("/txdebug", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_txdebug(request); });
 	async_server.on("/sidebarInfo", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_sidebar(request); });
 	async_server.on("/sysinfo", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -12252,11 +12795,18 @@ void webService()
 					{ handle_delete(request); });
 	async_server.on("/format", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_format(request); });
-
 	// Route to handle the file upload
-	async_server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request)
-					{ request->send(200, "text/plain", "File uploaded successfully!"); }, handleUpload); // Pass the handleUpload function as the upload handler
+    async_server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request) {
+        // LU6JMF - Marcelo Ferreira: report what actually happened in
+        // handleUpload() instead of always claiming success (see there).
+        if (lastUploadOk) {
+            request->send(200, "text/plain", "File uploaded successfully!");
+        } else {
+            request->send(500, "text/plain", "Upload failed: " + lastUploadError);
+        }
+    }, handleUpload); // Pass the handleUpload function as the upload handler
 
+	// async_server.on("/api/vpnreq", HTTP_GET, handle_vpn_request);
 	async_server.on(
 		"/update", HTTP_POST, [](AsyncWebServerRequest *request)
 		{
@@ -12275,16 +12825,18 @@ void webService()
 				}
 				else
 				{
-					disableLoopWDT();
-					disableCore0WDT();
+					adcEn = -1;
+					dacEn = -1;
+					delay(500);
+					// disableLoopWDT();
+					// disableCore0WDT();
 					// disableCore1WDT();
-					// esp_task_wdt_delete(taskAPRSPollHandle); // Delete watchdog task
-					// disableCore1WDT();
-					// vTaskSuspend(taskAPRSPollHandle);
-					// vTaskSuspend(taskAPRSHandle);
-					// vTaskSuspend(taskSensorHandle);
-					// vTaskSuspend(taskSerialHandle);
-					// vTaskSuspend(taskGPSHandle);
+					//  vTaskSuspend(taskAPRSPollHandle);
+					//  vTaskSuspend(taskAPRSHandle);
+					//  vTaskSuspend(taskSensorHandle);
+					//  vTaskSuspend(taskSerialHandle);
+					//  vTaskSuspend(taskGPSHandle);
+					//  vTaskSuspend(taskSensorHandle);
 				}
 			}
 			if (!Update.hasError())
@@ -12309,36 +12861,97 @@ void webService()
 			}
 		});
 
-	async_server.on("/ota_url", HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_ota_url(request); });
+	async_server.on(
+		"/updatefs", HTTP_POST, [](AsyncWebServerRequest *request)
+		{
+  		bool espShouldReboot = !Update.hasError();
+  		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", espShouldReboot ? "<h1><strong>Filesystem Update DONE</strong></h1><br><a href='/'>Return Home</a>" : "<h1><strong>Filesystem Update FAILED</strong></h1><br><a href='/about'>Retry?</a>");
+  		response->addHeader("Connection", "close");
+  		request->send(response); },
+		[](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
+		{
+			if (!index)
+			{
+				log_d("Filesystem Update Start: %s\n", filename.c_str());
+				// custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+				// Same Update lib as firmware OTA, but targets the "spiffs" (LittleFS) partition
+				// instead of the app partition - lets us push data/symbols/icons/* over the web
+				// when there is no physical USB access to the board.
+				if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS))
+				{
+					Update.printError(Serial);
+				}
+			}
+			if (!Update.hasError())
+			{
+				if (Update.write(data, len) != len)
+				{
+					Update.printError(Serial);
+				}
+			}
+			if (final)
+			{
+				if (Update.end(true))
+				{
+					log_d("Filesystem Update Success: %uByte\n", index + len);
+					// custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+					// The published littlefs.bin only carries icons/fsversion.txt (no
+					// personal config), so this raw overwrite of the whole partition
+					// would otherwise wipe the user's WiFi/APRS config too - stranding
+					// remote users with no USB access in AP mode. `config` is the live
+					// in-RAM copy (loaded at boot, untouched by the flash write below),
+					// so remount the fresh filesystem and write it straight back out.
+					LITTLEFS.end();
+					if (LITTLEFS.begin(false))
+					{
+						if (saveConfiguration("/default.cfg", config))
+						{
+							log_d("Config restored to new filesystem after update\n");
+						}
+						else
+						{
+							log_e("Failed to restore config after filesystem update\n");
+						}
+						LITTLEFS.end();
+					}
+					else
+					{
+						log_e("Could not remount LITTLEFS to restore config after update\n");
+					}
+					delay(1000);
+					esp_restart();
+				}
+				else
+				{
+					Update.printError(Serial);
+				}
+			}
+		});
 
-	async_server.on("/check_version", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_check_version(request); });
+async_server.on("/check_version", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_check_version(request); });		
 
 	lastheard_events.onConnect([](AsyncEventSourceClient *client)
 							   {
-								   if (client->lastId())
-								   {
-#if (CORE_DEBUG_LEVEL > 0)
-									   log_d("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
-#endif
-								   }
-							   });
+    if(client->lastId()){
+      log_d("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
+    }
+    // send event with message "hello!", id current millis
+    // and set reconnect delay to 1 second
+    //String html = event_lastHeard(true);
+    //client->send(html.c_str(), "lastHeard", time(NULL), 5000); 
+});
 	async_server.addHandler(&lastheard_events);
 
 	message_events.onConnect([](AsyncEventSourceClient *client)
 							 {
-								 if (client->lastId())
-								 {
-#if (CORE_DEBUG_LEVEL > 0)
-									 log_d("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
-#endif
-								 }
-								 // send event with message "hello!", id current millis
-								 // and set reconnect delay to 1 second
-								 // String html = event_chatMessage(true);
-								 // client->send(html.c_str(), "chatMsg", time(NULL), 5000);
-							 });
+    if(client->lastId()){
+      log_d("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
+    }
+    // send event with message "hello!", id current millis
+    // and set reconnect delay to 1 second
+	String html = event_chatMessage(true);
+    client->send(html.c_str(), "chatMsg", time(NULL), 5000); });
 	async_server.addHandler(&message_events);
 
 	async_server.onNotFound(notFound);

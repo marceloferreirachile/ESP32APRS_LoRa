@@ -1,461 +1,462 @@
 /*
  Name:		ESP32APRS
- Created:	13-10-2023 14:27:23
+ Created:	25-12-2024
  Author:	HS5TQA/Atten
  Github:	https://github.com/nakhonthai
  Facebook:	https://www.facebook.com/atten
- Support IS: host:aprs.dprns.com port:14580 or aprs.hs5tqa.ampr.org:14580
- Support IS monitor: http://aprs.dprns.com:14501 or http://aprs.hs5tqa.ampr.org:14501
 */
 
 #include "config.h"
 #include <LITTLEFS.h>
+#include <SPIFFS.h>
 #include "FS.h"
 #include <ArduinoJson.h>
+//#include <StreamUtils.h>
+#include "AFSK.h"
+#include <esp_task_wdt.h>
 
 extern fs::LITTLEFSFS LITTLEFS;
 
-// ประกาศ global semaphore
-static SemaphoreHandle_t cfg_mutex = NULL;
+extern TaskHandle_t taskAPRSHandle;
+extern TaskHandle_t taskAPRSPollHandle;
+
+//JsonDocument doc;
+
+extern volatile int8_t adcEn;
+extern volatile int8_t dacEn;
 
 // Saves the configuration to a file
 bool saveConfiguration(const char *filename, const Configuration &config)
 {
-    if (cfg_mutex == NULL)
-        cfg_mutex = xSemaphoreCreateMutex();
-    if (xSemaphoreTake(cfg_mutex, portMAX_DELAY) == pdTRUE)
+    // Delete existing file, otherwise the configuration is appended to the file
+    //AFSK_TimerEnable(false);
+    // if (LITTLEFS.exists(filename))
+    // {
+    //     LITTLEFS.remove(filename);
+    //     log_d("Remove file %s",filename);
+    // }
+
+    // Open file for writing
+    // File file = LITTLEFS.open(filename, FILE_WRITE);
+    // if (!file)
+    // {
+    //     log_d("Failed to create file");
+    //     return false;
+    // }
+    
+    log_d("Create file %s",filename);
+    //AFSK_TimerEnable(false);
+    // Allocate a temporary JsonDocument
+    //adcEn=-1;
+    //delay(500);
+    //StaticJsonDocument<6000> doc;    
+    JsonDocument doc;
+    
+    // Set the values in the document
+    doc["cpuFreq"] = config.cpuFreq;
+    doc["txTimeSlot"] = config.tx_timeslot;
+    doc["syncTime"] = config.synctime;
+    doc["timeZone"] = config.timeZone;
+    doc["ntpHost"] = config.ntp_host;
+    doc["WiFiMode"] = (signed char)config.wifi_mode;
+    doc["WiFiPwr"] = config.wifi_power;
+    doc["WiFiAPCH"] = config.wifi_ap_ch;
+    doc["WiFiAP_SSID"] = config.wifi_ap_ssid;
+    doc["WiFiAP_PASS"] = config.wifi_ap_pass;
+    JsonArray wifiArray = doc["WiFiSTA"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
     {
-        // Delete existing file, otherwise the configuration is appended to the file
+        wifiArray.add(config.wifi_sta[i].enable);
+        wifiArray.add(config.wifi_sta[i].wifi_ssid);
+        wifiArray.add(config.wifi_sta[i].wifi_pass);
+    }
 
-        if (LITTLEFS.exists(filename))
-        {
-            LITTLEFS.remove(filename);
-        }
+    doc["fx25Mode"] = config.fx25_mode;
+    doc["rfEnable"] = config.rf_en;
+    doc["rfType"] = config.rf_type;
+    doc["rfModem"] = config.modem_type;    
+    doc["rfPreamble"] = config.preamble;
+    doc["rfFreqRX"] = config.freq_rx;
+    doc["rfFreqTX"] = config.freq_tx;
+    doc["rfToneRX"] = config.tone_rx;
+    doc["rfToneTX"] = config.tone_tx;
+    doc["rfSql"] = config.sql_level;
+    doc["rfVolume"] = config.volume;
+    doc["rfBand"] = config.band;
+    doc["rfPwr"] = config.rf_power;
+    doc["audioLPF"] = config.audio_lpf;
+    doc["txAudioGain"] = config.tx_audio_gain;
+    doc["txPreemphasis"] = config.tx_preemphasis;
+    doc["txPreemphasisTilt"] = config.tx_preemphasis_tilt;
+    // doc["rfFreq"] = config.rf_freq;
+    // doc["rfOffset"] = config.rf_freq_offset;
+    // doc["rfBW"] = config.rf_bw;
+    // doc["rfSF"] = config.rf_sf;
+    // doc["rfCR"] = config.rf_cr;
+    // doc["rfSync"] = config.rf_sync;
+    // doc["rfPwr"] = config.rf_power;
+    // doc["rfPream"] = config.rf_preamable;
+    // doc["rfLNA"] = config.rf_lna;
+    // doc["rfMode"] = config.rf_mode;
+    // doc["rfAX25"] = config.rf_ax25;
+    // doc["rfBR"] = config.rf_br;
+    // doc["rfShaping"] = config.rf_shaping;
+    // doc["rfEncoding"] = config.rf_encoding;
 
-        // Open file for writing
-        File file = LITTLEFS.open(filename, FILE_WRITE);
-        if (!file)
-        {
-            log_d("Failed to create file");
-            xSemaphoreGive(cfg_mutex);
-            return false;
-        }
+    // IGate group
+    doc["igateEn"] = config.igate_en;
+    doc["igateBcn"] = config.igate_bcn;
+    doc["rf2inet"] = config.rf2inet;
+    doc["inet2rf"] = config.inet2rf;
+    doc["igatePos2rf"] = config.igate_loc2rf;
+    doc["igatePos2inet"] = config.igate_loc2inet;
+    doc["rf2inetFilter"] = config.rf2inetFilter;
+    doc["inet2rfFiltger"] = config.inet2rfFilter;
 
-        // Allocate a temporary JsonDocument
-        JsonDocument doc;
+    doc["igateSSID"] = config.aprs_ssid;
+    doc["igatePort"] = config.aprs_port;
+    doc["igateMycall"] = config.aprs_mycall;
+    doc["igateHost"] = config.aprs_host;
+    // doc["igatePassCode"]=config.aprs_passcode;
+    doc["igateFilter"] = config.aprs_filter;
+    doc["igateGPS"] = config.igate_gps;
+    doc["igateLAT"] = config.igate_lat;
+    doc["igateLON"] = config.igate_lon;
+    doc["igateALT"] = config.igate_alt;
+    doc["igateINV"] = config.igate_interval;
+    doc["igateSymbol"] = config.igate_symbol;
+    doc["igateObject"] = config.igate_object;
+    doc["igatePHG"] = config.igate_phg;
+    doc["igatePath"] = config.igate_path;
+    doc["igateComment"] = config.igate_comment;
+    doc["igateSTSIntv"] = config.igate_sts_interval;
+    doc["igateStatus"] = config.igate_status;
+    JsonArray igateTlmAvg = doc["igateTlmAvg"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmAvg.add(config.igate_tlm_avg[i]);
+    JsonArray igateTlmSen = doc["igateTlmSen"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmSen.add(config.igate_tlm_sensor[i]);
+    JsonArray igateTlmPrec = doc["igateTlmPrec"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmPrec.add(config.igate_tlm_precision[i]);
+    JsonArray igateTlmOffset = doc["igateTlmOffset"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmOffset.add(config.igate_tlm_offset[i]);
+    JsonArray igateTlmPARM = doc["igateTlmPARM"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmPARM.add(config.igate_tlm_PARM[i]);
+    JsonArray igateTlmUNIT = doc["igateTlmUNIT"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        igateTlmUNIT.add(config.igate_tlm_UNIT[i]);
+    JsonArray igateTlmEQNS = doc["igateTlmEQNS"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+    {
+        igateTlmEQNS.add(config.igate_tlm_EQNS[i][0]);
+        igateTlmEQNS.add(config.igate_tlm_EQNS[i][1]);
+        igateTlmEQNS.add(config.igate_tlm_EQNS[i][2]);
+    }
 
-        // Set the values in the document
-        doc["txTimeSlot"] = config.tx_timeslot;
-        doc["syncTime"] = config.synctime;
-        doc["timeZone"] = config.timeZone;
-        doc["ntpHost"] = config.ntp_host;
-        doc["WiFiMode"] = (signed char)config.wifi_mode;
-        doc["WiFiPwr"] = config.wifi_power;
-        doc["WiFiAPCH"] = config.wifi_ap_ch;
-        doc["WiFiAP_SSID"] = config.wifi_ap_ssid;
-        doc["WiFiAP_PASS"] = config.wifi_ap_pass;
-        JsonArray wifiArray = doc["WiFiSTA"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-        {
-            wifiArray.add(config.wifi_sta[i].enable);
-            wifiArray.add(config.wifi_sta[i].wifi_ssid);
-            wifiArray.add(config.wifi_sta[i].wifi_pass);
-        }
+    // Digi group
+    doc["digiEn"] = config.digi_en;
+    doc["digiAuto"] = config.digi_auto;
+    doc["digiPos2rf"] = config.digi_loc2rf;
+    doc["digiPos2inet"] = config.digi_loc2inet;
+    doc["digiTime"] = config.digi_timestamp;
+    doc["digiSSID"] = config.digi_ssid;
+    doc["digiMycall"] = config.digi_mycall;
+    doc["digiPath"] = config.digi_path;
+    doc["digiDelay"] = config.digi_delay;
+    doc["digiFilter"] = config.digiFilter;
+    doc["digiBcn"] = config.digi_bcn;
+    doc["digiAlt"] = config.digi_alt;
+    doc["digiGPS"] = config.digi_gps;
+    doc["digiLAT"] = config.digi_lat;
+    doc["digiLON"] = config.digi_lon;
+    doc["digiINV"] = config.digi_interval;
+    doc["digiSymbol"] = config.digi_symbol;
+    doc["digiPHG"] = config.digi_phg;
+    doc["digiComment"] = config.digi_comment;
+    doc["digiSTSIntv"] = config.digi_sts_interval;
+    doc["digiStatus"] = config.digi_status;
+    JsonArray digiTlmAvg = doc["digiTlmAvg"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmAvg.add(config.digi_tlm_avg[i]);
+    JsonArray digiTlmSen = doc["digiTlmSen"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmSen.add(config.digi_tlm_sensor[i]);
+    JsonArray digiTlmPrec = doc["digiTlmPrec"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmPrec.add(config.digi_tlm_precision[i]);
+    JsonArray digiTlmOffset = doc["digiTlmOffset"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmOffset.add(config.digi_tlm_offset[i]);
+    JsonArray digiTlmPARM = doc["digiTlmPARM"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmPARM.add(config.digi_tlm_PARM[i]);
+    JsonArray digiTlmUNIT = doc["digiTlmUNIT"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        digiTlmUNIT.add(config.digi_tlm_UNIT[i]);
+    JsonArray digiTlmEQNS = doc["digiTlmEQNS"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+    {
+        digiTlmEQNS.add(config.digi_tlm_EQNS[i][0]);
+        digiTlmEQNS.add(config.digi_tlm_EQNS[i][1]);
+        digiTlmEQNS.add(config.digi_tlm_EQNS[i][2]);
+    }
 
-        doc["rfEnable"] = config.rf_en;
-        doc["rfType"] = config.rf_type;
-        doc["rfFreq"] = config.rf_freq;
-        doc["rfOffset"] = config.rf_freq_offset;
-        doc["rfBW"] = config.rf_bw;
-        doc["rfSF"] = config.rf_sf;
-        doc["rfCR"] = config.rf_cr;
-        doc["rfSync"] = config.rf_sync;
-        doc["rfPwr"] = config.rf_power;
-        doc["rfPream"] = config.rf_preamable;
-        doc["rfLNA"] = config.rf_lna;
-        doc["rfMode"] = config.rf_mode;
-        doc["rfAX25"] = config.rf_ax25;
-        doc["rfBR"] = config.rf_br;
-        doc["rfShaping"] = config.rf_shaping;
-        doc["rfEncoding"] = config.rf_encoding;
-        doc["rfRxBoost"] = config.rf_rx_boost;
-#ifdef RF2
-        doc["rf1Enable"] = config.rf1_en;
-        doc["rf1Type"] = config.rf1_type;
-        doc["rf1Freq"] = config.rf1_freq;
-        doc["rf1Offset"] = config.rf1_freq_offset;
-        doc["rf1BW"] = config.rf1_bw;
-        doc["rf1SF"] = config.rf1_sf;
-        doc["rf1CR"] = config.rf1_cr;
-        doc["rf1Sync"] = config.rf1_sync;
-        doc["rf1Pwr"] = config.rf1_power;
-        doc["rf1Pream"] = config.rf1_preamable;
-        doc["rf1LNA"] = config.rf1_lna;
-        doc["rf1Mode"] = config.rf1_mode;
-        doc["rf1AX25"] = config.rf1_ax25;
-        doc["rf1BR"] = config.rf1_br;
-        doc["rf1Shaping"] = config.rf1_shaping;
-        doc["rf1Encoding"] = config.rf1_encoding;
-        doc["rf1RxBoost"] = config.rf1_rx_boost;
-#endif
+    // Tracker group
+    doc["trkEn"] = config.trk_en;
+    doc["trkPos2rf"] = config.trk_loc2rf;
+    doc["trkPos2inet"] = config.trk_loc2inet;
+    doc["trkTime"] = config.trk_timestamp;
+    doc["trkSSID"] = config.trk_ssid;
+    doc["trkMycall"] = config.trk_mycall;
+    doc["trkPath"] = config.trk_path;
+    doc["trkGPS"] = config.trk_gps;
+    doc["trkLAT"] = config.trk_lat;
+    doc["trkLON"] = config.trk_lon;
+    doc["trkALT"] = config.trk_alt;
+    doc["trkINV"] = config.trk_interval;
+    doc["trkSmart"] = config.trk_smartbeacon;
+    doc["trkCompress"] = config.trk_compress;
+    doc["trkOptAlt"] = config.trk_altitude;
+    doc["trkLog"] = config.trk_log;
+    doc["trkOptRSSI"] = config.trk_rssi;
+    doc["trkLSpeed"] = config.trk_lspeed;
+    doc["trkHSpeed"] = config.trk_hspeed;
+    doc["trkMaxInv"] = config.trk_maxinterval;
+    doc["trkMinInv"] = config.trk_mininterval;
+    doc["trkMinDir"] = config.trk_minangle;
+    doc["trkSlowInv"] = config.trk_slowinterval;
+    doc["trkSymbol"] = config.trk_symbol;
+    doc["trkSymbolMove"] = config.trk_symmove;
+    doc["trkSymbolStop"] = config.trk_symstop;
+    doc["trkItem"] = config.trk_item;
+    doc["trkComment"] = config.trk_comment;
+    doc["trkSTSIntv"] = config.trk_sts_interval;
+    doc["trkStatus"] = config.trk_status;
+    JsonArray trkTlmAvg = doc["trkTlmAvg"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmAvg.add(config.trk_tlm_avg[i]);
+    JsonArray trkTlmSen = doc["trkTlmSen"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmSen.add(config.trk_tlm_sensor[i]);
+    JsonArray trkTlmPrec = doc["trkTlmPrec"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmPrec.add(config.trk_tlm_precision[i]);
+    JsonArray trkTlmOffset = doc["trkTlmOffset"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmOffset.add(config.trk_tlm_offset[i]);
+    JsonArray trkTlmPARM = doc["trkTlmPARM"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmPARM.add(config.trk_tlm_PARM[i]);
+    JsonArray trkTlmUNIT = doc["trkTlmUNIT"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+        trkTlmUNIT.add(config.trk_tlm_UNIT[i]);
+    JsonArray trkTlmEQNS = doc["trkTlmEQNS"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+    {
+        trkTlmEQNS.add(config.trk_tlm_EQNS[i][0]);
+        trkTlmEQNS.add(config.trk_tlm_EQNS[i][1]);
+        trkTlmEQNS.add(config.trk_tlm_EQNS[i][2]);
+    }
 
-        // IGate group
-        doc["igateEn"] = config.igate_en;
-        doc["igateBcn"] = config.igate_bcn;
-        doc["rf2inet"] = config.rf2inet;
-        doc["inet2rf"] = config.inet2rf;
-        doc["igatePos2rf"] = config.igate_loc2rf;
-        doc["igatePos2inet"] = config.igate_loc2inet;
-        doc["rf2inetFilter"] = config.rf2inetFilter;
-        doc["inet2rfFiltger"] = config.inet2rfFilter;
+    // WX group
+    doc["wxEn"] = config.wx_en;
+    doc["wxTx2rf"] = config.wx_2rf;
+    doc["wxTx2inet"] = config.wx_2inet;
+    doc["wxTime"] = config.wx_timestamp;
+    doc["wxSSID"] = config.wx_ssid;
+    doc["wxMycall"] = config.wx_mycall;
+    doc["wxPath"] = config.wx_path;
+    doc["wxGPS"] = config.wx_gps;
+    doc["wxLAT"] = config.wx_lat;
+    doc["wxLON"] = config.wx_lon;
+    doc["wxALT"] = config.wx_alt;
+    doc["wxInv"] = config.wx_interval;
+    doc["wxFlage"] = config.wx_flage;
+    doc["wxObject"] = config.wx_object;
+    doc["wxComment"] = config.wx_comment;
 
-        doc["igateSSID"] = config.igate_ssid;
-        doc["igatePort"] = config.aprs_port;
-        doc["igateMycall"] = config.igate_mycall;
-        doc["igateHost"] = config.igate_host;
-        // doc["igatePassCode"]=config.aprs_passcode;
-        doc["igateFilter"] = config.igate_filter;
-        doc["igateGPS"] = config.igate_gps;
-        doc["igateLAT"] = config.igate_lat;
-        doc["igateLON"] = config.igate_lon;
-        doc["igateALT"] = config.igate_alt;
-        doc["igateINV"] = config.igate_interval;
-        doc["igateSymbol"] = config.igate_symbol;
-        doc["igateObject"] = config.igate_object;
-        doc["igatePHG"] = config.igate_phg;
-        doc["igatePath"] = config.igate_path;
-        doc["igateComment"] = config.igate_comment;
-        doc["igateSTSIntv"] = config.igate_sts_interval;
-        doc["igateStatus"] = config.igate_status;
-        JsonArray igateTlmAvg = doc["igateTlmAvg"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmAvg.add(config.igate_tlm_avg[i]);
-        JsonArray igateTlmSen = doc["igateTlmSen"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmSen.add(config.igate_tlm_sensor[i]);
-        JsonArray igateTlmPrec = doc["igateTlmPrec"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmPrec.add(config.igate_tlm_precision[i]);
-        JsonArray igateTlmOffset = doc["igateTlmOffset"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmOffset.add(config.igate_tlm_offset[i]);
-        JsonArray igateTlmPARM = doc["igateTlmPARM"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmPARM.add(config.igate_tlm_PARM[i]);
-        JsonArray igateTlmUNIT = doc["igateTlmUNIT"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            igateTlmUNIT.add(config.igate_tlm_UNIT[i]);
-        JsonArray igateTlmEQNS = doc["igateTlmEQNS"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-        {
-            igateTlmEQNS.add(config.igate_tlm_EQNS[i][0]);
-            igateTlmEQNS.add(config.igate_tlm_EQNS[i][1]);
-            igateTlmEQNS.add(config.igate_tlm_EQNS[i][2]);
-        }
-        // Digi group
-        doc["digiEn"] = config.digi_en;
-        doc["digiAuto"] = config.digi_auto;
-        doc["digiPos2rf"] = config.digi_loc2rf;
-        doc["digiPos2inet"] = config.digi_loc2inet;
-        doc["digiTime"] = config.digi_timestamp;
-        doc["digiSSID"] = config.digi_ssid;
-        doc["digiMycall"] = config.digi_mycall;
-        doc["digiPath"] = config.digi_path;
-        doc["digiDelay"] = config.digi_delay;
-        doc["digiFilter"] = config.digiFilter;
-        doc["digiBcn"] = config.digi_bcn;
-        doc["digiAlt"] = config.digi_alt;
-        doc["digiGPS"] = config.digi_gps;
-        doc["digiLAT"] = config.digi_lat;
-        doc["digiLON"] = config.digi_lon;
-        doc["digiINV"] = config.digi_interval;
-        doc["digiSymbol"] = config.digi_symbol;
-        doc["digiPHG"] = config.digi_phg;
-        doc["digiComment"] = config.digi_comment;
-        doc["digiSTSIntv"] = config.digi_sts_interval;
-        doc["digiStatus"] = config.digi_status;
-        JsonArray digiTlmAvg = doc["digiTlmAvg"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmAvg.add(config.digi_tlm_avg[i]);
-        JsonArray digiTlmSen = doc["digiTlmSen"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmSen.add(config.digi_tlm_sensor[i]);
-        JsonArray digiTlmPrec = doc["digiTlmPrec"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmPrec.add(config.digi_tlm_precision[i]);
-        JsonArray digiTlmOffset = doc["digiTlmOffset"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmOffset.add(config.digi_tlm_offset[i]);
-        JsonArray digiTlmPARM = doc["digiTlmPARM"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmPARM.add(config.digi_tlm_PARM[i]);
-        JsonArray digiTlmUNIT = doc["digiTlmUNIT"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            digiTlmUNIT.add(config.digi_tlm_UNIT[i]);
-        JsonArray digiTlmEQNS = doc["digiTlmEQNS"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-        {
-            digiTlmEQNS.add(config.digi_tlm_EQNS[i][0]);
-            digiTlmEQNS.add(config.digi_tlm_EQNS[i][1]);
-            digiTlmEQNS.add(config.digi_tlm_EQNS[i][2]);
-        }
-        // Tracker group
-        doc["trkEn"] = config.trk_en;
-        doc["trkPos2rf"] = config.trk_loc2rf;
-        doc["trkPos2inet"] = config.trk_loc2inet;
-        doc["trkTime"] = config.trk_timestamp;
-        doc["trkSSID"] = config.trk_ssid;
-        doc["trkMycall"] = config.trk_mycall;
-        doc["trkPath"] = config.trk_path;
-        doc["trkGPS"] = config.trk_gps;
-        doc["trkLAT"] = config.trk_lat;
-        doc["trkLON"] = config.trk_lon;
-        doc["trkALT"] = config.trk_alt;
-        doc["trkINV"] = config.trk_interval;
-        doc["trkSmart"] = config.trk_smartbeacon;
-        doc["trkCompress"] = config.trk_compress;
-        doc["trkOptAlt"] = config.trk_altitude;
-        doc["trkLog"] = config.trk_log;
-        doc["trkOptRSSI"] = config.trk_rssi;
-        doc["trkOptSNR"] = config.trk_snr;
-        doc["trkOptFreq"] = config.trk_freqerr;
-        doc["trkHSpeed"] = config.trk_hspeed;
-        doc["trkMaxInv"] = config.trk_maxinterval;
-        doc["trkMinInv"] = config.trk_mininterval;
-        doc["trkMinDir"] = config.trk_minangle;
-        doc["trkSlowInv"] = config.trk_slowinterval;
-        doc["trkSymbol"] = config.trk_symbol;
-        doc["trkSymbolMove"] = config.trk_symmove;
-        doc["trkSymbolStop"] = config.trk_symstop;
-        doc["trkItem"] = config.trk_item;
-        doc["trkComment"] = config.trk_comment;
-        doc["trkSTSIntv"] = config.trk_sts_interval;
-        doc["trkStatus"] = config.trk_status;
-        JsonArray trkTlmAvg = doc["trkTlmAvg"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmAvg.add(config.trk_tlm_avg[i]);
-        JsonArray trkTlmSen = doc["trkTlmSen"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmSen.add(config.trk_tlm_sensor[i]);
-        JsonArray trkTlmPrec = doc["trkTlmPrec"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmPrec.add(config.trk_tlm_precision[i]);
-        JsonArray trkTlmOffset = doc["trkTlmOffset"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmOffset.add(config.trk_tlm_offset[i]);
-        JsonArray trkTlmPARM = doc["trkTlmPARM"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmPARM.add(config.trk_tlm_PARM[i]);
-        JsonArray trkTlmUNIT = doc["trkTlmUNIT"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-            trkTlmUNIT.add(config.trk_tlm_UNIT[i]);
-        JsonArray trkTlmEQNS = doc["trkTlmEQNS"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-        {
-            trkTlmEQNS.add(config.trk_tlm_EQNS[i][0]);
-            trkTlmEQNS.add(config.trk_tlm_EQNS[i][1]);
-            trkTlmEQNS.add(config.trk_tlm_EQNS[i][2]);
-        }
-        // WX group
-        doc["wxEn"] = config.wx_en;
-        doc["wxTx2rf"] = config.wx_2rf;
-        doc["wxTx2inet"] = config.wx_2inet;
-        doc["wxTime"] = config.wx_timestamp;
-        doc["wxSSID"] = config.wx_ssid;
-        doc["wxMycall"] = config.wx_mycall;
-        doc["wxPath"] = config.wx_path;
-        doc["wxGPS"] = config.wx_gps;
-        doc["wxLAT"] = config.wx_lat;
-        doc["wxLON"] = config.wx_lon;
-        doc["wxALT"] = config.wx_alt;
-        doc["wxInv"] = config.wx_interval;
-        doc["wxFlage"] = config.wx_flage;
-        doc["wxObject"] = config.wx_object;
-        doc["wxComment"] = config.wx_comment;
+    JsonArray wxSenEn = doc["wxSenEn"].to<JsonArray>();
+    for (int i = 0; i < WX_SENSOR_NUM; i++)
+    {
+        wxSenEn.add(config.wx_sensor_enable[i]);
+    }
+    JsonArray wxSenAvg = doc["wxSenAvg"].to<JsonArray>();
+    for (int i = 0; i < WX_SENSOR_NUM; i++)
+    {
+        wxSenAvg.add(config.wx_sensor_avg[i]);
+    }
+    JsonArray wxSenCH = doc["wxSenCH"].to<JsonArray>();
+    for (int i = 0; i < WX_SENSOR_NUM; i++)
+    {
+        wxSenCH.add(config.wx_sensor_ch[i]);
+    }
 
-        JsonArray wxSenEn = doc["wxSenEn"].to<JsonArray>();
-        for (int i = 0; i < WX_SENSOR_NUM; i++)
-        {
-            wxSenEn.add(config.wx_sensor_enable[i]);
-        }
-        JsonArray wxSenAvg = doc["wxSenAvg"].to<JsonArray>();
-        for (int i = 0; i < WX_SENSOR_NUM; i++)
-        {
-            wxSenAvg.add(config.wx_sensor_avg[i]);
-        }
-        JsonArray wxSenCH = doc["wxSenCH"].to<JsonArray>();
-        for (int i = 0; i < WX_SENSOR_NUM; i++)
-        {
-            wxSenCH.add(config.wx_sensor_ch[i]);
-        }
+    // Telemetry
+    doc["tlmEn"] = config.tlm0_en;
+    doc["tlmTx2rf"] = config.tlm0_2rf;
+    doc["tlmTx2inet"] = config.tlm0_2inet;
+    doc["tlmSSID"] = config.tlm0_ssid;
+    doc["tlmMycall"] = config.tlm0_mycall;
+    doc["tlmPath"] = config.tlm0_path;
+    doc["tlmInfoInv"] = config.tlm0_info_interval;
+    doc["tlmDataInv"] = config.tlm0_data_interval;
+    doc["tlmBIT"] = config.tlm0_BITS_Active;
+    // doc["tlmDataCH"]=config.tml0_data_channel;
+    JsonArray tlmEQNS = doc["tlmEQNS"].to<JsonArray>();
+    for (int i = 0; i < 5; i++)
+    {
+        tlmEQNS.add(config.tlm0_EQNS[i][0]);
+        tlmEQNS.add(config.tlm0_EQNS[i][1]);
+        tlmEQNS.add(config.tlm0_EQNS[i][2]);
+    }
+    JsonArray tlmPARM = doc["tlmPARM"].to<JsonArray>();
+    for (int i = 0; i < 13; i++)
+    {
+        tlmPARM.add(config.tlm0_PARM[i]);
+    }
+    JsonArray tlmUNIT = doc["tlmUNIT"].to<JsonArray>();
+    for (int i = 0; i < 13; i++)
+    {
+        tlmUNIT.add(config.tlm0_UNIT[i]);
+    }
+    JsonArray tlmDataCH = doc["tlmDataCH"].to<JsonArray>();
+    for (int i = 0; i < 13; i++)
+    {
+        tlmDataCH.add(config.tml0_data_channel[i]);
+    }
 
-        // Telemetry
-        doc["tlmEn"] = config.tlm0_en;
-        doc["tlmTx2rf"] = config.tlm0_2rf;
-        doc["tlmTx2inet"] = config.tlm0_2inet;
-        doc["tlmSSID"] = config.tlm0_ssid;
-        doc["tlmMycall"] = config.tlm0_mycall;
-        doc["tlmPath"] = config.tlm0_path;
-        doc["tlmInfoInv"] = config.tlm0_info_interval;
-        doc["tlmDataInv"] = config.tlm0_data_interval;
-        doc["tlmBIT"] = config.tlm0_BITS_Active;
-        // doc["tlmDataCH"]=config.tml0_data_channel;
-        JsonArray tlmEQNS = doc["tlmEQNS"].to<JsonArray>();
-        for (int i = 0; i < 5; i++)
-        {
-            tlmEQNS.add(config.tlm0_EQNS[i][0]);
-            tlmEQNS.add(config.tlm0_EQNS[i][1]);
-            tlmEQNS.add(config.tlm0_EQNS[i][2]);
-        }
-        JsonArray tlmPARM = doc["tlmPARM"].to<JsonArray>();
-        for (int i = 0; i < 13; i++)
-        {
-            tlmPARM.add(config.tlm0_PARM[i]);
-        }
-        JsonArray tlmUNIT = doc["tlmUNIT"].to<JsonArray>();
-        for (int i = 0; i < 13; i++)
-        {
-            tlmUNIT.add(config.tlm0_UNIT[i]);
-        }
-        JsonArray tlmDataCH = doc["tlmDataCH"].to<JsonArray>();
-        for (int i = 0; i < 13; i++)
-        {
-            tlmDataCH.add(config.tml0_data_channel[i]);
-        }
-        // OLED Display
-        doc["dspEn"] = config.oled_enable;
-        doc["dspTOut"] = config.oled_timeout;
-        doc["dspDim"] = config.dim;
-        doc["dspContrast"] = config.contrast;
-        doc["dspBright"] = config.disp_brightness;
-        doc["dspStartUp"] = config.startup;
-        doc["dspDelay"] = config.dispDelay;
-        doc["dspDxFilter"] = config.filterDistant;
-        doc["dspHUp"] = config.h_up;
-        doc["dspTX"] = config.tx_display;
-        doc["dspRX"] = config.rx_display;
-        doc["dspFilter"] = config.dispFilter;
-        doc["dspRF"] = config.dispRF;
-        doc["dspINET"] = config.dispINET;
-        doc["dspFlip"] = config.disp_flip;
+    // OLED Display
+    doc["dspEn"] = config.oled_enable;
+    doc["dspTOut"] = config.oled_timeout;
+    doc["dspDim"] = config.dim;
+    doc["dspContrast"] = config.contrast;
+    doc["dspBright"] = config.disp_brightness;
+    doc["dspStartUp"] = config.startup;
+    doc["dspDelay"] = config.dispDelay;
+    doc["dspDxFilter"] = config.filterDistant;
+    doc["dspHUp"] = config.h_up;
+    doc["dspTX"] = config.tx_display;
+    doc["dspRX"] = config.rx_display;
+    doc["dspFilter"] = config.dispFilter;
+    doc["dspRF"] = config.dispRF;
+    doc["dspINET"] = config.dispINET;
+    doc["dspFlip"] = config.disp_flip;
 
-        // VPN Wireguard
-        doc["vpnEn"] = config.vpn;
-        doc["vpnPort"] = config.wg_port;
-        doc["vpnPeer"] = config.wg_peer_address;
-        doc["vpnLocal"] = config.wg_local_address;
-        doc["vpnNetmark"] = config.wg_netmask_address;
-        doc["vpnGW"] = config.wg_gw_address;
-        doc["vpnPubKey"] = config.wg_public_key;
-        doc["vpnPriKey"] = config.wg_private_key;
+    // VPN Wireguard
+    doc["vpnEn"] = config.vpn;
+    doc["vpnPort"] = config.wg_port;
+    doc["vpnPeer"] = config.wg_peer_address;
+    doc["vpnLocal"] = config.wg_local_address;
+    doc["vpnNetmark"] = config.wg_netmask_address;
+    doc["vpnGW"] = config.wg_gw_address;
+    doc["vpnPubKey"] = config.wg_public_key;
+    doc["vpnPriKey"] = config.wg_private_key;
 
-        // System
-        doc["httpUser"] = config.http_username;
-        doc["httpPass"] = config.http_password;
+    // System
+    doc["httpUser"] = config.http_username;
+    doc["httpPass"] = config.http_password;
 
-        JsonArray path = doc["path"].to<JsonArray>();
-        for (int i = 0; i < 4; i++)
-        {
-            path.add(config.path[i]);
-        }
+    JsonArray path = doc["path"].to<JsonArray>();
+    for (int i = 0; i < 4; i++)
+    {
+        path.add(config.path[i]);
+    }
 
-        // MOD GNSS group
-        doc["gnssEn"] = config.gnss_enable;
-        doc["gnssCH"] = config.gnss_channel;
-        doc["gnssPPS"] = config.gnss_pps_gpio;
-        doc["gnssTCPPort"] = config.gnss_tcp_port;
-        doc["gnssTCPHost"] = config.gnss_tcp_host;
-        doc["gnssAT"] = config.gnss_at_command;
+    // MOD GNSS group
+    doc["gnssEn"] = config.gnss_enable;
+    doc["gnssCH"] = config.gnss_channel;
+    doc["gnssPPS"] = config.gnss_pps_gpio;
+    doc["gnssTCPPort"] = config.gnss_tcp_port;
+    doc["gnssTCPHost"] = config.gnss_tcp_host;
+    doc["gnssAT"] = config.gnss_at_command;
 
-        // MOD RF group
-        doc["rfTx"] = config.rf_tx_gpio;
-        doc["rfRx"] = config.rf_rx_gpio;
-        doc["rfRST"] = config.rf_reset_gpio;
-        doc["rfDIO0"] = config.rf_dio0_gpio;
-        doc["rfDIO1"] = config.rf_dio1_gpio;
-        doc["rfDIO2"] = config.rf_dio2_gpio;
-        doc["rfNSS"] = config.rf_nss_gpio;
-        doc["rfSCK"] = config.rf_sclk_gpio;
-        doc["rfMISO"] = config.rf_miso_gpio;
-        doc["rfMOSI"] = config.rf_mosi_gpio;
-        doc["rfTxAct"] = config.rf_tx_active;
-        doc["rfRxAct"] = config.rf_rx_active;
-        doc["rfRSTAct"] = config.rf_reset_active;
-        doc["rfNSSAct"] = config.rf_nss_active;
-#ifdef NAWS4
-        doc["rf1Tx"] = config.rf1_tx_gpio;
-        doc["rf1Rx"] = config.rf1_rx_gpio;
-        doc["rf1RST"] = config.rf1_reset_gpio;
-        doc["rf1DIO0"] = config.rf1_dio0_gpio;
-        doc["rf1DIO1"] = config.rf1_dio1_gpio;
-        doc["rf1DIO2"] = config.rf1_dio2_gpio;
-        doc["rf1NSS"] = config.rf1_nss_gpio;
-        doc["rf1SCK"] = config.rf1_sclk_gpio;
-        doc["rf1MISO"] = config.rf1_miso_gpio;
-        doc["rf1MOSI"] = config.rf1_mosi_gpio;
-        doc["rf1TxAct"] = config.rf1_tx_active;
-        doc["rf1RxAct"] = config.rf1_rx_active;
-        doc["rf1RSTAct"] = config.rf1_reset_active;
-        doc["rf1NSSAct"] = config.rf1_nss_active;
-#endif
-        // MOD I2C group
-        doc["i2cEn"] = config.i2c_enable;
-        doc["i2cSDA"] = config.i2c_sda_pin;
-        doc["i2cSCK"] = config.i2c_sck_pin;
-        // doc["i2cRST"]=config.i2c_rst_pin;
-        doc["i2cFreq"] = config.i2c_freq;
-#if SOC_I2C_NUM > 1
-        doc["i2c1En"] = config.i2c1_enable;
-        doc["i2c1SDA"] = config.i2c1_sda_pin;
-        doc["i2c1SCK"] = config.i2c1_sck_pin;
-        doc["i2c1Freq"] = config.i2c1_freq;
-#endif
-        // MOD 1-Wire group
-        doc["oneWireEn"] = config.onewire_enable;
-        doc["oneWireIO"] = config.onewire_gpio;
+    // MOD RF group
+    doc["rfTx"] = config.rf_tx_gpio;
+    doc["rfRx"] = config.rf_rx_gpio;
+    doc["rfSQL"] = config.rf_sql_gpio;
+    doc["rfPD"] = config.rf_pd_gpio;
+    doc["rfPWR"] = config.rf_pwr_gpio;
+    doc["rfPTT"] = config.rf_ptt_gpio;
+    doc["rfSQLAct"] = config.rf_sql_active;
+    doc["rfPDAct"] = config.rf_pd_active;
+    doc["rfPWRAct"] = config.rf_pwr_active;
+    doc["rfPTTAct"] = config.rf_ptt_active;
+    doc["adcAtten"] = config.adc_atten;
+    doc["adcOffset"] = config.adc_dc_offset;
+    doc["rfBaudrate"] = config.rf_baudrate;
 
-        // MOD UART
-        doc["uart0En"] = config.uart0_enable;
-        doc["uart0BR"] = config.uart0_baudrate;
-        doc["uart0TX"] = config.uart0_tx_gpio;
-        doc["uart0RX"] = config.uart0_rx_gpio;
-        doc["uart0RTS"] = config.uart0_rts_gpio;
-        doc["uart1En"] = config.uart1_enable;
-        doc["uart1BR"] = config.uart1_baudrate;
-        doc["uart1TX"] = config.uart1_tx_gpio;
-        doc["uart1RX"] = config.uart1_rx_gpio;
-        doc["uart1RTS"] = config.uart1_rts_gpio;
+    // doc["rfRST"] = config.rf_reset_gpio;
+    // doc["rfDIO0"] = config.rf_dio0_gpio;
+    // doc["rfDIO1"] = config.rf_dio1_gpio;
+    // doc["rfDIO2"] = config.rf_dio2_gpio;
+    // doc["rfNSS"] = config.rf_nss_gpio;
+    // doc["rfSCK"] = config.rf_sclk_gpio;
+    // doc["rfMISO"] = config.rf_miso_gpio;
+    // doc["rfMOSI"] = config.rf_mosi_gpio;
+    // doc["rfTxAct"] = config.rf_tx_active;
+    // doc["rfRxAct"] = config.rf_rx_active;
+    // doc["rfRSTAct"] = config.rf_reset_active;
+    // doc["rfNSSAct"] = config.rf_nss_active;
+    // MOD I2C group
+    doc["i2cEn"] = config.i2c_enable;
+    doc["i2cSDA"] = config.i2c_sda_pin;
+    doc["i2cSCK"] = config.i2c_sck_pin;
+    // doc["i2cRST"]=config.i2c_rst_pin;
+    doc["i2cFreq"] = config.i2c_freq;
+    doc["i2c1En"] = config.i2c1_enable;
+    doc["i2c1SDA"] = config.i2c1_sda_pin;
+    doc["i2c1SCK"] = config.i2c1_sck_pin;
+    doc["i2c1Freq"] = config.i2c1_freq;
+    // MOD 1-Wire group
+    doc["oneWireEn"] = config.onewire_enable;
+    doc["oneWireIO"] = config.onewire_gpio;
+
+    // MOD UART
+    doc["uart0En"] = config.uart0_enable;
+    doc["uart0BR"] = config.uart0_baudrate;
+    doc["uart0TX"] = config.uart0_tx_gpio;
+    doc["uart0RX"] = config.uart0_rx_gpio;
+    doc["uart0RTS"] = config.uart0_rts_gpio;
+    doc["uart1En"] = config.uart1_enable;
+    doc["uart1BR"] = config.uart1_baudrate;
+    doc["uart1TX"] = config.uart1_tx_gpio;
+    doc["uart1RX"] = config.uart1_rx_gpio;
+    doc["uart1RTS"] = config.uart1_rts_gpio;
 #if SOC_UART_NUM > 2
-        doc["uart2En"] = config.uart2_enable;
-        doc["uart2BR"] = config.uart2_baudrate;
-        doc["uart2TX"] = config.uart2_tx_gpio;
-        doc["uart2RX"] = config.uart2_rx_gpio;
+    doc["uart2En"] = config.uart2_enable;
+    doc["uart2BR"] = config.uart2_baudrate;
+    doc["uart2TX"] = config.uart2_tx_gpio;
+    doc["uart2RX"] = config.uart2_rx_gpio;
 #endif
-        // MOD Modbus
-        doc["modbusEn"] = config.modbus_enable;
-        doc["modbusAddr"] = config.modbus_address;
-        doc["modbusCh"] = config.modbus_channel;
-        doc["modbusDE"] = config.modbus_de_gpio;
-        // MOD Counter
-        doc["cnt0En"] = config.counter0_enable;
-        doc["cnt0Act"] = config.counter0_active;
-        doc["cnt0IO"] = config.counter0_gpio;
-        doc["cnt1En"] = config.counter1_enable;
-        doc["cnt1Act"] = config.counter1_active;
-        doc["cnt1IO"] = config.counter1_gpio;
-        // MOD External TNC
-        doc["extTNCEn"] = config.ext_tnc_enable;
-        doc["extTNCCh"] = config.ext_tnc_channel;
-        doc["extTNCMode"] = config.ext_tnc_mode;
+    // MOD Modbus
+    doc["modbusEn"] = config.modbus_enable;
+    doc["modbusAddr"] = config.modbus_address;
+    doc["modbusCh"] = config.modbus_channel;
+    doc["modbusDE"] = config.modbus_de_gpio;
+    // MOD Counter
+    doc["cnt0En"] = config.counter0_enable;
+    doc["cnt0Act"] = config.counter0_active;
+    doc["cnt0IO"] = config.counter0_gpio;
+    doc["cnt1En"] = config.counter1_enable;
+    doc["cnt1Act"] = config.counter1_active;
+    doc["cnt1IO"] = config.counter1_gpio;
+    // MOD External TNC
+    doc["extTNCEn"] = config.ext_tnc_enable;
+    doc["extTNCCh"] = config.ext_tnc_channel;
+    doc["extTNCMode"] = config.ext_tnc_mode;
 
-        // Power control
-        doc["pwrEn"] = config.pwr_en;
-        doc["pwrMode"] = config.pwr_mode;
-        doc["pwrSleep"] = config.pwr_sleep_interval;
-        doc["pwrStanby"] = config.pwr_stanby_delay;
-        doc["pwrSleepAct"] = config.pwr_sleep_activate;
-        doc["pwrIO"] = config.pwr_gpio;
-        doc["pwrIOAct"] = config.pwr_active;
+    // MOD TCP KISS Server - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+    doc["tcpKissEn"] = config.tcp_kiss_enable;
+    doc["tcpKissPort1"] = config.tcp_kiss_port1;
+    doc["tcpKissPort2"] = config.tcp_kiss_port2;
+
+    // Power control - only pwr_stanby_delay survives (Set/2026, LU6JMF): the
+    // rest was a dead "Power Save Mode" toggle, removed to save space.
+    doc["pwrStanby"] = config.pwr_stanby_delay;
 
 #ifdef BLUETOOTH
         doc["btSlave"] = config.bt_slave;
@@ -472,92 +473,159 @@ bool saveConfiguration(const char *filename, const Configuration &config)
 #endif
 #endif
 
-        doc["logFile"] = config.log;
+    doc["logFile"] = config.log;
 
-        JsonArray sensor = doc["Sensor"].to<JsonArray>();
-        for (int i = 0; i < SENSOR_NUMBER; i++)
-        {
-            sensor.add(config.sensor[i].enable);
-            sensor.add(config.sensor[i].port);
-            sensor.add(config.sensor[i].address);
-            sensor.add(config.sensor[i].samplerate);
-            sensor.add(config.sensor[i].averagerate);
-            sensor.add(config.sensor[i].eqns[0]);
-            sensor.add(config.sensor[i].eqns[1]);
-            sensor.add(config.sensor[i].eqns[2]);
-            sensor.add(config.sensor[i].type);
-            sensor.add(config.sensor[i].parm);
-            sensor.add(config.sensor[i].unit);
-        }
+    JsonArray sensor = doc["Sensor"].to<JsonArray>();
+    for (int i = 0; i < SENSOR_NUMBER; i++)
+    {
+        sensor.add(config.sensor[i].enable);
+        sensor.add(config.sensor[i].port);
+        sensor.add(config.sensor[i].address);
+        sensor.add(config.sensor[i].samplerate);
+        sensor.add(config.sensor[i].averagerate);
+        sensor.add(config.sensor[i].eqns[0]);
+        sensor.add(config.sensor[i].eqns[1]);
+        sensor.add(config.sensor[i].eqns[2]);
+        sensor.add(config.sensor[i].type);
+        sensor.add(config.sensor[i].parm);
+        sensor.add(config.sensor[i].unit);
+    }
 
-// PPP Modem
-#ifdef PPPOS
-        doc["pppEn"] = config.ppp_enable;
-        doc["pppAPN"] = config.ppp_apn;
-        doc["pppRST"] = config.ppp_rst_gpio;
-        doc["pppRSTAct"] = config.ppp_rst_active;
-        doc["pppTX"] = config.ppp_tx_gpio;
-        doc["pppRX"] = config.ppp_rx_gpio;
-        doc["pppRTS"] = config.ppp_rts_gpio;
-        doc["pppDTR"] = config.ppp_dtr_gpio;
-        doc["pppCTS"] = config.ppp_cts_gpio;
-        doc["pppRI"] = config.ppp_ri_gpio;
-        doc["pppPWR"] = config.ppp_pwr_gpio;
-        doc["pppPWRAct"] = config.ppp_pwr_active;
-        doc["pppRSTDelay"] = config.ppp_rst_delay;
-        doc["pppPin"] = config.ppp_pin;
-        doc["pppSerial"] = config.ppp_serial;
-        doc["pppSerialBaudrate"] = config.ppp_serial_baudrate;
-        doc["pppModel"] = config.ppp_model;
-        doc["pppFlow"] = config.ppp_flow_ctrl;
-        doc["pppGNSS"] = config.ppp_gnss;
-        doc["pppNAPT"] = config.ppp_napt;
-#endif
+     // PPP Modem
+    doc["pppEn"] = config.ppp_enable;
+    doc["pppAPN"] = config.ppp_apn;
+    doc["pppRST"] = config.ppp_rst_gpio;
+    doc["pppRSTAct"] = config.ppp_rst_active;
+    doc["pppTX"] = config.ppp_tx_gpio;
+    doc["pppRX"] = config.ppp_rx_gpio;
+    doc["pppRTS"] = config.ppp_rts_gpio;
+    doc["pppDTR"] = config.ppp_dtr_gpio;
+    doc["pppCTS"] = config.ppp_cts_gpio;
+    doc["pppRI"] = config.ppp_ri_gpio;
+    doc["pppPWR"] = config.ppp_pwr_gpio;
+    doc["pppPWRAct"] = config.ppp_pwr_active;
+    doc["pppRSTDelay"] = config.ppp_rst_delay;
+    doc["pppPin"] = config.ppp_pin;
+    doc["pppSerial"] = config.ppp_serial;
+    doc["pppSerialBaudrate"] = config.ppp_serial_baudrate;
+    doc["pppModel"] = config.ppp_model;
+    doc["pppFlow"] = config.ppp_flow_ctrl;
+    doc["pppGNSS"] = config.ppp_gnss;
+    doc["pppNAPT"] = config.ppp_napt;
 
-#ifdef MQTT
-        doc["mqttEnable"] = config.en_mqtt;
-        doc["mqttHost"] = config.mqtt_host;
-        doc["mqttTopic"] = config.mqtt_topic;
-        doc["mqttSub"] = config.mqtt_subscribe;
-        doc["mqttTopicFlag"] = config.mqtt_topic_flag;
-        doc["mqttSubFlag"] = config.mqtt_subscribe_flag;
-        doc["mqttPort"] = config.mqtt_port;
-        doc["mqttUser"] = config.mqtt_user;
-        doc["mqttPass"] = config.mqtt_pass;
-#endif
+    #ifdef MQTT
+    doc["mqttEnable"] = config.en_mqtt;
+    doc["mqttHost"] = config.mqtt_host;
+    doc["mqttTopic"] = config.mqtt_topic;
+    doc["mqttSub"] = config.mqtt_subscribe;
+    doc["mqttTopicFlag"] = config.mqtt_topic_flag;
+    doc["mqttSubFlag"] = config.mqtt_subscribe_flag;
+    doc["mqttPort"] = config.mqtt_port;
+    doc["mqttUser"] = config.mqtt_user;
+    doc["mqttPass"] = config.mqtt_pass;
+    #endif
 
-        doc["trkMicEType"] = config.trk_mice_type;
-        doc["trkTlmInv"] = config.trk_tlm_interval;
-        doc["digiTlmInv"] = config.digi_tlm_interval;
-        doc["igateTlmInv"] = config.igate_tlm_interval;
-        doc["hostName"] = config.host_name;
-        doc["resetTimeout"] = config.reset_timeout;
+    doc["trkMicEType"] = config.trk_mice_type;
+    doc["trkTlmInv"] = config.trk_tlm_interval;
+    doc["digiTlmInv"] = config.digi_tlm_interval;
+    doc["igateTlmInv"] = config.igate_tlm_interval;
+    doc["hostName"] = config.host_name;
+    doc["resetTimeout"] = config.reset_timeout;
 
-        doc["cmdOnMqtt"] = config.at_cmd_mqtt;
-        doc["cmdOnMsg"] = config.at_cmd_msg;
-        doc["cmdOnBluetooth"] = config.at_cmd_bluetooth;
-        doc["cmdOnUart"] = config.at_cmd_uart;
+    doc["cmdOnMqtt"] = config.at_cmd_mqtt;
+    doc["cmdOnMsg"] = config.at_cmd_msg;
+    doc["cmdOnBluetooth"] = config.at_cmd_bluetooth;
+    doc["cmdOnUart"] = config.at_cmd_uart;
 
-        doc["msgEnable"] = config.msg_enable;
-        doc["msgMycall"] = config.msg_mycall;
-        doc["msgRf"] = config.msg_rf;
-        doc["msgInet"] = config.msg_inet;
-        doc["msgPath"] = config.msg_path;
-        doc["msgEncrypt"] = config.msg_encrypt;
-        doc["msgAESKey"] = config.msg_key;
-        doc["msgRetry"] = config.msg_retry;
-        doc["msgInterval"] = config.msg_interval;
+    doc["msgEnable"] = config.msg_enable;
+    doc["msgMycall"] = config.msg_mycall;
+    doc["msgRf"] = config.msg_rf;
+    doc["msgInet"] = config.msg_inet;
+    doc["msgPath"] = config.msg_path;
+    doc["msgEncrypt"] = config.msg_encrypt;
+    doc["msgAESKey"] = config.msg_key;
+    doc["msgRetry"] = config.msg_retry;
+    doc["msgInterval"] = config.msg_interval;
 
-        // Serialize JSON to file
+    // Bulletins BLN1-BLN9 - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+    for (uint8_t bi = 0; bi < 9; bi++)
+    {
+        char key[20];
+        snprintf(key, sizeof(key), "blnEn%d", bi + 1);
+        doc[key] = config.bln_en[bi];
+        snprintf(key, sizeof(key), "blnText%d", bi + 1);
+        doc[key] = config.bln_text[bi];
+        snprintf(key, sizeof(key), "blnInterval%d", bi + 1);
+        doc[key] = config.bln_interval[bi];
+        snprintf(key, sizeof(key), "blnLimit%d", bi + 1);
+        doc[key] = config.bln_limit[bi];
+
+        // LU6JMF - Marcelo Ferreira:
+        // BLN1-BLN9 share the same campaign lifetime and real-send counter.
+        snprintf(key, sizeof(key), "blnDuration%d", bi + 1);
+        doc[key] = config.bln_duration[bi];
+
+        snprintf(key, sizeof(key), "blnStarted%d", bi + 1);
+        doc[key] = config.bln_started_at[bi];
+
+        snprintf(key, sizeof(key), "blnSentTotal%d", bi + 1);
+        doc[key] = config.bln_sent_total[bi];
+    }
+
+    // Objects (Object1-4) - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+    // LU6JMF fix (Set/2026): estes campos nunca eram salvos aqui - o Object
+    // vivia so em RAM e qualquer reboot apagava tudo (nome/texto/posicao/
+    // ativo), mesmo com o commitObj corrigido. Agora persiste igual ao BLN.
+    for (uint8_t oi = 0; oi < 4; oi++)
+    {
+        char okey[20];
+        snprintf(okey, sizeof(okey), "objEn%d", oi + 1);
+        doc[okey] = config.obj_en[oi];
+        snprintf(okey, sizeof(okey), "objName%d", oi + 1);
+        doc[okey] = config.obj_name[oi];
+        snprintf(okey, sizeof(okey), "objLat%d", oi + 1);
+        doc[okey] = config.obj_lat[oi];
+        snprintf(okey, sizeof(okey), "objLon%d", oi + 1);
+        doc[okey] = config.obj_lon[oi];
+        snprintf(okey, sizeof(okey), "objSymbol%d", oi + 1);
+        doc[okey] = config.obj_symbol[oi];
+        snprintf(okey, sizeof(okey), "objText%d", oi + 1);
+        doc[okey] = config.obj_text[oi];
+        snprintf(okey, sizeof(okey), "objMode%d", oi + 1);
+        doc[okey] = config.obj_mode[oi];
+        snprintf(okey, sizeof(okey), "objInterval%d", oi + 1);
+        doc[okey] = config.obj_interval[oi];
+        snprintf(okey, sizeof(okey), "objLimit%d", oi + 1);
+        doc[okey] = config.obj_limit[oi];
+        snprintf(okey, sizeof(okey), "objActiveFor%d", oi + 1);
+        doc[okey] = config.obj_activefor[oi];
+        snprintf(okey, sizeof(okey), "objPermanent%d", oi + 1);
+        doc[okey] = config.obj_permanent[oi];
+    }
+
+    // Serialize JSON to file
+    File file = LITTLEFS.open(filename, FILE_WRITE);
+    if (file)
+    {
+        int8_t adcEnBak=adcEn;
+        int8_t dacEnBak=dacEn;
+        //adcEn=-1;
+        //dacEn=-1;
+        
+        //delay(500);
         if (serializeJson(doc, file) == 0)
         {
             log_d("Failed to write to file");
+        }else{
+            log_d("Write file configuration susses.");
         }
-
         // Close the file
         file.close();
-        xSemaphoreGive(cfg_mutex);
+        delay(100);
+        //adcEn=1;
+        dacEn=0;
     }
+    doc.clear();
     return true;
 }
 
@@ -592,6 +660,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
             return false;
         }
 
+        config.cpuFreq = doc["cpuFreq"] | 160;
         config.tx_timeslot = doc["txTimeSlot"] | 2000;
         config.synctime = doc["syncTime"];
         config.timeZone = doc["timeZone"];
@@ -600,10 +669,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.wifi_power = doc["WiFiPwr"];
         config.wifi_ap_ch = doc["WiFiAPCH"];
         strlcpy(config.wifi_ap_ssid, doc["WiFiAP_SSID"] | "ESP32LoRa", sizeof(config.wifi_ap_ssid));
-        strlcpy(config.wifi_ap_pass, doc["WiFiAP_PASS"] | "", sizeof(config.wifi_ap_pass));
-        // LU6JMF: the old public default password becomes an open AP (existing saved configs too)
-        if (strcmp(config.wifi_ap_pass, "aprsthnetwork") == 0)
-            config.wifi_ap_pass[0] = 0;
+        strlcpy(config.wifi_ap_pass, doc["WiFiAP_PASS"] | "aprsthnetwork", sizeof(config.wifi_ap_pass));
         // log_d("Load WiFiAP: SSID=%s Pass=%s",config.wifi_ap_ssid,config.wifi_ap_pass);
         for (int i = 0; i < 5; i++)
         {
@@ -614,43 +680,37 @@ bool loadConfiguration(const char *filename, Configuration &config)
             // log_d("Load WiFiSTA[%i]: SSID=%s Pass=%s",i,config.wifi_sta[i].wifi_ssid,config.wifi_sta[i].wifi_pass);
         }
 
+        config.fx25_mode = doc["fx25Mode"];
         config.rf_en = doc["rfEnable"];
         config.rf_type = doc["rfType"];
-        config.rf_freq = doc["rfFreq"];
-        config.rf_freq_offset = doc["rfOffset"];
-        config.rf_bw = doc["rfBW"];
-        config.rf_sf = doc["rfSF"];
-        config.rf_cr = doc["rfCR"];
-        config.rf_sync = doc["rfSync"];
         config.rf_power = doc["rfPwr"];
-        config.rf_preamable = doc["rfPream"];
-        config.rf_lna = doc["rfLNA"];
-        config.rf_mode = doc["rfMode"];
-        config.rf_ax25 = doc["rfAX25"];
-        config.rf_br = doc["rfBR"];
-        config.rf_shaping = doc["rfShaping"];
-        config.rf_encoding = doc["rfEncoding"];
-        config.rf_rx_boost = doc["rfRxBoost"];
-
-#ifdef RF2
-        config.rf1_en = doc["rf1Enable"];
-        config.rf1_type = doc["rf1Type"];
-        config.rf1_freq = doc["rf1Freq"];
-        config.rf1_freq_offset = doc["rf1Offset"];
-        config.rf1_bw = doc["rf1BW"];
-        config.rf1_sf = doc["rf1SF"];
-        config.rf1_cr = doc["rf1CR"];
-        config.rf1_sync = doc["rf1Sync"];
-        config.rf1_power = doc["rf1Pwr"];
-        config.rf1_preamable = doc["rf1Pream"];
-        config.rf1_lna = doc["rf1LNA"];
-        config.rf1_mode = doc["rf1Mode"];
-        config.rf1_ax25 = doc["rf1AX25"];
-        config.rf1_br = doc["rf1BR"];
-        config.rf1_shaping = doc["rf1Shaping"];
-        config.rf1_encoding = doc["rf1Encoding"];
-        config.rf1_rx_boost = doc["rf1RxBoost"];
-#endif
+        config.modem_type = doc["rfModem"];
+        config.preamble = doc["rfPreamble"];
+        config.freq_rx = doc["rfFreqRX"];
+        config.freq_tx = doc["rfFreqTX"];
+        config.tone_rx = doc["rfToneRX"];
+        config.tone_tx = doc["rfToneTX"];
+        config.sql_level = doc["rfSql"];
+        config.volume = doc["rfVolume"];
+        config.band = doc["rfBand"];
+        config.audio_lpf = doc["audioLPF"];
+        config.tx_audio_gain = doc["txAudioGain"] | 100;
+        config.tx_preemphasis = doc["txPreemphasis"] | false;
+        config.tx_preemphasis_tilt = doc["txPreemphasisTilt"] | 20;
+        // config.rf_freq = doc["rfFreq"];
+        // config.rf_freq_offset = doc["rfOffset"];
+        // config.rf_bw = doc["rfBW"];
+        // config.rf_sf = doc["rfSF"];
+        // config.rf_cr = doc["rfCR"];
+        // config.rf_sync = doc["rfSync"];
+        // config.rf_power = doc["rfPwr"];
+        // config.rf_preamable = doc["rfPream"];
+        // config.rf_lna = doc["rfLNA"];
+        // config.rf_mode = doc["rfMode"];
+        // config.rf_ax25 = doc["rfAX25"];
+        // config.rf_br = doc["rfBR"];
+        // config.rf_shaping = doc["rfShaping"];
+        // config.rf_encoding = doc["rfEncoding"];
 
         // IGate group
         config.igate_en = doc["igateEn"];
@@ -662,11 +722,11 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.rf2inetFilter = doc["rf2inetFilter"];
         config.inet2rfFilter = doc["inet2rfFiltger"];
 
-        config.igate_ssid = doc["igateSSID"];
+        config.aprs_ssid = doc["igateSSID"];
         config.aprs_port = doc["igatePort"];
-        strlcpy(config.igate_mycall, doc["igateMycall"] | "NOCALL", sizeof(config.igate_mycall));
-        strlcpy(config.igate_host, doc["igateHost"] | "", sizeof(config.igate_host));
-        strlcpy(config.igate_filter, doc["igateFilter"] | "", sizeof(config.igate_filter));
+        strlcpy(config.aprs_mycall, doc["igateMycall"] | "NOCALL", sizeof(config.aprs_mycall));
+        strlcpy(config.aprs_host, doc["igateHost"] | "", sizeof(config.aprs_host));
+        strlcpy(config.aprs_filter, doc["igateFilter"] | "", sizeof(config.aprs_filter));
         config.igate_gps = doc["igateGPS"];
         config.igate_lat = doc["igateLAT"];
         config.igate_lon = doc["igateLON"];
@@ -756,8 +816,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.trk_altitude = doc["trkOptAlt"];
         config.trk_log = doc["trkLog"];
         config.trk_rssi = doc["trkOptRSSI"];
-        config.trk_snr = doc["trkOptSNR"];
-        config.trk_freqerr = doc["trkOptFreq"];
+        config.trk_lspeed = doc["trkLSpeed"];
         config.trk_hspeed = doc["trkHSpeed"];
         config.trk_maxinterval = doc["trkMaxInv"];
         config.trk_mininterval = doc["trkMinInv"];
@@ -894,47 +953,41 @@ bool loadConfiguration(const char *filename, Configuration &config)
         // MOD RF group
         config.rf_tx_gpio = doc["rfTx"];
         config.rf_rx_gpio = doc["rfRx"];
-        config.rf_reset_gpio = doc["rfRST"];
-        config.rf_dio0_gpio = doc["rfDIO0"];
-        config.rf_dio1_gpio = doc["rfDIO1"];
-        config.rf_dio2_gpio = doc["rfDIO2"];
-        config.rf_nss_gpio = doc["rfNSS"];
-        config.rf_sclk_gpio = doc["rfSCK"];
-        config.rf_miso_gpio = doc["rfMISO"];
-        config.rf_mosi_gpio = doc["rfMOSI"];
-        config.rf_tx_active = doc["rfTxAct"];
-        config.rf_rx_active = doc["rfRxAct"];
-        config.rf_reset_active = doc["rfRSTAct"];
-        config.rf_nss_active = doc["rfNSSAct"];
-#ifdef RF2
-        config.rf1_tx_gpio = doc["rf1Tx"];
-        config.rf1_rx_gpio = doc["rf1Rx"];
-        config.rf1_reset_gpio = doc["rf1RST"];
-        config.rf1_dio0_gpio = doc["rf1DIO0"];
-        config.rf1_dio1_gpio = doc["rf1DIO1"];
-        config.rf1_dio2_gpio = doc["rf1DIO2"];
-        config.rf1_nss_gpio = doc["rf1NSS"];
-        config.rf1_sclk_gpio = doc["rf1SCK"];
-        config.rf1_miso_gpio = doc["rf1MISO"];
-        config.rf1_mosi_gpio = doc["rf1MOSI"];
-        config.rf1_tx_active = doc["rf1TxAct"];
-        config.rf1_rx_active = doc["rf1RxAct"];
-        config.rf1_reset_active = doc["rf1RSTAct"];
-        config.rf1_nss_active = doc["rf1NSSAct"];
-#endif
+        config.rf_sql_gpio = doc["rfSQL"];
+        config.rf_pd_gpio = doc["rfPD"];
+        config.rf_pwr_gpio = doc["rfPWR"];
+        config.rf_ptt_gpio = doc["rfPTT"];
+        config.rf_sql_active = doc["rfSQLAct"];
+        config.rf_pd_active = doc["rfPDAct"];
+        config.rf_pwr_active = doc["rfPWRAct"];
+        config.rf_ptt_active = doc["rfPTTAct"];
+        config.rf_baudrate = doc["rfBaudrate"];
+        config.adc_atten = doc["adcAtten"];
+        config.adc_dc_offset = doc["adcOffset"];          
+
+        // config.rf_reset_gpio = doc["rfRST"];
+        // config.rf_dio0_gpio = doc["rfDIO0"];
+        // config.rf_dio1_gpio = doc["rfDIO1"];
+        // config.rf_dio2_gpio = doc["rfDIO2"];
+        // config.rf_nss_gpio = doc["rfNSS"];
+        // config.rf_sclk_gpio = doc["rfSCK"];
+        // config.rf_miso_gpio = doc["rfMISO"];
+        // config.rf_mosi_gpio = doc["rfMOSI"];
+        // config.rf_tx_active = doc["rfTxAct"];
+        // config.rf_rx_active = doc["rfRxAct"];
+        // config.rf_reset_active = doc["rfRSTAct"];
+        // config.rf_nss_active = doc["rfNSSAct"];
         // MOD I2C group
         config.i2c_enable = doc["i2cEn"];
         config.i2c_sda_pin = doc["i2cSDA"];
         config.i2c_sck_pin = doc["i2cSCK"];
         // doc["i2cRST"]=config.i2c_rst_pin;
         config.i2c_freq = doc["i2cFreq"];
-        // #if SOC_I2C_NUM > 1
         config.i2c1_enable = doc["i2c1En"];
         config.i2c1_sda_pin = doc["i2c1SDA"];
         config.i2c1_sck_pin = doc["i2c1SCK"];
         config.i2c1_freq = doc["i2c1Freq"];
-        // #endif
-        //  MOD 1-Wire group
+        // MOD 1-Wire group
         config.onewire_enable = doc["oneWireEn"];
         config.onewire_gpio = doc["oneWireIO"];
 
@@ -954,7 +1007,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.uart2_tx_gpio = doc["uart2TX"];
         config.uart2_rx_gpio = doc["uart2RX"];
         // #endif
-        //  MOD Modbus
+        // MOD Modbus
         config.modbus_enable = doc["modbusEn"];
         config.modbus_address = doc["modbusAddr"];
         config.modbus_channel = doc["modbusCh"];
@@ -971,14 +1024,15 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.ext_tnc_channel = doc["extTNCCh"];
         config.ext_tnc_mode = doc["extTNCMode"];
 
-        // Power control
-        config.pwr_en = doc["pwrEn"];
-        config.pwr_mode = doc["pwrMode"];
-        config.pwr_sleep_interval = doc["pwrSleep"];
-        config.pwr_stanby_delay = doc["pwrStanby"];
-        config.pwr_sleep_activate = doc["pwrSleepAct"];
-        config.pwr_gpio = doc["pwrIO"];
-        config.pwr_active = doc["pwrIOAct"];
+        // MOD TCP KISS Server - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+        // Uses "| default" so devices updating from an older config file (which won't have
+        // these keys yet) get safe defaults instead of 0/false-for-everything.
+        config.tcp_kiss_enable = doc["tcpKissEn"] | false;
+        config.tcp_kiss_port1 = doc["tcpKissPort1"] | 8001;
+        config.tcp_kiss_port2 = doc["tcpKissPort2"] | 8002;
+
+        // Power control - only pwr_stanby_delay survives (Set/2026, LU6JMF)
+        config.pwr_stanby_delay = doc["pwrStanby"] | 30;
 
 #ifdef BLUETOOTH
         config.bt_slave = doc["btSlave"];
@@ -1012,8 +1066,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
             strlcpy(config.sensor[i].unit, doc["Sensor"][(i * 11) + 10] | "", sizeof(config.sensor[i].unit));
         }
 
-// PPP Modem
-#ifdef PPPOS
+        // PPP Modem
         config.ppp_enable = doc["pppEn"];
         strlcpy(config.ppp_apn, doc["pppAPN"] | "", sizeof(config.ppp_apn));
         strlcpy(config.ppp_pin, doc["pppPin"] | "", sizeof(config.ppp_pin));
@@ -1027,16 +1080,15 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.ppp_cts_gpio = doc["pppCTS"];
         config.ppp_ri_gpio = doc["pppRI"];
         config.ppp_pwr_gpio = doc["pppPWR"];
-        config.ppp_pwr_active = doc["pppPWRAct"];
+        config.ppp_pwr_active = doc["pppPWRAct"];   
         config.ppp_serial = doc["pppSerial"];
         config.ppp_serial_baudrate = doc["pppSerialBaudrate"];
         config.ppp_model = doc["pppModel"];
         config.ppp_flow_ctrl = doc["pppFlowCtrl"];
         config.ppp_gnss = doc["pppGNSS"];
         config.ppp_napt = doc["pppNAPT"];
-#endif
 
-#ifdef MQTT
+        #ifdef MQTT
         config.en_mqtt = doc["mqttEnable"];
         strlcpy(config.mqtt_host, doc["mqttHost"] | "", sizeof(config.mqtt_host));
         strlcpy(config.mqtt_topic, doc["mqttTopic"] | "", sizeof(config.mqtt_topic));
@@ -1046,7 +1098,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.mqtt_port = doc["mqttPort"];
         strlcpy(config.mqtt_user, doc["mqttUser"] | "", sizeof(config.mqtt_user));
         strlcpy(config.mqtt_pass, doc["mqttPass"] | "", sizeof(config.mqtt_pass));
-#endif
+        #endif
 
         config.trk_mice_type = doc["trkMicEType"];
         config.trk_tlm_interval = doc["trkTlmInv"];
@@ -1059,8 +1111,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.at_cmd_bluetooth = doc["cmdOnBluetooth"];
         config.at_cmd_uart = doc["cmdOnUart"];
 
-        if (doc["msgEnable"].isNull())
-        { // old version compatibility
+        if(doc["msgEnable"].isNull()){ //old version compatibility
             config.msg_enable = true;
             config.msg_encrypt = false;
             config.msg_rf = true;
@@ -1070,9 +1121,7 @@ bool loadConfiguration(const char *filename, Configuration &config)
             config.msg_path = 9;
             sprintf(config.msg_key, "8EC8233E91D59B0164C24E771BA66307");
             sprintf(config.msg_mycall, "NOCALL");
-        }
-        else
-        {
+        }else{
             config.msg_enable = doc["msgEnable"];
             config.msg_path = doc["msgPath"];
             config.msg_rf = doc["msgRf"];
@@ -1082,6 +1131,122 @@ bool loadConfiguration(const char *filename, Configuration &config)
             config.msg_interval = doc["msgInterval"];
             strlcpy(config.msg_key, doc["msgAESKey"] | "", sizeof(config.msg_key));
             strlcpy(config.msg_mycall, doc["msgMycall"] | "", sizeof(config.msg_mycall));
+        }
+
+        // Bulletins BLN1-BLN9 - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+        for (uint8_t bi = 0; bi < 9; bi++)
+        {
+            char key[20];
+            snprintf(key, sizeof(key), "blnEn%d", bi + 1);
+            if (doc[key].isNull())
+            {
+                config.bln_en[bi] = false;
+                config.bln_text[bi][0] = 0;
+                config.bln_interval[bi] = 30; // LU6JMF - Marcelo Ferreira: minutes
+                config.bln_limit[bi] = 0;
+                config.bln_duration[bi] = 72;
+                config.bln_started_at[bi] = 0;
+                config.bln_sent_total[bi] = 0;
+            }
+            else
+            {
+                config.bln_en[bi] = doc[key];
+                snprintf(key, sizeof(key), "blnText%d", bi + 1);
+                strlcpy(config.bln_text[bi], doc[key] | "", sizeof(config.bln_text[bi]));
+                snprintf(key, sizeof(key), "blnInterval%d", bi + 1);
+                config.bln_interval[bi] = doc[key] | 30; // LU6JMF - Marcelo Ferreira: minutes
+
+                // LU6JMF - Marcelo Ferreira:
+                // One-time compatibility with our earlier BLN implementation,
+                // where the interval was stored in seconds.
+                // Values above the current UI maximum (1440 min) are legacy seconds.
+                if (bi < 4 && config.bln_interval[bi] > 1440)
+                {
+                    config.bln_interval[bi] =
+                        (config.bln_interval[bi] + 30) / 60;
+
+                    if (config.bln_interval[bi] == 0)
+                        config.bln_interval[bi] = 1;
+                }
+
+                snprintf(key, sizeof(key), "blnLimit%d", bi + 1);
+                config.bln_limit[bi] = doc[key] | 0;
+            }
+
+            // LU6JMF - Marcelo Ferreira:
+            // Common BLN1-BLN9 campaign state (replaces bln_activefor).
+            snprintf(key, sizeof(key), "blnDuration%d", bi + 1);
+            config.bln_duration[bi] = doc[key] | 72;
+
+            // Only the supported calendar lifetimes are accepted.
+            if (config.bln_duration[bi] != 24 &&
+                config.bln_duration[bi] != 36 &&
+                config.bln_duration[bi] != 48 &&
+                config.bln_duration[bi] != 72)
+            {
+                config.bln_duration[bi] = 72;
+            }
+
+            snprintf(key, sizeof(key), "blnStarted%d", bi + 1);
+            if (!doc[key].isNull())
+            {
+                config.bln_started_at[bi] = doc[key] | 0UL;
+            }
+            else
+            {
+                config.bln_started_at[bi] = 0;
+            }
+
+            snprintf(key, sizeof(key), "blnSentTotal%d", bi + 1);
+            config.bln_sent_total[bi] = doc[key] | 0;
+        }
+
+        // Objects (Object1-4) - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+        // LU6JMF fix (Set/2026): faltava o load pareado do save acima - sem
+        // isso o Object voltava sempre pro default (desativado/vazio) em
+        // todo boot, mesmo tendo sido salvo certinho no arquivo.
+        for (uint8_t oi = 0; oi < 4; oi++)
+        {
+            char okey[20];
+            snprintf(okey, sizeof(okey), "objEn%d", oi + 1);
+            if (doc[okey].isNull())
+            {
+                config.obj_en[oi] = false;
+                config.obj_name[oi][0] = 0;
+                config.obj_lat[oi] = 0;
+                config.obj_lon[oi] = 0;
+                strlcpy(config.obj_symbol[oi], "/r", sizeof(config.obj_symbol[oi]));
+                config.obj_text[oi][0] = 0;
+                config.obj_mode[oi] = 0;
+                config.obj_interval[oi] = 900;
+                config.obj_limit[oi] = 0;
+                config.obj_activefor[oi] = 0;
+                config.obj_permanent[oi] = false;
+            }
+            else
+            {
+                config.obj_en[oi] = doc[okey];
+                snprintf(okey, sizeof(okey), "objName%d", oi + 1);
+                strlcpy(config.obj_name[oi], doc[okey] | "", sizeof(config.obj_name[oi]));
+                snprintf(okey, sizeof(okey), "objLat%d", oi + 1);
+                config.obj_lat[oi] = doc[okey] | 0.0;
+                snprintf(okey, sizeof(okey), "objLon%d", oi + 1);
+                config.obj_lon[oi] = doc[okey] | 0.0;
+                snprintf(okey, sizeof(okey), "objSymbol%d", oi + 1);
+                strlcpy(config.obj_symbol[oi], doc[okey] | "/r", sizeof(config.obj_symbol[oi]));
+                snprintf(okey, sizeof(okey), "objText%d", oi + 1);
+                strlcpy(config.obj_text[oi], doc[okey] | "", sizeof(config.obj_text[oi]));
+                snprintf(okey, sizeof(okey), "objMode%d", oi + 1);
+                config.obj_mode[oi] = doc[okey] | 0;
+                snprintf(okey, sizeof(okey), "objInterval%d", oi + 1);
+                config.obj_interval[oi] = doc[okey] | 900;
+                snprintf(okey, sizeof(okey), "objLimit%d", oi + 1);
+                config.obj_limit[oi] = doc[okey] | 0;
+                snprintf(okey, sizeof(okey), "objActiveFor%d", oi + 1);
+                config.obj_activefor[oi] = doc[okey] | 0;
+                snprintf(okey, sizeof(okey), "objPermanent%d", oi + 1);
+                config.obj_permanent[oi] = doc[okey];
+            }
         }
 
         // Close the file (Curiously, File's destructor doesn't close the file)

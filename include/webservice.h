@@ -14,7 +14,6 @@
 
 #include <Update.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <time.h>
@@ -72,13 +71,13 @@ const timeZoneName tzList[40] PROGMEM= {
 	{+14.00, "(GMT +14:00) Line Islands, Tokelau"},
 };
 
-//const char ADC_ATTEN[4][19] = {"0dB (100-950mV)", "2.5dB (100-1250mV)", "6dB (150-1750mV)", "11dB (150-2450mV)"};
+const char ADC_ATTEN[5][19] = {"0dB (100-950mV)", "2.5dB (100-1250mV)", "6dB (150-1750mV)", "11dB (150-2450mV)", "12dB (150-3300mV)"};
 
 #define SYSTEM_LEN 6
 #define SYSTEM_BIT_LEN 9
 #define PATH_LEN 17
 const char SYSTEM_NAME[SYSTEM_LEN][20] = {"NONE", "All Count", "RF2INET", "INET2RF","DIGI","All Drop"};
-const char SYSTEM_BITS_NAME[9][20] = {"NONE", "IGATE Mode", "DIGI Mode", "WX Mode","SAT Status","INET Status","VPN Status","GSM Status","MQTT Status"};
+const char SYSTEM_BITS_NAME[9][20] = {"NONE", "IGATE Mode", "DIGI Mode", "WEATHER Mode","SAT Status","INET Status","VPN Status","GSM Status","FX.25 Status"};
 const char PATH_NAME[PATH_LEN][15] = {"OFF", "DST-TRACE 1", "DST-TRACE 2", "DST-TRACE 3", "DST-TRACE 4", "TRACE1-1", "TRACE2-2", "TRACE3-3", "WIDE1-1","RFONLY","RELAY","GATE","ECHO","UserDefine 1","UserDefine 2","UserDefine 3","UserDefine 4"};
 
 
@@ -99,12 +98,20 @@ extern msgType *msgQueue;
 extern TinyGPSPlus gps;
 extern float vbat;
 extern WiFiClient aprsClient;
+// TCP KISS Server - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
+extern WiFiServer tcpKissServer1;
+extern WiFiServer tcpKissServer2;
+extern WiFiClient tcpKissClient1;
+extern WiFiClient tcpKissClient2;
+extern uint32_t tcpKissRxCount[2];
+extern uint32_t tcpKissTxCount[2];
 extern bool initInterval;
 extern bool webServiceBegin;
 extern fs::LITTLEFSFS LITTLEFS;
-extern float VBat;
-extern float TempNTC;
+extern double VBat;
+extern double TempNTC;
 extern bool lastHeard_Flag;
+extern unsigned long lastHeardTimeout;
 extern SensorData sen[SENSOR_NUMBER];
 extern uint16_t TLM_SEQ;
 extern uint16_t IGATE_TLM_SEQ;
@@ -122,20 +129,23 @@ extern "C"
 uint8_t temprature_sens_read();
 
 void serviceHandle();
-// void setHTML(byte page);
-// void handle_root();
-// void handle_setting();
-// void handle_service();
-// void handle_system();
-// void handle_firmware();
-// void handle_default();
+void setHTML(byte page);
+void handle_root();
+void handle_setting();
+void handle_service();
+void handle_system();
+void handle_firmware();
+void handle_default();
 void webService();
-// void handle_radio();
-// extern void RF_MODULE(bool boot);
-void handle_ws();
-//void handle_ws_gnss(char *nmea);
+void handle_radio();
+extern void RF_MODULE(bool boot);
+//void handle_ws(String Raw,uint16_t mVrms);
+void handle_ws(char *Raw,size_t len,uint16_t mVrms);
+void handle_ws_gnss(char *nmea);
 void handle_ws_gnss(char *nmea, size_t size);
 void event_lastHeard(bool gethtml=false);
 String event_chatMessage(bool gethtml=false);
 
 #endif
+
+
