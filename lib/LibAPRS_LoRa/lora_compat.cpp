@@ -174,7 +174,12 @@ bool Ax25ReadNextRxFrame(uint8_t **dst, uint16_t *size, int8_t *peak, int8_t *va
 }
 
 // ---- TX side ------------------------------------------------------------------
-bool getTransmit() { return ax25_stateTx; }
+// "PTT" on LoRa = the radio is really on the air (set by LibAPRS around
+// radioHal->transmit(), after listen-before-talk). So /txdebug "wait to PTT" is
+// the queue + channel wait and the learned airtime is the real airtime.
+static volatile bool loraOnAir = false;
+void loraSetOnAir(bool on) { loraOnAir = on; }
+bool getTransmit() { return loraOnAir; }
 bool getReceive() { return false; }
 uint8_t ModemDcdState(void) { return 0; }
 void setPtt(bool state) { (void)state; }
