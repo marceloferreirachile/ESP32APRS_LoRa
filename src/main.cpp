@@ -2302,6 +2302,9 @@ config.oled_enable = true;
     config.uart0_rx_gpio = 44; // ESP32-S3 UART0 pins (3/1 are ESP32-classic)
     config.uart0_tx_gpio = 43;
 #endif
+    // LoRa airtime (~4 s per packet at SF12): position beacons every 15 min, as in CA2RXU
+    config.igate_interval = 900;
+    config.digi_interval = 900;
     config.timeZone = -3;
     sprintf(config.aprs_host, "rotate.aprs2.net");
     config.aprs_port = 14580;
@@ -3013,6 +3016,7 @@ void AFSK_RequestRxSoftReset(void); // RX half: executed later by AFSK_Poll (tas
 // LU6JMF - Marcelo Ferreira
 // Identity of the single RF job currently owned by the TX lifecycle.
 static uint8_t lu6jmfRfActiveJobType = LU6JMF_TXJOB_GENERIC;
+static uint8_t lu6jmfRfActivePriority = LU6JMF_TXPRIO_NORMAL; // LoRa: priority kept for a CAD re-queue
 
 // -----------------------------------------------------------------------------
 // LU6JMF - Marcelo Ferreira
@@ -3686,6 +3690,17 @@ bool pkgTxPushJob(const char *info,
     char *ecs = strstr(info, ">");
     if (ecs == NULL)
         return false;
+#ifdef RADIO_LORA
+    // A LoRa frame carries at most 255 bytes; the standard "<\xFF\x01" header takes 3.
+    // A longer packet would be refused by the radio and lost: keep it for APRS-IS only.
+    if ((Ch & RF_CHANNEL) && len > 252)
+    {
+        log_e("[LoRa] packet too long for RF (%u > 252), not sent by radio", (unsigned)len);
+        Ch &= ~RF_CHANNEL;
+        if (Ch == 0)
+            return false;
+    }
+#endif
     psramLock();
     // for (int i = 0; i < PKGTXSIZE; i++)
     // {
@@ -4120,6 +4135,7 @@ bool pkgTxSend()
             // LU6JMF - Marcelo Ferreira
             // Bind producer identity to the complete RF lifecycle.
             lu6jmfRfActiveJobType = txQueue[i].JobType;
+            lu6jmfRfActivePriority = selectedPriority;
 
             lu6jmfTxEventAdd(LU6JMF_TXEV_RF_ACCEPTED,
                              (uint32_t)i,
@@ -8224,17 +8240,50 @@ void taskAPRS(void *pvParameters)
 
                 lu6jmfRfLastCycleMs = txEndMs - lu6jmfRfDispatchMs;
 
+#ifdef RADIO_LORA
+                // LoRa listen-before-talk: the channel stayed busy, nothing was
+                // transmitted. Put the same frame back into the TX queue (same job
+                // and priority, 1-3 s later); after 5 busy attempts in a row it is
+                // dropped so a jammed channel cannot loop forever.
+                static uint8_t loraBusyRetries = 0;
+                bool loraChannelWasBusy = (loraGetLastTxState() == LORA_TX_CHANNEL_BUSY);
+                if (loraChannelWasBusy)
+                {
+                    size_t fl = 0;
+                    const char *fr = loraLastFrame(&fl);
+                    if (++loraBusyRetries <= 5 && fl > 0)
+                    {
+                        pkgTxPushJob(fr, fl, random(1000, 3000), RF_CHANNEL,
+                                     lu6jmfRfActiveJobType, lu6jmfRfActivePriority);
+                        log_i("[LoRa] channel busy, frame re-queued (%u)", loraBusyRetries);
+                    }
+                    else
+                    {
+                        log_e("[LoRa] channel busy 5x, frame dropped");
+                        loraBusyRetries = 0;
+                    }
+                }
+                else
+                {
+                    loraBusyRetries = 0;
+                }
+                if (!loraChannelWasBusy && lu6jmfRfPttSeen && lu6jmfRfPttOnMs != 0)
+#else
                 // -------------------------------------------------------------
                 // LU6JMF - Marcelo Ferreira
                 // Phase 2J: learn actual RF airtime only when PTT ON was really
                 // observed. PTT OFF here remains the authoritative completion.
                 // -------------------------------------------------------------
                 if (lu6jmfRfPttSeen && lu6jmfRfPttOnMs != 0)
+#endif
                 {
                     uint32_t airMs = txEndMs - lu6jmfRfPttOnMs;
                     lu6jmfTxTimingLearn(lu6jmfRfActiveJobType, airMs);
                 }
 
+#ifdef RADIO_LORA
+                if (!loraChannelWasBusy) // a busy-channel cycle transmitted nothing
+#endif
                 lu6jmfRfCompleted++;
                 lu6jmfTxEventAdd(LU6JMF_TXEV_RF_RELEASE,
                                  lu6jmfRfLastCycleMs,
@@ -9798,8 +9847,27 @@ void taskAPRS(void *pvParameters)
                 // uint16_t type = pkgType((const char *)&incomingPacket.info[0]);
                 Sleep_Activate &= ~ACTIVATE_DIGI;
                 StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+#ifdef RADIO_LORA
+                // LoRa fill-in digipeater (as CA2RXU mode 1, the usual one on LoRa APRS):
+                // repeat only when the next unused hop is WIDE1-1 or our own callsign.
+                // WIDE2-n is left to the high sites, so a packet is not repeated over and
+                // over at ~4 s of airtime each.
+                bool loraFillIn = false;
+                for (int h = 0; h < incomingPacket.rpt_count; h++)
+                {
+                    if (incomingPacket.rpt_flags & (1 << h))
+                        continue; // already used (H-bit set)
+                    if (!strncmp(incomingPacket.rpt_list[h].call, "WIDE1", 5) && incomingPacket.rpt_list[h].ssid == 1)
+                        loraFillIn = true;
+                    else if (!strcmp(incomingPacket.rpt_list[h].call, config.digi_mycall) && incomingPacket.rpt_list[h].ssid == config.digi_ssid)
+                        loraFillIn = true;
+                    break;
+                }
+                if ((type & config.digiFilter) && loraFillIn)
+#else
                 // Digi repeater filter
                 if ((type & config.digiFilter))
+#endif
                 {
                     // Packet recheck
                     pkgTxDuplicate(incomingPacket); // Search duplicate in tx and drop packet for renew

@@ -47,11 +47,36 @@ static volatile bool loraRecoverReq = false;
 
 // Called by LibAPRS.cpp (taskAPRSPoll context) right after radioHal->transmit()
 // returned and RX was restarted. This is the LoRa "PTT OFF".
+static volatile uint32_t loraTxBusy = 0;
+uint32_t loraGetTxBusy() { return loraTxBusy; }
+
+// TNC2 text of the frame currently handed to the radio (to re-queue it if the
+// channel was busy).
+static char loraFrameBuf[300];
+static size_t loraFrameLen = 0;
+void loraRememberFrame(const uint8_t *raw, size_t len)
+{
+    if (len >= sizeof(loraFrameBuf))
+        len = sizeof(loraFrameBuf) - 1;
+    memcpy(loraFrameBuf, raw, len);
+    loraFrameBuf[len] = 0;
+    loraFrameLen = len;
+    loraLastTxState = 0; // a new lifecycle starts: forget the previous result
+}
+const char *loraLastFrame(size_t *len)
+{
+    if (len)
+        *len = loraFrameLen;
+    return loraFrameBuf;
+}
+
 void loraTxDone(int16_t state)
 {
     loraLastTxState = state;
     if (state == 0)
         loraTxOk++;
+    else if (state == LORA_TX_CHANNEL_BUSY)
+        loraTxBusy++;
     else
         loraTxErr++;
     pttOff = true;

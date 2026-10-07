@@ -89,10 +89,62 @@ static unsigned long b91val[4] = {23601572L, 259358L, 2851L, 32L};
 static long valtable[] = {1193046471L, 119304647L, 11930465L, 1988411L, 198841L, 19884L, 1988L, 199L, 20L, 2L};
 
 bool received = false;
+// LU6JMF: TCXO supply voltage (DIO3). Heltec V3 = 1.8 V (Heltec docs, CA2RXU, Meshtastic);
+// RadioLib's default 1.6 V was used before.
+#if defined(HELTEC_V3_GPS)
+#define LORA_TCXO_VOLTAGE 1.8
+#else
+#define LORA_TCXO_VOLTAGE 1.6
+#endif
+
 // LU6JMF 2.1.5 core hooks (implemented in lora_compat.cpp)
 static int16_t lastTxState = 0;
 extern void loraTxDone(int16_t state);
 extern void LED_Status(uint8_t r, uint8_t g, uint8_t b); // main.cpp
+
+// -----------------------------------------------------------------------------
+// LU6JMF - LoRa listen before talk (CAD), as in CA2RXU's LoRa_APRS_iGate:
+// the channel must be free on 2 consecutive CAD scans (DIFS), then on a random
+// 1..4 more scans (backoff, so two stations waiting for the same free channel
+// do not start together). Activity during the backoff restarts the wait.
+// Gives up after 10 s -> the frame goes back to the TX queue (main.cpp).
+// -----------------------------------------------------------------------------
+#define LORA_CAD_DIFS_SLOTS 2
+#define LORA_CAD_BACKOFF_MAX 4
+#define LORA_CAD_MAX_WAIT_MS 10000UL
+
+static bool loraCadBusy()
+{
+    return radioHal->scanChannel() != RADIOLIB_CHANNEL_FREE;
+}
+
+static bool loraChannelClear()
+{
+    uint32_t start = millis();
+    for (;;)
+    {
+        bool free = true;
+        for (int k = 0; k < LORA_CAD_DIFS_SLOTS; k++)
+        {
+            if (loraCadBusy())
+            {
+                free = false;
+                break;
+            }
+        }
+        if (free)
+        {
+            int backoff = random(1, LORA_CAD_BACKOFF_MAX + 1);
+            while (backoff > 0 && !loraCadBusy())
+                backoff--;
+            if (backoff == 0)
+                return true;
+        }
+        if (millis() - start > LORA_CAD_MAX_WAIT_MS)
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(random(50, 200)));
+    }
+}
 
 bool eInterrupt = true;
 bool noisyInterrupt = false;
@@ -443,6 +495,7 @@ bool APRS_sendTNC2Pkt(const uint8_t *raw_in, size_t length)
     if (raw_in == NULL || length == 0 || length > 300)
         return false;
     uint8_t *raw = (uint8_t *)raw_in;
+    loraRememberFrame(raw_in, length);
     if (config.rf_ax25)
     {
         ax25frame *frame = (ax25frame *)calloc(1, sizeof(ax25frame));
@@ -635,7 +688,7 @@ bool APRS_init(Configuration *cfg)
         if ((cfg->rf_type == RF_SX1231) || (cfg->rf_type == RF_SX1233) || (config.rf_mode == RF_MODE_G3RUH) || (config.rf_mode == RF_MODE_AIS) || (config.rf_mode == RF_MODE_GFSK))
         {
             // state = radioHal->beginFSK(config.rf_freq + (config.rf_freq_offset / 1000000.0), config.rf_baudrate, config.rf_bw, config.rf_bw, config.rf_power, config.rf_preamable, 0, 1.6);
-            state = radioHal->beginFSK(config.rf_freq + (config.rf_freq_offset / 1000000.0), config.rf_br, config.rf_br * 0.25f, config.rf_bw, config.rf_power, config.rf_preamable, false, 1.6);
+            state = radioHal->beginFSK(config.rf_freq + (config.rf_freq_offset / 1000000.0), config.rf_br, config.rf_br * 0.25f, config.rf_bw, config.rf_power, config.rf_preamable, false, LORA_TCXO_VOLTAGE);
             if (state == RADIOLIB_ERR_NONE)
             {
                 ret = true;
@@ -649,7 +702,7 @@ bool APRS_init(Configuration *cfg)
         }
         else
         {
-            state = radioHal->begin(config.rf_freq + (config.rf_freq_offset / 1000000.0), config.rf_bw, config.rf_sf, config.rf_cr, config.rf_sync, config.rf_power, config.rf_preamable, 1, 1.6);
+            state = radioHal->begin(config.rf_freq + (config.rf_freq_offset / 1000000.0), config.rf_bw, config.rf_sf, config.rf_cr, config.rf_sync, config.rf_power, config.rf_preamable, 1, LORA_TCXO_VOLTAGE);
             if (state == RADIOLIB_ERR_NONE)
             {
                 ret = true;
@@ -1652,8 +1705,13 @@ bool APRS_poll(void)
                         }
                     }
                     else
-                    {                        
-                        lastTxState = radioHal->transmit(byteArr, i);
+                    {
+                        // LU6JMF: listen before talk (same scheme as CA2RXU). If the channel stays
+                        // busy the frame is NOT transmitted; the scheduler re-queues it.
+                        if (config.rf_mode == RF_MODE_LoRa && !loraChannelClear())
+                            lastTxState = LORA_TX_CHANNEL_BUSY;
+                        else
+                            lastTxState = radioHal->transmit(byteArr, i);
                     }
                     free(byteArr);
                     ret = true;
