@@ -2338,7 +2338,7 @@ void defaultConfig()
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
     sprintf(config.wifi_ap_ssid, "ESP32APRS_LoRa");
-    sprintf(config.wifi_ap_pass, "aprsthnetwork");
+    config.wifi_ap_pass[0] = 0; // LU6JMF: open AP (no default password)
 
     // Blutooth
 #ifdef BLUETOOTH
@@ -3350,7 +3350,7 @@ void defaultConfig()
     config.pwr_gpio = 41;
     config.pwr_active = 1;
     sprintf(config.wifi_ap_ssid, "LoRa_HT");
-    sprintf(config.wifi_ap_pass, "aprsthnetwork");
+    config.wifi_ap_pass[0] = 0; // LU6JMF: open AP (no default password)
     config.at_cmd_msg = true;
     config.at_cmd_uart = 4;
 #elif defined(HELTEC_HTIT_TRACKER)
@@ -10482,7 +10482,8 @@ void taskNetwork(void *pvParameters)
         // Start the Access Point
         WiFi.AP.begin();
         WiFi.AP.config(ap_ip, ap_ip, ap_mask, ap_leaseStart, ap_dns);
-        WiFi.AP.create(config.wifi_ap_ssid, config.wifi_ap_pass);
+        // LU6JMF: empty password = open network (NULL), otherwise WPA2
+        WiFi.AP.create(config.wifi_ap_ssid, config.wifi_ap_pass[0] ? config.wifi_ap_pass : NULL);
         if (!WiFi.AP.waitStatusBits(ESP_NETIF_STARTED_BIT, 1000))
         {
             Serial.println("Failed to start AP!");

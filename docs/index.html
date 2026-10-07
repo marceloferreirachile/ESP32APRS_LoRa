@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ESP32APRS LoRa - Installer (LU6JMF)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root { --bg:#150d26; --card:#241640; --line:#4c2f85; --accent:#8b5cf6; --accent2:#a78bfa; --text:#ede9fe; --muted:#b9a8e6; }
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 20px; line-height: 1.5; background: var(--bg); color: var(--text); }
+  h1 { font-size: 1.4em; color: var(--accent2); }
+  a { color: var(--accent2); }
+  .box { border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin: 20px 0; background: var(--card); }
+  .box h2 { margin-top: 0; font-size: 1.1em; }
+  esp-web-install-button { display: block; margin: 16px 0; --esp-tools-button-color: #8b5cf6; --esp-tools-button-text-color: #fff; }
+  ol { padding-left: 20px; }
+  .warn { background: #3b1d5e; border: 1px solid #7c3aed; border-radius: 8px; padding: 12px; margin: 16px 0; }
+  .ok { background: #1e2f4a; border: 1px solid #5b8bd6; border-radius: 8px; padding: 12px; margin: 16px 0; }
+  small, .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>ESP32APRS LoRa (LU6JMF) — Installer</h1>
+
+<p>Firmware for LoRa APRS stations (tested target: Heltec WiFi LoRa 32 V3, 915 MHz), based on ESP32APRS_LoRa by nakhonthai. Flashes straight from your browser (Chrome or Edge) with one click. No software to install.</p>
+
+<div class="box">
+  <h2>1. Update an existing device (keeps your configuration)</h2>
+  <p>Use this if the device already runs the original firmware or this one. Only the program is replaced; callsign, WiFi, APRS and LoRa settings stay as they are.</p>
+  <esp-web-install-button manifest="./manifest-update.json">
+    <button slot="activate">Update (keep configuration)</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer.</span>
+    <span slot="not-allowed">This page needs HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+  <div class="ok"><small>Do not tick any "erase" option in the installer dialog when updating.</small></div>
+</div>
+
+<div class="box">
+  <h2>2. Fresh install (erases everything)</h2>
+  <ol>
+    <li>Connect the board to your computer with a USB cable.</li>
+    <li>Click the button and select the board's serial port.</li>
+    <li>Wait for the flashing to finish (about 1 minute).</li>
+  </ol>
+  <esp-web-install-button manifest="./manifest.json">
+    <button slot="activate">Fresh install</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer.</span>
+    <span slot="not-allowed">This page needs HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+  <div class="warn"><strong>Warning:</strong> this erases everything on the device, including WiFi and APRS configuration. After the install, configure it through the device's own web page (it creates its own WiFi network on first boot).</div>
+</div>
+
+<p class="muted">Tip: if the board is not detected, hold BOOT, tap RESET, then release BOOT, and try again.</p>
+
+</body>
+</html>
