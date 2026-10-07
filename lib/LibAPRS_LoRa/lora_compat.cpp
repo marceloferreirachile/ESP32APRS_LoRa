@@ -37,6 +37,7 @@ volatile bool pttOff = false;
 volatile uint32_t adcIsrCount = 0;
 volatile int fifoSampleCount = 0;
 volatile bool hw_afsk_dac_isr = false;
+int offset = 0; // audio ADC DC offset (shown on the MOD page); no meaning on LoRa
 
 // ---- LoRa TX lifecycle -----------------------------------------------------
 static volatile int16_t loraLastTxState = 0;
