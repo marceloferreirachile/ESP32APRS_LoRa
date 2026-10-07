@@ -537,7 +537,78 @@ void ax25_init(AX25Ctx *ctx, ax25_callback_t hook)
     ctx->crc_in = ctx->crc_out = CRC_CCIT_INIT_VAL;
 }
 
+// LU6JMF - LoRa port of the 2.1.5 core:
+// every packet the radio decodes (LoRa AX.25, LoRa "<\xFF\x01"+TNC2, GFSK/G3RUH)
+// ends up here. Instead of handing it to aprs_msg_callback(), the raw frame is
+// queued into the same RX ring the audio firmware uses (Ax25NewRxFrames /
+// Ax25ReadNextRxFrame in lora_compat.cpp), so taskAPRS of the 2.1.5 core
+// processes LoRa packets exactly like audio packets (igate, digi, KISS, logs).
+extern bool loraRxPushFrame(const uint8_t *frame, size_t len);
+
+void ax25_decode(uint8_t *buf, size_t len, uint16_t mVrms, AX25Msg *msg)
+{
+    uint8_t *buf_start = buf;
+    memset(msg, 0, sizeof(AX25Msg));
+    if (buf == NULL || len < 16)
+        return;
+
+    DECODE_CALL(buf, msg->dst.call);
+    msg->dst.ssid = (*buf++ >> 1) & 0x0F;
+    msg->dst.call[6] = 0;
+
+    DECODE_CALL(buf, msg->src.call);
+    msg->src.ssid = (*buf >> 1) & 0x0F;
+    msg->src.call[6] = 0;
+
+    for (msg->rpt_count = 0; !(*buf++ & 0x01) && (msg->rpt_count < countof(msg->rpt_list)); msg->rpt_count++)
+    {
+        if ((size_t)(buf - buf_start) + 7 > len)
+            return;
+        DECODE_CALL(buf, msg->rpt_list[msg->rpt_count].call);
+        msg->rpt_list[msg->rpt_count].ssid = (*buf >> 1) & 0x0F;
+        AX25_SET_REPEATED(msg, msg->rpt_count, (*buf & 0x80));
+        msg->rpt_list[msg->rpt_count].call[6] = 0;
+    }
+
+    if ((size_t)(buf - buf_start) + 2 > len)
+        return;
+    msg->ctrl = *buf++;
+    if (msg->ctrl != AX25_CTRL_UI)
+        return;
+
+    msg->pid = *buf++;
+    if (msg->pid != AX25_PID_NOLAYER3)
+        return;
+
+    int rest = (int)((buf_start + len) - buf);
+    if (rest > 0)
+    {
+        if (rest > (int)sizeof(msg->info) - 1)
+            rest = sizeof(msg->info) - 1;
+        msg->len = rest;
+        memcpy(msg->info, buf, rest);
+    }
+    else
+    {
+        msg->len = 0;
+    }
+    msg->mVrms = mVrms;
+}
+
 void ax25_decode(AX25Ctx *ctx)
+{
+    // frame_len includes the 2 FCS bytes
+    if (ctx->frame_len > 2)
+    {
+        ctxbufflen = ctx->frame_len - 2;
+        ctxbuffer = ctx->buf;
+        loraRxPushFrame(ctx->buf, ctx->frame_len - 2);
+    }
+    return;
+}
+
+// Original nakhonthai decoder (callback path), kept for reference / RF2. Not used by the 2.1.5 core.
+void ax25_decode_callback(AX25Ctx *ctx)
 {
     AX25Msg msg;
     ctxbufflen = ctx->frame_len - 2;

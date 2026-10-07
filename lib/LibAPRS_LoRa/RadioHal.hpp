@@ -6,6 +6,7 @@
 
 class IRadioHal {
 public:
+  virtual ~IRadioHal() {}
   virtual int16_t begin(float freq, float bw, uint8_t sf, uint8_t cr, uint8_t syncWord, int8_t power, uint16_t preambleLength, uint8_t gain, float tcxoVoltage) = 0;
   virtual int16_t begin() = 0;
   virtual int16_t beginFSK(float freq = 434.0, float br = 48.0, float freqDev = 50.0, float rxBw = 125.0, int8_t power = 10, uint16_t preambleLength = 16, bool enableOOK = false, float tcxoVoltage = 1.6, bool useRegulatorLDO = false) = 0;
@@ -14,6 +15,7 @@ public:
   virtual int16_t setCRC(uint8_t len,	uint16_t initial = 0x1D0F, uint16_t polynomial = 0x1021, bool inverted = true ) = 0;
   virtual int16_t setDataShaping(uint8_t sh) = 0;
   virtual void setDio0Action(void (*func)(void)) = 0;
+  virtual void clearDio0Action() = 0; // LU6JMF: detach the RX/TX-done interrupt before deleting the radio
   virtual int16_t startReceive(uint8_t len = 0, uint8_t mode = RADIOLIB_SX127X_RXCONTINUOUS) = 0;
   virtual int16_t transmit(uint8_t* data, size_t len, uint8_t addr = 0) = 0;
   virtual int16_t sleep() = 0;
@@ -42,7 +44,19 @@ class RadioHal : public IRadioHal {
 public:
   RadioHal(Module* mod)
   {
+    module = mod;
     radio = new T(mod);
+  }
+
+  // LU6JMF: radio re-init (watchdog recovery / config change) used to leak the
+  // radio object and its Module on every APRS_init(). The owner deletes the old
+  // RadioHal before creating a new one; this frees both.
+  virtual ~RadioHal()
+  {
+    if (radio) delete radio;
+    if (module) delete module;
+    radio = NULL;
+    module = NULL;
   }
 
   int16_t begin(float freq, float bw, uint8_t sf, uint8_t cr, uint8_t syncWord, int8_t power, uint16_t preambleLength, uint8_t gain, float tcxoVoltage);
@@ -61,6 +75,7 @@ public:
   }
 
   void setDio0Action(void (*func)(void));
+  void clearDio0Action() { radio->clearPacketReceivedAction(); }
 
   int16_t startReceive(uint8_t len = 0, uint8_t mode = RADIOLIB_SX127X_RXCONTINUOUS);
 
@@ -131,7 +146,8 @@ public:
 
 
 private:
-  T* radio;
+  T* radio = NULL;
+  Module* module = NULL;
 };
 
 

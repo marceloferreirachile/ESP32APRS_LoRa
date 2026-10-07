@@ -13,6 +13,7 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include "main.h"
+#include "brand.h"
 #include <LibAPRSesp.h>
 // LU6JMF - Marcelo Ferreira: DCD state used by TX Scheduler diagnostics.
 #include "modem.h"
@@ -143,7 +144,11 @@ TwoWire Wire1 = TwoWire(1);
 Adafruit_SH1106 display(OLED_RESET);
 #else
 #include <Adafruit_SSD1306.h>
+#if defined(HELTEC_V3_GPS)
+#define OLED_RESET 21
+#else
 #define OLED_RESET -1
+#endif
 #ifdef SSD1306_72x40
 #define SSD1306_NO_SPLASH
 #define SCREEN_ADDRESS 0x3C
@@ -200,8 +205,16 @@ void IRAM_ATTR LED_Status(uint8_t r, uint8_t g, uint8_t b)
     // portEXIT_CRITICAL_ISR(&ledMux);
 }
 #else
+#if defined(HELTEC_V3_GPS)
+#define LED_TX 35
+#define LED_RX -1
+#elif defined(RADIO_LORA)
+#define LED_TX -1
+#define LED_RX -1
+#else
 #define LED_TX 4
 #define LED_RX 2
+#endif
 void LED_Status(uint8_t r, uint8_t g, uint8_t b)
 {
     // portENTER_CRITICAL_ISR(&ledMux);          // ISR start
@@ -1650,7 +1663,7 @@ void defaultConfig()
         config.wifi_sta[i].wifi_ssid[0] = 0;
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
-    sprintf(config.wifi_ap_ssid, "ESP32APRS_Audio");
+    sprintf(config.wifi_ap_ssid, BRAND_DEVICE_NAME);
     sprintf(config.wifi_ap_pass, "aprsthnetwork");
 
     // Blutooth
@@ -1658,7 +1671,7 @@ void defaultConfig()
     config.bt_master = false;
     config.bt_mode = 1; // 0-None,1-TNC2RAW,2-KISS
     config.bt_power = 3;
-    sprintf(config.bt_name, "ESP32APRS_Audio");
+    sprintf(config.bt_name, BRAND_DEVICE_NAME);
     config.bt_pin = 0;
 #if !defined(CONFIG_IDF_TARGET_ESP32)
     // Bluetooth BLE
@@ -1770,7 +1783,7 @@ void defaultConfig()
     memset(config.igate_phg, 0, sizeof(config.igate_phg));
     config.igate_path = 8;
     sprintf(config.igate_comment, "");
-    sprintf(config.igate_status, "https://github.com/nakhonthai/ESP32APRS_Audio");
+    sprintf(config.igate_status, BRAND_UPSTREAM_URL);
     config.igate_sts_interval = 1800;
 
     // DIGI REPEATER
@@ -1795,7 +1808,7 @@ void defaultConfig()
     sprintf(config.digi_symbol, "A#");
     memset(config.digi_phg, 0, sizeof(config.digi_phg));
     sprintf(config.digi_comment, "");
-    sprintf(config.digi_status, "https://github.com/nakhonthai/ESP32APRS_Audio");
+    sprintf(config.digi_status, BRAND_UPSTREAM_URL);
     config.digi_sts_interval = 1800;
 
     // Tracker
@@ -1835,7 +1848,7 @@ void defaultConfig()
     sprintf(config.trk_mycall, "NOCALL");
     sprintf(config.trk_comment, "");
     memset(config.trk_item, 0, sizeof(config.trk_item));
-    sprintf(config.trk_status, "https://github.com/nakhonthai/ESP32APRS_Audio");
+    sprintf(config.trk_status, BRAND_UPSTREAM_URL);
     config.trk_sts_interval = 1800;
 
     // WX
@@ -2229,6 +2242,58 @@ config.oled_enable = true;
     config.i2c_sda_pin = -1;
     config.i2c_sck_pin = -1;
 #endif
+#ifdef RADIO_LORA
+    // LU6JMF - LoRa radio defaults (Argentina LoRa APRS: 433.775 MHz, SF12/BW125/CR5,
+    // sync 0x12 = the one every LoRa APRS project uses). TX in the standard
+    // "<\xFF\x01"+TNC2 format (rf_ax25 = false) so every project understands us;
+    // RX always accepts both formats (AX.25/HDLC and TNC2).
+    config.rf_en = true;
+    config.rf_type = RF_SX1262;
+    config.rf_mode = RF_MODE_LoRa;
+    config.rf_freq = 433.775;
+    config.rf_freq_offset = 0;
+    config.rf_bw = 125.0;
+    config.rf_br = 9.7;
+    config.rf_sf = 12;
+    config.rf_cr = 5;
+    config.rf_sync = 0x12;
+    config.rf_power = 20;
+    config.rf_preamable = 8;
+    config.rf_lna = 1;
+    config.rf_ax25 = false;
+    config.rf_shaping = 0x02;  // RADIOLIB_SHAPING_0_5
+    config.rf_encoding = 0x00; // RADIOLIB_ENCODING_NRZ
+    config.rf_rx_boost = true;
+    config.rf_tx_gpio = -1; // antenna switch TX enable (-1 = none)
+    config.rf_rx_gpio = -1;
+    config.rf_tx_active = 1;
+    config.rf_rx_active = 1;
+    config.rf_nss_active = 0;
+    config.rf_reset_active = 0;
+    config.rf_dio2_gpio = -1;
+    // audio-only pins: never drive them on a LoRa board
+    config.rf_sql_gpio = -1;
+    config.rf_pd_gpio = -1;
+    config.rf_pwr_gpio = -1;
+    config.rf_ptt_gpio = -1;
+#if defined(HELTEC_V3_GPS)
+    config.rf_dio1_gpio = 14;
+    config.rf_reset_gpio = 12;
+    config.rf_dio0_gpio = 13; // BUSY
+    config.rf_nss_gpio = 8;
+    config.rf_sclk_gpio = 9;
+    config.rf_miso_gpio = 11;
+    config.rf_mosi_gpio = 10;
+    config.uart1_enable = true; // GNSS header
+    config.uart1_baudrate = 9600;
+    config.uart1_rx_gpio = 19;
+    config.uart1_tx_gpio = 20;
+    config.uart1_rts_gpio = -1;
+    config.i2c_enable = true;   // on-board OLED
+    config.i2c_sda_pin = 17;
+    config.i2c_sck_pin = 18;
+#endif
+#endif
     config.i2c_freq = 400000;
     config.i2c1_enable = false;
     config.i2c1_sda_pin = -1;
@@ -2298,7 +2363,7 @@ config.oled_enable = true;
     config.digi_tlm_interval = 0;
     config.igate_tlm_interval = 0;
     config.wx_tlm_interval = 0;
-    sprintf(config.host_name, "ESP32APRS_Audio");
+    sprintf(config.host_name, BRAND_DEVICE_NAME);
 
     config.fx25_mode = 2; // Used modem mode FX.25 RX+TX
 }
@@ -2909,7 +2974,14 @@ static const uint32_t LU6JMF_RF_STUCK_TIMEOUT_MS = 60000; // 1 minute
 // more than ~4 s (preamble + <=330 bytes at 1200 baud + tail). If PTT stays on longer than this
 // the modem is stuck: recover after 10 s instead of waiting the full 60 s (a stuck PTT is an
 // unmodulated carrier on the air for the whole time).
+#ifdef RADIO_LORA
+// LoRa: "PTT ON" = frame handed to the radio, OFF = transmit() returned. At SF12/BW125
+// a full 255-byte frame is ~9 s on the air (+ RadioLib's own timeout margin), so the
+// "keyed too long" limit is wider than the audio 10 s.
+static const uint32_t LU6JMF_RF_PTT_MAX_MS = 25000;
+#else
 static const uint32_t LU6JMF_RF_PTT_MAX_MS = 10000;
+#endif
 extern volatile bool hw_afsk_dac_isr;  // AFSK.cpp: DAC ISR gate flag (diagnostic read only)
 bool AFSK_DacTimerRunning(void);       // AFSK.cpp: DAC timer run-state (diagnostic read only)
 
@@ -3056,7 +3128,12 @@ static void lu6jmfTxQueueWaitLearn(uint8_t priority, uint32_t waitMs)
 // After MESSAGE / MSG RETRY RF completion, LOW priority RF jobs are held
 // briefly while CRITICAL, HIGH and NORMAL traffic remain eligible.
 // -----------------------------------------------------------------------------
+#ifdef RADIO_LORA
+// LoRa: the other station's ACK alone takes ~2-4 s on the air at SF12.
+static const uint32_t LU6JMF_ACK_WINDOW_MS = 12000;
+#else
 static const uint32_t LU6JMF_ACK_WINDOW_MS = 5000;
+#endif
 static uint32_t lu6jmfAckWindowUntilMs = 0;
 static bool lu6jmfAckWindowActive = false;
 
@@ -3968,6 +4045,7 @@ bool pkgTxSend()
 
         psramUnlock();
 
+#ifndef RADIO_LORA
         if (config.rf_en)
         {
             if ((config.rf_type == RF_SR_1WV) ||
@@ -3989,6 +4067,7 @@ bool pkgTxSend()
                 );
             }
         }
+#endif
 
         log_d("TX->RF[%i]: %s", (int)rfLength, (char *)rfInfo);
 
@@ -4227,6 +4306,9 @@ unsigned long SA818_Timeout = 0;
 
 void RF_MODULE_SLEEP()
 {
+#ifdef RADIO_LORA
+    return; // LoRa: the radio is owned by taskAPRSPoll (lora_compat.cpp); no SA868 power pins
+#endif
     digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
     digitalWrite(config.rf_pd_gpio, LOW);
     // PMU.disableDC3();
@@ -4271,6 +4353,14 @@ String ctcssToHex(unsigned int decValue, int section)
 
 void RF_MODULE(bool boot)
 {
+#ifdef RADIO_LORA
+    // LoRa: (re)configure the radio = re-run APRS_init() inside taskAPRSPoll,
+    // the only task that touches the radio. At boot taskAPRSPoll does the
+    // first init by itself, so only later calls (RADIO page save) ask for it.
+    if (!boot)
+        AFSK_RequestRxSoftReset();
+    return;
+#endif
     String data;
     if (config.rf_en == false)
     {
@@ -4436,6 +4526,9 @@ void RF_MODULE(bool boot)
 
 void RF_MODULE_CHECK()
 {
+#ifdef RADIO_LORA
+    return; // LoRa: no SA868 AT link to check
+#endif
     while (SerialRF.available() > 0)
         SerialRF.read();
     SerialRF.println("AT+DMOCONNECT");
@@ -4501,15 +4594,15 @@ boolean APRSConnect()
         if (strlen(config.igate_object) >= 3)
         {
             uint16_t passcode = aprsParse.passCode(config.igate_object);
-            login = "user " + String(config.igate_object) + " pass " + String(passcode, DEC) + " vers ESP32APRS_Audio V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
+            login = "user " + String(config.igate_object) + " pass " + String(passcode, DEC) + " vers " BRAND_SHORT " V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
         }
         else
         {
             uint16_t passcode = aprsParse.passCode(config.aprs_mycall);
             if (config.aprs_ssid == 0)
-                login = "user " + String(config.aprs_mycall) + " pass " + String(passcode, DEC) + " vers ESP32APRS_Audio V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
+                login = "user " + String(config.aprs_mycall) + " pass " + String(passcode, DEC) + " vers " BRAND_SHORT " V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
             else
-                login = "user " + String(config.aprs_mycall) + "-" + String(config.aprs_ssid) + " pass " + String(passcode, DEC) + " vers ESP32APRS_Audio V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
+                login = "user " + String(config.aprs_mycall) + "-" + String(config.aprs_ssid) + " pass " + String(passcode, DEC) + " vers " BRAND_SHORT " V" + String(VERSION) + String(VERSION_BUILD) + " filter " + String(config.aprs_filter);
         }
         aprsClient.println(login);
         // Serial.println(login);
@@ -4597,8 +4690,19 @@ void setup()
     tcpKissTxQueue = xQueueCreate(4, sizeof(TcpKissTxItem));
 
     pinMode(BOOT_PIN, INPUT_PULLUP); // BOOT Button
-    pinMode(LED_RX, OUTPUT);
-    pinMode(LED_TX, OUTPUT);
+    if (LED_RX > -1)
+        pinMode(LED_RX, OUTPUT);
+    if (LED_TX > -1)
+        pinMode(LED_TX, OUTPUT);
+#if defined(HELTEC_V3_GPS)
+    // Heltec WiFi LoRa 32 V3: Vext (GPIO36, active LOW) powers the OLED and the
+    // GNSS header; GPIO37 enables the battery voltage divider (ADC_Ctrl).
+    pinMode(36, OUTPUT);
+    digitalWrite(36, LOW);
+    pinMode(37, OUTPUT);
+    digitalWrite(37, HIGH);
+    delay(50);
+#endif
 
     // Set up serial port
 #ifdef CORE_DEBUG_LEVEL
@@ -4646,7 +4750,7 @@ void setup()
     }
 
     Serial.println();
-    Serial.println("Start ESP32APRS_Audio V" + String(VERSION));
+    Serial.println("Start " BRAND_SHORT " V" + String(VERSION));
     Serial.println("Push BOOT after 3 sec for Factory Default config.");
 
 // if (!EEPROM.begin(EEPROM_SIZE))

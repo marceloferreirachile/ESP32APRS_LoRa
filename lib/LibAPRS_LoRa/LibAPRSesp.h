@@ -43,7 +43,10 @@ bool APRS_poll(void);
 // void APRS_msgRetry();
 
 //void APRS_printSettings();
-void APRS_sendTNC2Pkt(uint8_t *raw,size_t length);
+bool APRS_sendTNC2Pkt(const uint8_t *raw, size_t length);
+// LU6JMF: audio-core API kept as no-ops on LoRa (lora_compat.cpp)
+void APRS_setCallsign(char *call, int ssid);
+void APRS_setPreamble(unsigned long pre);
 
 //void APRS_setFreq(float freq);
 

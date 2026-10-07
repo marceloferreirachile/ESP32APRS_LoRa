@@ -5,6 +5,7 @@
 #include "message.h"
 #include <parse_aprs.h>
 #include "webservice.h"
+#include "brand.h"
 #include <MD5Builder.h>
 
 #define AES_BLOCK_SIZE 16
@@ -140,7 +141,7 @@ String handleAPRSQuery(const String &queryTextIn)
         time_t now = time(NULL);
         unsigned long upSecs = (systemUptime > 0 && now > systemUptime) ? (unsigned long)(now - systemUptime) : 0;
         char buf[100];
-        snprintf(buf, sizeof(buf), "ESP32APRS_CDU v%s-%s up %s heap %luK",
+        snprintf(buf, sizeof(buf), BRAND_SHORT " v%s-%s up %s heap %luK",
                  VERSION, VERSION_BUILD, formatUptime(upSecs).c_str(),
                  (unsigned long)(ESP.getFreeHeap() / 1024));
         return String(buf);
