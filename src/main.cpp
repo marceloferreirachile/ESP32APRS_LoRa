@@ -1889,7 +1889,11 @@ void defaultConfig()
     sprintf(config.tlm0_PARM[9], "INET");
     sprintf(config.tlm0_PARM[10], "VPN");
     sprintf(config.tlm0_PARM[11], "4G");
+#ifdef RADIO_LORA
+    sprintf(config.tlm0_PARM[12], "LoRa");
+#else
     sprintf(config.tlm0_PARM[12], "FX.25");
+#endif
 
     for (int i = 0; i < 5; i++)
     {
@@ -2293,6 +2297,15 @@ config.oled_enable = true;
     config.i2c_sda_pin = 17;
     config.i2c_sck_pin = 18;
 #endif
+    // Network defaults for Argentina (the audio core still ships nakhonthai's Thai servers / UTC+7)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    config.uart0_rx_gpio = 44; // ESP32-S3 UART0 pins (3/1 are ESP32-classic)
+    config.uart0_tx_gpio = 43;
+#endif
+    config.timeZone = -3;
+    sprintf(config.aprs_host, "rotate.aprs2.net");
+    config.aprs_port = 14580;
+    sprintf(config.ntp_host, "pool.ntp.org");
 #endif
     config.i2c_freq = 400000;
     config.i2c1_enable = false;
@@ -6487,6 +6500,25 @@ int packet2Raw(String &tnc2, AX25Msg &Packet)
     return tnc2.length();
 }
 
+#ifdef RADIO_LORA
+// LU6JMF - KISS (TCP KISS server / BT KISS / serial KISS) -> RF through the TX scheduler.
+// The frame is a raw AX.25 frame without FCS; it is re-sent in the LoRa TX format
+// selected on the RADIO page (TNC2 standard or AX.25).
+void loraKissTx(uint8_t *frame, size_t len)
+{
+    AX25Msg msg;
+    ax25_decode(frame, len, 0, &msg);
+    if (msg.len == 0 || !isValidCallsignChars(msg.src.call))
+        return;
+    String tnc2;
+    if (packet2Raw(tnc2, msg) > 0)
+    {
+        pkgTxPushJob(tnc2.c_str(), tnc2.length(), 0, RF_CHANNEL,
+                     LU6JMF_TXJOB_EXTERNAL, LU6JMF_TXPRIO_NORMAL);
+    }
+}
+#endif
+
 long sendTimer = 0;
 int btn_count = 0;
 long timeCheck = 0;
@@ -7342,8 +7374,12 @@ bool getBits(int ch)
     case 7: // 4G LTE
         val = 0;
         break;
-    case 8: // FX.25
+    case 8: // FX.25 (audio) / LoRa radio enabled (LoRa)
+#ifdef RADIO_LORA
+        val = config.rf_en ? 1 : 0;
+#else
         val = (config.fx25_mode > 0) ? 1 : 0;
+#endif
         break;
     }
     return val;
@@ -8578,7 +8614,11 @@ void taskAPRS(void *pvParameters)
                 {
                     if (config.trk_rssi)
                     {
+#ifdef RADIO_LORA
+                        cmn += " ?RSSI?SNR"; // Signal Request: the receiving igate/digi appends our RSSI/SNR
+#else
                         cmn += " ?AULVL";
+#endif
                     }
                 }
 
@@ -8685,6 +8725,28 @@ void taskAPRS(void *pvParameters)
                 {
                     String info((const char *)incomingPacket.info);
                     // info.getBytes(msg->info,strlen((const char*)msg->info),0);
+#ifdef RADIO_LORA
+                    // Signal Request (same tokens as nakhonthai LoRa / LoRa APRS trackers):
+                    // replace ?RSSI / ?SNR / ?FREQ with the values measured on THIS packet.
+                    {
+                        bool changed = false;
+                        int q = info.lastIndexOf("?RSSI");
+                        if (q > 0) { info.remove(q, 5); info += "[RSSI:" + String(rssi, 1) + "dBm] "; changed = true; }
+                        q = info.lastIndexOf("?SNR");
+                        if (q > 0) { info.remove(q, 4); info += "[SNR:" + String(snr, 1) + "dB] "; changed = true; }
+                        q = info.lastIndexOf("?FREQ");
+                        if (q > 0) { info.remove(q, 5); info += "[FREQERR:" + String((int)freqErr) + "Hz] "; changed = true; }
+                        if (changed)
+                        {
+                            size_t n = info.length();
+                            if (n > sizeof(incomingPacket.info) - 1)
+                                n = sizeof(incomingPacket.info) - 1;
+                            memcpy(incomingPacket.info, info.c_str(), n);
+                            incomingPacket.info[n] = 0;
+                            incomingPacket.len = n;
+                        }
+                    }
+#endif
                     int idx = info.lastIndexOf("?AULVL");
                     if (idx > 0)
                     {

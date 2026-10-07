@@ -691,7 +691,7 @@ void handle_css(AsyncWebServerRequest *request)
 		request->send(LITTLEFS, "/style.css", "text/css");
 		return;
 	}
-	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #171717;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#263B43;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{cursor: pointer;user-select: none;font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#1F4E5F;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #263B43}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0;padding:1px 4px;font-size:12px;flex:1 1 auto;min-width:0;white-space:nowrap}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;}\n";
+	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #171717;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#171717;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#263B43;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{cursor: pointer;user-select: none;font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#1F4E5F;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #263B43}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0;padding:1px 4px;font-size:12px;flex:1 1 auto;min-width:0;white-space:nowrap}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;}\n" BRAND_CSS;
 	request->send_P(200, "text/css", css);
 }
 
@@ -4578,7 +4578,55 @@ alert("An error occurred.");
 </form><br />
 </td></tr></table>
 <table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
-<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromRF" method="post">
+{{#if lora}}<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromRF" method="post">
+<table>
+<th colspan="2"><span><b>LoRa SPI GPIO Modify</b></span></th>
+<tr>
+<td align="right"><b>NSS (CS) GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lnss" type="number" value="{{lNss}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>SCK GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lsck" type="number" value="{{lSck}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>MISO GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lmiso" type="number" value="{{lMiso}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>MOSI GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lmosi" type="number" value="{{lMosi}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>RESET GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lrst" type="number" value="{{lRst}}" /> Active:<input type="radio" name="lrst_active" value="0" {{#if lRstHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="lrst_active" value="1" {{#if lRstHigh}}checked="checked"{{/if}}/>HIGH</td>
+</tr>
+<tr>
+<td align="right"><b>BUSY / DIO0 GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="ldio0" type="number" value="{{lDio0}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>DIO1 (IRQ) GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="ldio1" type="number" value="{{lDio1}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>DIO2 GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="ldio2" type="number" value="{{lDio2}}" /></td>
+</tr>
+<tr>
+<td align="right"><b>Antenna TX switch GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="ltx" type="number" value="{{lTx}}" /> Active:<input type="radio" name="ltx_active" value="0" {{#if lTxHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="ltx_active" value="1" {{#if lTxHigh}}checked="checked"{{/if}}/>HIGH</td>
+</tr>
+<tr>
+<td align="right"><b>Antenna RX switch GPIO:</b></td>
+<td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lrx" type="number" value="{{lRx}}" /> Active:<input type="radio" name="lrx_active" value="0" {{#if lRxHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="lrx_active" value="1" {{#if lRxHigh}}checked="checked"{{/if}}/>HIGH</td>
+</tr>
+<tr><td colspan="2" style="text-align:left;"><i>*Heltec V3: NSS 8, SCK 9, MISO 11, MOSI 10, RESET 12, BUSY 13, DIO1 14, antenna switch -1. -1 = not used. The radio restarts with the new pins after Apply.</i></td></tr>
+<input class="button" id="submitRF" name="commitRF" type="submit" value="Apply" maxlength="80"/>
+<input type="hidden" name="commitRF"/>
+</td></tr></table>
+</form>
+{{else}}<form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromRF" method="post">
 <table>
 <th colspan="2"><span><b>RF GPIO Modify</b></span></th>
 <tr>
@@ -4627,7 +4675,7 @@ alert("An error occurred.");
 <input type="hidden" name="commitRF"/>
 </td></tr></table>
 </form>
-</td></tr></table>
+{{/if}}</td></tr></table>
 <br />
 <table style="text-align:unset;border-width:0px;background:unset"><tr style="background:unset;vertical-align:top"><td width="50%" style="border:unset;vertical-align:top">
 <form accept-charset="UTF-8" action="#" class="form-horizontal" id="fromTNC" method="post">
@@ -5031,6 +5079,29 @@ void handle_mod(AsyncWebServerRequest *request)
 	{
 		for (uint8_t i = 0; i < request->args(); i++)
 		{
+#ifdef RADIO_LORA
+			{
+				const String &n = request->argName(i);
+				const String &v = request->arg(i);
+				if (v != "" && isValidNumber(v))
+				{
+					int g = v.toInt();
+					if (n == "lnss") config.rf_nss_gpio = g;
+					else if (n == "lsck") config.rf_sclk_gpio = g;
+					else if (n == "lmiso") config.rf_miso_gpio = g;
+					else if (n == "lmosi") config.rf_mosi_gpio = g;
+					else if (n == "lrst") config.rf_reset_gpio = g;
+					else if (n == "lrst_active") config.rf_reset_active = (g != 0);
+					else if (n == "ldio0") config.rf_dio0_gpio = g;
+					else if (n == "ldio1") config.rf_dio1_gpio = g;
+					else if (n == "ldio2") config.rf_dio2_gpio = g;
+					else if (n == "ltx") config.rf_tx_gpio = g;
+					else if (n == "ltx_active") config.rf_tx_active = (g != 0);
+					else if (n == "lrx") config.rf_rx_gpio = g;
+					else if (n == "lrx_active") config.rf_rx_active = (g != 0);
+				}
+			}
+#endif
 			// Serial.print("SERVER ARGS ");
 			// Serial.print(request->argName(i));
 			// Serial.print("=");
@@ -5134,6 +5205,9 @@ void handle_mod(AsyncWebServerRequest *request)
 			}
 		}
 		saveConfiguration("/default.cfg", config);
+#ifdef RADIO_LORA
+		AFSK_RequestRxSoftReset(); // new pins -> radio re-init in taskAPRSPoll
+#endif
 		String html = "OK";
 		request->send(200, "text/html", html);
 	}
@@ -5409,6 +5483,22 @@ void handle_mod(AsyncWebServerRequest *request)
 		data["rfSqlHigh"] = config.rf_sql_active;
 		data["rfPttGpio"] = config.rf_ptt_gpio;
 		data["rfPttHigh"] = config.rf_ptt_active;
+#ifdef RADIO_LORA
+		data["lora"] = true;
+		data["lNss"] = config.rf_nss_gpio;
+		data["lSck"] = config.rf_sclk_gpio;
+		data["lMiso"] = config.rf_miso_gpio;
+		data["lMosi"] = config.rf_mosi_gpio;
+		data["lRst"] = config.rf_reset_gpio;
+		data["lRstHigh"] = config.rf_reset_active;
+		data["lDio0"] = config.rf_dio0_gpio;
+		data["lDio1"] = config.rf_dio1_gpio;
+		data["lDio2"] = config.rf_dio2_gpio;
+		data["lTx"] = config.rf_tx_gpio;
+		data["lTxHigh"] = config.rf_tx_active;
+		data["lRx"] = config.rf_rx_gpio;
+		data["lRxHigh"] = config.rf_rx_active;
+#endif
 
 		data["tncEn"] = config.ext_tnc_enable;
 		JsonArray tncPortOptions = data["tncPortOptions"].to<JsonArray>();
@@ -6950,13 +7040,13 @@ static const char *IGATE_TEMPLATE =
 	"if (document.querySelector('#rf2inetEnable').checked) {\n"
 	"document.getElementById(\"rf2inetFilterGrp\").disabled=false;\n"
 	"} else {\n"
-	"document.getElementById(\"rf2inetFilterGrp\").disabled=true;\n"
+	"document.getElementById(\"rf2inetFilterGrp\").disabled=false;\n"
 	"}\n}\n"
 	"function onINET2RFCheck() {\n"
 	"if (document.querySelector('#inet2rfEnable').checked) {\n"
 	"document.getElementById(\"inet2rfFilterGrp\").disabled=false;\n"
 	"} else {\n"
-	"document.getElementById(\"inet2rfFilterGrp\").disabled=true;\n"
+	"document.getElementById(\"inet2rfFilterGrp\").disabled=false;\n"
 	"}\n}\n"
 	"function selPrecision(idx) {\n"
 	"var x=0;\n"
@@ -7006,11 +7096,23 @@ static const char *IGATE_TEMPLATE =
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Server Host:</b></td>\n"
-	"<td style=\"text-align: left;\"><input maxlength=\"20\" size=\"20\" id=\"aprsHost\" name=\"aprsHost\" type=\"text\" value=\"{{aprsHost}}\" /> *APRS-IS by T2THAI at <a href=\"http://aprs.nakhonthai.net:14501\" target=\"_t2thai\">aprs.nakhonthai.net:14580</a>,CBAPRS at <a href=\"http://aprs.nakhonthai.net:24501\" target=\"_t2thai\">aprs.nakhonthai.net:24580</a></td>\n"
+	"<td style=\"text-align: left;\"><input maxlength=\"20\" size=\"20\" id=\"aprsHost\" name=\"aprsHost\" type=\"text\" value=\"{{aprsHost}}\" /> "
+#ifdef RADIO_LORA
+	"*APRS-IS: <b>rotate.aprs2.net</b> (worldwide pool, picks the nearest server)</td>\n"
+#else
+	"*APRS-IS by T2THAI at <a href=\"http://aprs.nakhonthai.net:14501\" target=\"_t2thai\">aprs.nakhonthai.net:14580</a>,CBAPRS at <a href=\"http://aprs.nakhonthai.net:24501\" target=\"_t2thai\">aprs.nakhonthai.net:24580</a></td>\n"
+#endif
+
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Server Port:</b></td>\n"
-	"<td style=\"text-align: left;\"><input min=\"1\" max=\"65535\" step=\"1\" id=\"aprsPort\" name=\"aprsPort\" type=\"number\" value=\"{{aprsPort}}\" /> *AMPR Host at <a href=\"http://aprs.hs5tqa.ampr.org:14501\" target=\"_t2thai\">aprs.hs5tqa.ampr.org:14580</a></td>\n"
+	"<td style=\"text-align: left;\"><input min=\"1\" max=\"65535\" step=\"1\" id=\"aprsPort\" name=\"aprsPort\" type=\"number\" value=\"{{aprsPort}}\" /> "
+#ifdef RADIO_LORA
+	"*14580 = port with your own filter (Server Filter below)</td>\n"
+#else
+	"*AMPR Host at <a href=\"http://aprs.hs5tqa.ampr.org:14501\" target=\"_t2thai\">aprs.hs5tqa.ampr.org:14580</a></td>\n"
+#endif
+
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Server Filter:</b></td>\n"
@@ -7052,7 +7154,12 @@ static const char *IGATE_TEMPLATE =
 	"<td align=\"right\">Radio TX Power</td>\n"
 	"<td style=\"text-align: left;\">\n"
 	"<select name=\"power\" id=\"power\">\n"
+#ifdef RADIO_LORA
+	"<option value=\"{{loraW}}\" selected>{{loraW}} (LoRa {{loraDbm}} dBm)</option>\n"
+	"<option value=\"1\">1</option>\n"
+#else
 	"<option value=\"1\" selected>1</option>\n"
+#endif
 	"<option value=\"5\">5</option>\n"
 	"<option value=\"10\">10</option>\n"
 	"<option value=\"15\">15</option>\n"
@@ -7101,7 +7208,7 @@ static const char *IGATE_TEMPLATE =
 	"<tr>\n"
 	"<td align=\"right\"><b>RF2INET Filter:</b></td>\n"
 	"<td align=\"center\">\n"
-	"<fieldset id=\"rf2inetFilterGrp\" {{#if rf2inetGrpDisabled}}disabled{{/if}}>\n"
+	"<fieldset id=\"rf2inetFilterGrp\">\n"
 	"<legend>Filter RF to Internet</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
 	"<tr style=\"background:unset;\">"
 	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"rf2inetFilterMessage\" type=\"checkbox\" value=\"OK\" {{#if rf2inetMsg}}checked{{/if}}/>Message</td>\n"
@@ -7120,7 +7227,7 @@ static const char *IGATE_TEMPLATE =
 	"<tr>\n"
 	"<td align=\"right\"><b>INET2RF Filter:</b></td>\n"
 	"<td align=\"center\">\n"
-	"<fieldset id=\"inet2rfFilterGrp\" {{#if inet2rfGrpDisabled}}disabled{{/if}}>\n"
+	"<fieldset id=\"inet2rfFilterGrp\">\n"
 	"<legend>Filter Internet to RF</legend>\n<table style=\"text-align:unset;border-width:0px;background:unset\">"
 	"<tr style=\"background:unset;\">"
 	"<td style=\"border:unset;\"><input class=\"field_checkbox\" name=\"inet2rfFilterMessage\" type=\"checkbox\" value=\"OK\" {{#if inet2rfMsg}}checked{{/if}}/>Message</td>\n"
@@ -7726,6 +7833,15 @@ config.igate_phg[sizeof(config.igate_phg) - 1] = 0;
 		data["alt"] = buf;
 
 		data["phg"] = config.igate_phg;
+#ifdef RADIO_LORA
+		{
+			// PHG calculator: start from the real LoRa TX power (RADIO page), in Watts
+			char pw[12];
+			snprintf(pw, sizeof(pw), "%.3g", pow(10.0, ((double)config.rf_power - 30.0) / 10.0));
+			data["loraW"] = pw;
+			data["loraDbm"] = config.rf_power;
+		}
+#endif
 
 		data["rf2inetGrpDisabled"] = !config.rf2inet;
 		data["rf2inetMsg"] = (config.rf2inetFilter & FILTER_MESSAGE) != 0;
@@ -8015,7 +8131,12 @@ static const char *DIGI_TEMPLATE =
 	"<td align=\"right\">Radio TX Power</td>\n"
 	"<td style=\"text-align: left;\">\n"
 	"<select name=\"power\" id=\"power\">\n"
+#ifdef RADIO_LORA
+	"<option value=\"{{loraW}}\" selected>{{loraW}} (LoRa {{loraDbm}} dBm)</option>\n"
+	"<option value=\"1\">1</option>\n"
+#else
 	"<option value=\"1\" selected>1</option>\n"
+#endif
 	"<option value=\"5\">5</option>\n"
 	"<option value=\"10\">10</option>\n"
 	"<option value=\"15\">15</option>\n"
@@ -8544,6 +8665,15 @@ config.digi_phg[sizeof(config.digi_phg) - 1] = 0;
 		data["alt"] = buf;
 
 		data["phg"] = config.digi_phg;
+#ifdef RADIO_LORA
+		{
+			// PHG calculator: start from the real LoRa TX power (RADIO page), in Watts
+			char pw[12];
+			snprintf(pw, sizeof(pw), "%.3g", pow(10.0, ((double)config.rf_power - 30.0) / 10.0));
+			data["loraW"] = pw;
+			data["loraDbm"] = config.rf_power;
+		}
+#endif
 
 		data["filterMessage"] = (config.digiFilter & FILTER_MESSAGE) != 0;
 		data["filterStatus"] = (config.digiFilter & FILTER_STATUS) != 0;
@@ -9393,7 +9523,7 @@ static const char *SENSOR_TEMPLATE =
 	"<th colspan=\"5\"><span><b>Sensor Monitor</b></span></th>\n"
 	"{{#each monitorRows}}<tr>\n"
 	"{{#each this}}<td align=\"center\">\n"
-	"<fieldset id=\"SenGrp{{idx}}\" {{#if enabled}}{{else}}disabled{{/if}}>\n"
+	"<fieldset id=\"SenGrp{{idx}}\">\n"
 	"<legend>{{legend}}</legend>\n"
 	"<input id=\"sVal{{idx}}\" style=\"text-align:right;\" size=\"5\" type=\"text\" value=\"{{value}}\" readonly/> {{unit}}\n"
 	"</fieldset>\n"
@@ -9822,7 +9952,7 @@ static const char *TRACKER_TEMPLATE =
 	"if (document.querySelector('#smartBcnEnable').checked) {\n"
 	"document.getElementById(\"smartbcnGrp\").disabled=false;\n"
 	"} else {\n"
-	"document.getElementById(\"smartbcnGrp\").disabled=true;\n"
+	"document.getElementById(\"smartbcnGrp\").disabled=false;\n"
 	"}\n}\n"
 	"function selPrecision(idx) {\n"
 	"var x=0;\n"
@@ -9895,7 +10025,7 @@ static const char *TRACKER_TEMPLATE =
 	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"trackerTimeStamp\" value=\"OK\" {{#if timestamp}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
 	"</tr>\n"
 	"<tr><td style=\"text-align: right;\"><b>TX Channel:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerPos2RF\" value=\"OK\" {{#if pos2RF}}checked{{/if}}/>RF <input type=\"checkbox\" name=\"trackerPos2INET\" value=\"OK\" {{#if pos2INET}}checked{{/if}}/>Internet </td></tr>\n"
-	"<tr><td style=\"text-align: right;\"><b>Option:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerOptCST\" value=\"OK\" {{#if optCST}}checked{{/if}}/>Telemetry <input type=\"checkbox\" name=\"trackerOptAlt\" value=\"OK\" {{#if optAlt}}checked{{/if}}/>Altutude <input type=\"checkbox\" name=\"trackerOptBat\" value=\"OK\" {{#if optBat}}checked{{/if}}/>Audio Request </td></tr>\n"
+	"<tr><td style=\"text-align: right;\"><b>Option:</b></td><td style=\"text-align: left;\"><input type=\"checkbox\" name=\"trackerOptCST\" value=\"OK\" {{#if optCST}}checked{{/if}}/>Telemetry <input type=\"checkbox\" name=\"trackerOptAlt\" value=\"OK\" {{#if optAlt}}checked{{/if}}/>Altutude <input type=\"checkbox\" name=\"trackerOptBat\" value=\"OK\" {{#if optBat}}checked{{/if}}/>" OPT_SIGNAL_LABEL " </td></tr>\n"
 	"<tr>"
 	"<td align=\"right\"><b>POSITION:</b></td>\n"
 	"<td align=\"center\">\n"
@@ -9914,7 +10044,7 @@ static const char *TRACKER_TEMPLATE =
 	"<tr>\n"
 	"<td align=\"right\"><b>Smart Beacon:</b></td>\n"
 	"<td align=\"center\">\n"
-	"<fieldset id=\"smartbcnGrp\" {{#if smartbeaconDisabled}}disabled{{/if}}>\n"
+	"<fieldset id=\"smartbcnGrp\">\n"
 	"<legend>Smart beacon configuration</legend>\n<table>"
 	"<tr>\n"
 	"<td align=\"right\">Move Symbol:</td>\n"
@@ -11173,14 +11303,18 @@ static const char *ABOUT_TEMPLATE =
 	"<tr><td align=\"right\"><b>Country: </b></td><td align=\"left\">Concepcion del Uruguay, Entre Rios, Argentina</td></tr>\n"
 	"<tr><td align=\"right\"><b>Github: </b></td><td align=\"left\"><a href=\"" BRAND_REPO_URL "\" target=\"_blank\">github.com/" BRAND_PUBLIC_REPO "</a></td></tr>"
 	"<tr><td align=\"right\"><b>Original: </b></td><td align=\"left\">Mr.Somkiat Nakhonthai (HS5TQA) - <a href=\"https://github.com/nakhonthai\" target=\"_blank\">github.com/nakhonthai</a></td></tr>\n"
-	"<tr><td align=\"right\"><b>License: </b></td><td align=\"left\">GNU GPL v3. Source code of this exact version available on request, free of charge, for at least 3 years: <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a> (include the version number)</td></tr>\n"
+	"<tr><td align=\"right\" style=\"vertical-align:top;\"><b>License: </b></td><td align=\"left\" style=\"white-space:normal;\">GNU GPL v3. Source code of this version on request (free, 3 years): <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a></td></tr>\n"
 	"<tr><td align=\"right\"><b>WhatsApp: </b></td><td align=\"left\"><a href=\"https://wa.me/5493442311119\" target=\"_blank\">wa.me/5493442311119</a></td></tr>"
 	"<tr><td align=\"right\"><b>Donate: </b></td><td align=\"left\"><a href=\"https://www.paypal.me/MarceloFerreira673\" target=\"_blank\">paypal.me/MarceloFerreira673</a></td></tr>"
 	"</table>"
 	"</td></tr></table><br />"
 	"<table>\n"
 	"<tr><td align=\"right\"><b>Contributor: </b></td><td align=\"left\">LU6JMF Marcelo</td></tr>\n"
+#ifdef RADIO_LORA
+	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\" style=\"white-space:normal;\">AR-LORA 1.0 &mdash; based on ESP32APRS_LoRa (nakhonthai), core from AR-APRS de LU6JMF</td></tr>\n"
+#else
 	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\">v2.0-lu6jmf (custom mods on top of V1.8a)</td></tr>\n"
+#endif
 	"<tr><td align=\"right\" style=\"vertical-align:top;\"><b>Changes: </b></td><td align=\"left\" style=\"white-space:normal;\">\n"
 	"See README / git log in the repository for full change history, or "
 	"<a href=\"" BRAND_REPO_URL "/releases\" target=\"_blank\">"
@@ -11324,7 +11458,12 @@ void handle_about(AsyncWebServerRequest *request)
 	// overflowed this buffer into the next stack variables (garbled "Firmware File" on About).
 	char ver[48];
 	snprintf(ver, sizeof(ver), "v%s-%s.bin", VERSION, VERSION_BUILD);
-#if defined(TTGO_TWR)
+	strcpy(hwVersion, "UNKNOWN");
+	sprintf(FirmwareOTA, "FIRMWARE_%s", ver);
+#if defined(HELTEC_V3_GPS)
+	strcpy(hwVersion, "Heltec WiFi LoRa 32 V3");
+	sprintf(FirmwareOTA, "HELTEC_V3_%s", ver);
+#elif defined(TTGO_TWR)
 	strcpy(hwVersion, "LiLyGo T-TWRPlus");
 	sprintf(FirmwareOTA, "ESP32S3_TWR_%s", ver);
 #elif defined(CONFIG_IDF_TARGET_ESP32)
@@ -11390,7 +11529,18 @@ void handle_about(AsyncWebServerRequest *request)
 	data["hwVersion"] = hwVersion;
 	snprintf(temp_buffer, sizeof(temp_buffer), "%s%s", VERSION, VERSION_BUILD);
 	data["firmwareVersion"] = temp_buffer;
+#ifdef RADIO_LORA
+	{
+		const char *m = "LoRa (other)";
+		if (config.rf_type == RF_SX1262) m = "LoRa SX1262";
+		else if (config.rf_type == RF_SX1268) m = "LoRa SX1268";
+		else if (config.rf_type == RF_SX1276) m = "LoRa SX1276";
+		else if (config.rf_type == RF_SX1278) m = "LoRa SX1278";
+		data["rfModule"] = m;
+	}
+#else
 	data["rfModule"] = RF_TYPE[config.rf_type];
+#endif
 	data["chipModel"] = ESP.getChipModel();
 	data["chipRevision"] = ESP.getChipRevision();
 	data["chipId"] = strCID;
@@ -12038,7 +12188,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
         "<meta http-equiv='refresh' content='5'>"
         "<title>" BRAND_SHORT " TX Debug</title>"
         "<style>"
-        "body{font-family:Arial,sans-serif;background:#111;color:#eee;"
+        "body{font-family:Arial,sans-serif;background:" BRAND_TXD_BG ";color:#eee;"
         "max-width:1180px;margin:24px auto;padding:15px}"
         "h2{margin-bottom:4px}"
         "h3{margin:0 0 4px 0}"
@@ -12054,7 +12204,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
         "grid-template-columns:repeat(2,minmax(0,1fr));"
         "gap:18px;margin-top:24px;align-items:start}"
         ".card{border:1px solid #333;border-radius:8px;"
-        "padding:15px;background:#151515;min-width:0}"
+        "padding:15px;background:" BRAND_TXD_CARD ";min-width:0}"
         ".full{grid-column:1/-1}"
         "@media(max-width:820px){"
         ".grid{grid-template-columns:1fr}"

@@ -24,6 +24,8 @@ unsigned long slotTime = 200;
 uint8_t p = 63;
 
 // LU6JMF: 2.1.5 core API - wrap a raw AX.25 frame (no FCS) into a KISS data frame
+extern void loraKissTx(uint8_t *frame, size_t len); // main.cpp
+
 int kiss_wrapper(uint8_t *pkg, uint8_t *buf, size_t len)
 {
     uint8_t *ptr = pkg;
@@ -86,10 +88,10 @@ void kiss_serial(uint8_t sbyte)
         IN_FRAME = false;
         // ax25_sendRaw(&AX25, serialBuffer, frame_len);
         log_d("[KISS] Received packet! %d Byte", frame_len);
-        ax25_init(&AX25, aprs_msg_callback);
-        AX25.frame_len = frame_len;
-        memcpy(AX25.buf, serialBuffer, frame_len);
-        ax25_decode(&AX25);
+        // LU6JMF: a KISS data frame from the PC/app is a frame to TRANSMIT (as in the
+        // audio firmware). It goes through the 2.1.5 TX scheduler like any other job
+        // (main.cpp loraKissTx). nakhonthai's version handled it as a received packet.
+        loraKissTx(serialBuffer, frame_len);
     }
     else if (sbyte == FEND)
     {
