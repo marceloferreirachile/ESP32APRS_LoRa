@@ -144,8 +144,6 @@ typedef struct
 
 	/// Relative humidity percentage.
 	double humidity;
-	/// Relative inside humidity percentage.
-	//unsigned int humidity_in;
 
 	/// Air pressure in millibars.
 	double pressure;

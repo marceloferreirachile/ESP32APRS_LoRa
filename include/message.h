@@ -7,6 +7,7 @@
 #include <mbedtls/base64.h>
 #include <esp_system.h>
 #include "config.h"
+#include "message.h"
 
 typedef struct
 {
@@ -26,10 +27,19 @@ msgType getMsgList(int idx);
 int pkgMsgUpdate(const char *call,const char *raw, uint16_t msg_id, int8_t ack, bool rxtx=false);
 String aesEncryptBase64WithIV(const String &plain, const uint8_t key[16], uint16_t msgID);
 String aesDecryptBase64WithIV(const String &b64, const uint8_t key[16], const char* callsign, uint16_t msgID);
-void sendAPRSMessage(const String &toCall, const String &message, bool encrypt);
+// LU6JMF - Marcelo Ferreira
+// jobType allows BLN/NEWS/etc. to share APRS Message framing while retaining
+// their own scheduler identity and RF priority.
+void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, bool noRetry = false, uint8_t jobType = LU6JMF_TXJOB_MESSAGE); // noRetry param added for BLN1-BLN9 - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
 void handleIncomingAPRS(const String& line);
 void sendAPRSMessageRetry();
 void pkgMsgSort(msgType a[]);
+// LU6JMF - Marcelo Ferreira (Oct/2026)
+// APRS Query feature (?APRSV/?VER/?ABOUT, ?IGATE, ?DX) - "APRS Queries" standard
+// (ref. SA7SKY APRS-Queries.pdf). handleAPRSQuery() returns "" when the text is
+// not a recognized query, so the caller can fall through to AT-command handling.
+String handleAPRSQuery(const String &queryText);
+void dxRecordTrackPacket(const char *callsign, const String &tnc2);
 // void processMessage(const char* message);
 // void sendMessage(const char* message);
 

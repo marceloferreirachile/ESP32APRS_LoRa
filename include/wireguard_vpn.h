@@ -2,15 +2,16 @@
 //==============================================================================
 // Wireguard VPN Client demo for LwIP/ESP32
 //==============================================================================
-#ifdef __cplusplus
-extern "C" {
-#endif // __cplusplus
 
 //==============================================================================
 //  Multi-include guard
 //==============================================================================
 #ifndef INC_WIREGUARD_VPN_H
 #define INC_WIREGUARD_VPN_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
 
 //==============================================================================
 //  Includes
@@ -44,7 +45,7 @@ extern "C" {
 //==============================================================================
 bool wireguard_active();
 void wireguard_remove();
-void wireguard_setup(netif *ppp_netif);
+void wireguard_setup();
 
 bool wireguard_up();
 

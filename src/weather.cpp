@@ -91,7 +91,8 @@ bool getCSV2Wx(String stream)
         uint8_t SendMode = 0;
         if (config.wx_2rf) SendMode |= RF_CHANNEL;
         if (config.wx_2inet) SendMode |= INET_CHANNEL;
-        pkgTxPush(strData, lng, 0,SendMode);
+        pkgTxPushJob(strData, lng, 0, SendMode,
+                     LU6JMF_TXJOB_WX, LU6JMF_TXPRIO_VERY_LOW);
         // if (config.wx_2rf)
         // { // WX SEND POSITION TO RF
         //     pkgTxPush(strData, lng, 0);
@@ -111,7 +112,7 @@ bool getCSV2Wx(String stream)
     // ModbusSerial.flush();
 }
 
-void getSensor(uint32_t type, float *val, int i, bool avg)
+void getSensor(uint32_t type, float *val, int i)
 {
     int senIdx = config.wx_sensor_ch[i];
     //log_d("type:%d i:%d senIdx:%d en:%x vis:%x",type,i,senIdx,config.wx_sensor_enable[i],sen[senIdx].visable);
@@ -122,16 +123,10 @@ void getSensor(uint32_t type, float *val, int i, bool avg)
         {
             
             weather.visable |= type;
-            if(avg && (sen[senIdx].timeAvg > 0) )
-            {
-                *val = sen[senIdx].average;
-            }else{
+            if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
                 *val = sen[senIdx].sample;
-            }
-            // if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
-            //     *val = sen[senIdx].sample;
-            // else
-            //     *val = sen[senIdx].average;
+            else
+                *val = sen[senIdx].average;
         }
         else
         {
@@ -144,7 +139,7 @@ void getSensor(uint32_t type, float *val, int i, bool avg)
     }
 }
 
-void getSensor(uint32_t type, uint16_t *val, int i, bool avg)
+void getSensor(uint32_t type, uint16_t *val, int i)
 {
     int senIdx = config.wx_sensor_ch[i];
     if (config.wx_sensor_enable[i] && senIdx > 0)
@@ -153,16 +148,10 @@ void getSensor(uint32_t type, uint16_t *val, int i, bool avg)
         if (sen[senIdx].visable)
         {
             weather.visable |= type;
-            if(avg && (sen[senIdx].timeAvg > 0) )
-            {
-                *val = sen[senIdx].average;
-            }else{
+            if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
                 *val = sen[senIdx].sample;
-            }
-            // if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
-            //     *val = sen[senIdx].sample;
-            // else
-            //     *val = sen[senIdx].average;
+            else
+                *val = sen[senIdx].average;
         }
         else
         {
@@ -175,7 +164,7 @@ void getSensor(uint32_t type, uint16_t *val, int i, bool avg)
     }
 }
 
-void getSensor(uint32_t type, uint32_t *val, int i, bool avg)
+void getSensor(uint32_t type, uint32_t *val, int i)
 {
     int senIdx = config.wx_sensor_ch[i];
     if (config.wx_sensor_enable[i] && senIdx > 0)
@@ -184,16 +173,10 @@ void getSensor(uint32_t type, uint32_t *val, int i, bool avg)
         if (sen[senIdx].visable)
         {            
             weather.visable |= type;
-            if (avg && (sen[senIdx].timeAvg > 0))
-            {
-                *val = sen[senIdx].average;
-            }else{
+            if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
                 *val = sen[senIdx].sample;
-            }
-            // if (!config.wx_sensor_avg[i] || (config.sensor[senIdx].averagerate <= config.sensor[senIdx].samplerate) || (sen[senIdx].timeAvg == 0))
-            //     *val = sen[senIdx].sample;
-            // else
-            //     *val = sen[senIdx].average;
+            else
+                *val = sen[senIdx].average;
         }
         else
         {
@@ -211,7 +194,6 @@ int getRawWx(char *strData)
     unsigned int i;
     char strtmp[300], obj[30];
 
-    strData[0] = '\0';
     memset(&obj[0], 0, sizeof(obj));
 
     weather.visable = 0;
@@ -224,82 +206,82 @@ int getRawWx(char *strData)
         switch (senType)
         {
         case WX_WIND_DIR:
-            getSensor(senType, &weather.winddirection, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.winddirection, i);
             break;
         case WX_WIND_SPD:
-            getSensor(senType, &weather.windspeed, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.windspeed, i);
             break;
         case WX_WIND_GUST:
             float windspeed;
-            getSensor(senType, &windspeed, i, config.wx_sensor_avg[i]);
-            if(wgIdx>=(sizeof(wgArray)/sizeof(wgArray[0]))) wgIdx=0;
+            getSensor(senType, &windspeed, i);
+            if(wgIdx>=(sizeof(wgArray)/4)) wgIdx=0;
             wgArray[wgIdx++]=windspeed;
-            weather.windgust = 0;
-            for(int i = 0; i < (int)(sizeof(wgArray)/sizeof(wgArray[0])); i++)
+            weather.windgust=0.0F;
+            for(int i;i<(sizeof(wgArray)/4);i++)
             {
                 if(wgArray[i]>weather.windgust) weather.windgust=wgArray[i];
             }
             //getSensor(senType, &weather.windgust, i);
             break;
         case WX_TEMP:
-            getSensor(senType, &weather.temperature, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.temperature, i);
             break;
         case WX_RAIN:
-            getSensor(senType, &weather.rain, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.rain, i);
             break;
         case WX_RAIN24HR:
-            getSensor(senType, &weather.rain24hr, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.rain24hr, i);
             break;
         case WX_RAIN_GMT:
-            getSensor(senType, &weather.rainmidnight, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.rainmidnight, i);
             break;
         case WX_HUMIDITY:
-            getSensor(senType, &weather.humidity, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.humidity, i);
             break;
         case WX_BARO:
-            getSensor(senType, &weather.barometric, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.barometric, i);
             break;
         case WX_LUMINOSITY:
-            getSensor(senType, &weather.solar, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.solar, i);
             break;
         case WX_SNOW:
-            getSensor(senType, &weather.snow, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.snow, i);
             break;
         case WX_SOIL_TEMP:
-            getSensor(senType, &weather.soil_temp, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.soil_temp, i);
             break;
         case WX_SOIL_MOISTURE:
-            getSensor(senType, &weather.soil_moisture, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.soil_moisture, i);
             break;
         case WX_WATER_TEMP:
-            getSensor(senType, &weather.water_temp, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.water_temp, i);
             break;
         case WX_WATER_TDS:
-            getSensor(senType, &weather.water_tds, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.water_tds, i);
             break;
         case WX_WATER_LEVEL:
-            getSensor(senType, &weather.water_level, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.water_level, i);
             break;
         case WX_PM25:
-            getSensor(senType, &weather.pm25, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.pm25, i);
             break;
         case WX_PM100:
-            getSensor(senType, &weather.pm100, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.pm100, i);
             break;
         case WX_CO2:
-            getSensor(senType, &weather.co2, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.co2, i);
             break;
         case WX_CH2O:
-            getSensor(senType, &weather.ch2o, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.ch2o, i);
             break;
         case WX_TVOC:
-            getSensor(senType, &weather.tvoc, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.tvoc, i);
             break;
         case WX_UV:
-            getSensor(senType, (uint16_t*)&weather.uv, i, config.wx_sensor_avg[i]);
+            getSensor(senType, (uint16_t*)&weather.uv, i);
             break;
         case WX_SOUND:
-            getSensor(senType, &weather.sound, i, config.wx_sensor_avg[i]);
+            getSensor(senType, &weather.sound, i);
             break;
         }
         senType <<= 1;
@@ -309,7 +291,7 @@ int getRawWx(char *strData)
 
     if (config.wx_flage & WX_WIND_DIR)
     {
-        if ((weather.visable & WX_WIND_DIR) && (weather.winddirection < 361))
+        if (weather.visable & WX_WIND_DIR & (weather.winddirection<361))
             sprintf(strtmp, "%03u/", weather.winddirection);
         else
             sprintf(strtmp, ".../");
@@ -417,7 +399,6 @@ int getRawWx(char *strData)
 
     if (config.wx_flage & WX_HUMIDITY)
     {
-        if(weather.humidity>99.0F) weather.humidity=99.0F;
         if ((weather.visable & WX_HUMIDITY) && (weather.humidity<100.0F))
             sprintf(strtmp, "h%02u", (unsigned int)round(weather.humidity));
         else
@@ -587,11 +568,11 @@ int getRawWx(char *strData)
         {
             double tmp=(weather.temperature * 9.0F / 5.0F) + 32.0F;
             tmp *= 50.0F;
-            int tempF = (int)round(tmp);
+            unsigned int tempF = (unsigned int)round(tmp);
             if(tempF < 0){
-                sprintf(strtmp, "T-%03d", -tempF);
+                sprintf(strtmp, "T-%03u", tempF);
             }else{
-                sprintf(strtmp, "T%04d", tempF);
+                sprintf(strtmp, "T%04u", tempF);
             }
             strcat(strData, strtmp);
         }
@@ -600,8 +581,7 @@ int getRawWx(char *strData)
     if (config.wx_flage & WX_HUMIDITY)
     {
         if (weather.visable & WX_HUMIDITY){
-            if(weather.humidity>99.9F) weather.humidity=99.9F;
-            sprintf(strtmp, "H%03u", (unsigned int)(weather.humidity*10.0F));
+            sprintf(strtmp, "H%03u", (unsigned int)round(weather.humidity*10.0F));
             strcat(strData, strtmp);
         }
     }
@@ -619,10 +599,10 @@ int getRawWx(char *strData)
     // c...s...g...t...r...p...P...h..b.....L...S..m...M...w...W....v...d...D...x....n...T....H...
 }
 
-int getWxJson(char *strData, bool avg)
+int getWxJson(char *strData)
 {
     unsigned int i;
-    char strtmp[500], obj[30];
+    char strtmp[300], obj[30];
 
     memset(&obj[0], 0, sizeof(obj));
 
@@ -636,82 +616,82 @@ int getWxJson(char *strData, bool avg)
         switch (senType)
         {
         case WX_WIND_DIR:
-            getSensor(senType, &weather.winddirection, i, avg);
+            getSensor(senType, &weather.winddirection, i);
             break;
         case WX_WIND_SPD:
-            getSensor(senType, &weather.windspeed, i, avg);
+            getSensor(senType, &weather.windspeed, i);
             break;
         case WX_WIND_GUST:
-            getSensor(senType, &weather.windgust, i, avg);
+            getSensor(senType, &weather.windgust, i);
             break;
         case WX_TEMP:
-            getSensor(senType, &weather.temperature, i, avg);
+            getSensor(senType, &weather.temperature, i);
             break;
         case WX_RAIN:
-            getSensor(senType, &weather.rain, i, avg);
+            getSensor(senType, &weather.rain, i);
             break;
         case WX_RAIN24HR:
-            getSensor(senType, &weather.rain24hr, i, avg);
+            getSensor(senType, &weather.rain24hr, i);
             break;
         case WX_RAIN_GMT:
-            getSensor(senType, &weather.rainmidnight, i, avg);
+            getSensor(senType, &weather.rainmidnight, i);
             break;
         case WX_HUMIDITY:
-            getSensor(senType, &weather.humidity, i, avg);
+            getSensor(senType, &weather.humidity, i);
             break;
         case WX_BARO:
-            getSensor(senType, &weather.barometric, i, avg);
+            getSensor(senType, &weather.barometric, i);
             break;
         case WX_LUMINOSITY:
-            getSensor(senType, &weather.solar, i, avg);
+            getSensor(senType, &weather.solar, i);
             break;
         case WX_SNOW:
-            getSensor(senType, &weather.snow, i, avg);
+            getSensor(senType, &weather.snow, i);
             break;
         case WX_SOIL_TEMP:
-            getSensor(senType, &weather.soil_temp, i, avg);
+            getSensor(senType, &weather.soil_temp, i);
             break;
         case WX_SOIL_MOISTURE:
-            getSensor(senType, &weather.soil_moisture, i, avg);
+            getSensor(senType, &weather.soil_moisture, i);
             break;
         case WX_WATER_TEMP:
-            getSensor(senType, &weather.water_temp, i, avg);
+            getSensor(senType, &weather.water_temp, i);
             break;
         case WX_WATER_TDS:
-            getSensor(senType, &weather.water_tds, i, avg);
+            getSensor(senType, &weather.water_tds, i);
             break;
         case WX_WATER_LEVEL:
-            getSensor(senType, &weather.water_level, i, avg);
+            getSensor(senType, &weather.water_level, i);
             break;
         case WX_PM25:
-            getSensor(senType, &weather.pm25, i, avg);
+            getSensor(senType, &weather.pm25, i);
             break;
         case WX_PM100:
-            getSensor(senType, &weather.pm100, i, avg);
+            getSensor(senType, &weather.pm100, i);
             break;
         case WX_CO2:
-            getSensor(senType, &weather.co2, i, avg);
+            getSensor(senType, &weather.co2, i);
             break;
         case WX_CH2O:
-            getSensor(senType, &weather.ch2o, i, avg);
+            getSensor(senType, &weather.ch2o, i);
             break;
         case WX_TVOC:
-            getSensor(senType, &weather.tvoc, i, avg);
+            getSensor(senType, &weather.tvoc, i);
             break;
         case WX_UV:
-            getSensor(senType, (uint16_t*)&weather.uv, i, avg);
+            getSensor(senType, (uint16_t*)&weather.uv, i);
             break;
         case WX_SOUND:
-            getSensor(senType, &weather.sound, i, avg);
+            getSensor(senType, &weather.sound, i);
             break;
         case WX_VBAT:
-            getSensor(senType, &weather.vbat, i, avg);
+            getSensor(senType, &weather.vbat, i);
             break;
         case WX_IBAT:
-            getSensor(senType, &weather.ibat, i, avg);
+            getSensor(senType, &weather.ibat, i);
             break;
         case WX_VSOLAR:
-            getSensor(senType, &weather.vsolar, i, avg);
+            getSensor(senType, &weather.vsolar, i);
             break;
         }
         senType <<= 1;
@@ -734,14 +714,14 @@ int getWxJson(char *strData, bool avg)
     if (config.wx_flage & WX_WIND_SPD)
     {
         if (weather.visable & WX_WIND_SPD){
-            sprintf(strtmp, ",\"windSpeed\":\"%.1f\"", weather.windspeed);
+            sprintf(strtmp, ",\"windSpeed\":\"%.1f\"", weather.windspeed * 0.621);
             strcat(strData, strtmp);
         }
     }
 
     if ((weather.visable & WX_WIND_SPD) && (weather.visable & WX_WIND_GUST))
     {
-        sprintf(strtmp, ",\"windGust\":\"%.1f\"", weather.windgust);
+        sprintf(strtmp, ",\"windGust\":\"%.1f\"", weather.windgust * 0.621);
         strcat(strData, strtmp);
     }
 
@@ -755,27 +735,27 @@ int getWxJson(char *strData, bool avg)
         }
     }
 
-    // unsigned int rain = (unsigned int)round((weather.rain * 100.0F) / 25.6F);
-    // unsigned int rain24 = (unsigned int)round((weather.rain24hr * 100.0F) / 25.6F);
-    // unsigned int rainGMT = (unsigned int)round((weather.rainmidnight * 100.0F) / 25.6F);
+    unsigned int rain = (unsigned int)round((weather.rain * 100.0F) / 25.6F);
+    unsigned int rain24 = (unsigned int)round((weather.rain24hr * 100.0F) / 25.6F);
+    unsigned int rainGMT = (unsigned int)round((weather.rainmidnight * 100.0F) / 25.6F);
     time_t now;
     time(&now);
     struct tm *info = gmtime(&now);
     if (info->tm_min == 0)
     {
-        //rain = 0;
+        rain = 0;
         weather.rain = 0;
     }
     if (info->tm_hour == 0 && info->tm_min == 0)
     {
-        //rain24 = 0;
+        rain24 = 0;
         weather.rain24hr = 0;
     }
 
     if (config.wx_flage & WX_RAIN)
     {
         if (weather.visable & WX_RAIN){
-            sprintf(strtmp, ",\"Rain\":\"%.1f\"", weather.rain);
+            sprintf(strtmp, ",\"Rain\":\"%d\"", weather.rain);
             strcat(strData, strtmp);
         }
     }
