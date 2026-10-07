@@ -10,6 +10,7 @@
 #include "CRC-CCIT.h"
 #include "HDLC.h"
 #include "AX25.h"
+#include "AFSK.h" // LU6JMF: 2.1.5 core API on LoRa (lora_compat.cpp), same as the audio LibAPRSesp.h
 
 #include "../../include/config.h"
 
