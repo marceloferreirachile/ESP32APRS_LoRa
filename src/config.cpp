@@ -1270,6 +1270,16 @@ bool loadConfiguration(const char *filename, Configuration &config)
 
         // Close the file (Curiously, File's destructor doesn't close the file)
         // f.close();
+#ifdef RADIO_LORA
+        // nakhonthai's Thai servers (configs coming from his firmware): NTP does not
+        // answer from here, so the clock stayed in 1970. Move to the world pools.
+        if (strstr(config.ntp_host, "nakhonthai") != NULL)
+            strlcpy(config.ntp_host, "pool.ntp.org", sizeof(config.ntp_host));
+        if (strstr(config.aprs_host, "nakhonthai") != NULL)
+            strlcpy(config.aprs_host, "rotate.aprs2.net", sizeof(config.aprs_host));
+        if (strstr(config.ntp_host, "pool.ntp.org") != NULL && config.timeZone == 7)
+            config.timeZone = -3; // Thai default UTC+7 carried over -> Argentina
+#endif
         return true;
     }
     else

@@ -739,7 +739,7 @@ static const char *DASHBOARD_TEMPLATE =
 	"<tr>\n<td>MODE</td>\n<td style=\"background: #ffffff;\">{{loraMode}}</td>\n</tr>\n"
 	"<tr>\n<td>TX PWR</td>\n<td style=\"background: #ffffff;\">{{txPower}} dBm</td>\n</tr>\n"
 	"<tr>\n<td>SYNC</td>\n<td style=\"background: #ffffff;\">{{sync}}</td>\n</tr>\n"
-	"<tr>\n<td>TX FORMAT</td>\n<td style=\"background: #ffffff;\">{{txFormat}}</td>\n</tr>\n"
+	"<tr>\n<td>TX FMT</td>\n<td style=\"background: #ffffff;\">{{txFormat}}</td>\n</tr>\n"
 	"{{else}}"
 	"<tr>\n<td>RADIO</td>\n<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n</tr>\n"
 	"{{/if}}"
@@ -816,20 +816,21 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	snprintf(temp_buffer, sizeof(temp_buffer), "%.3f", config.rf_freq);
 	data["freq"] = temp_buffer;
 	if (config.rf_mode == RF_MODE_LoRa)
-		snprintf(temp_buffer, sizeof(temp_buffer), "LoRa SF%d BW%.1f CR4/%d", config.rf_sf, config.rf_bw, config.rf_cr);
+		snprintf(temp_buffer, sizeof(temp_buffer), "SF%d BW%g CR%d", config.rf_sf, config.rf_bw, config.rf_cr);
 	else
 		snprintf(temp_buffer, sizeof(temp_buffer), "FSK mode %d", config.rf_mode);
 	data["loraMode"] = temp_buffer;
 	data["txPower"] = config.rf_power;
-	snprintf(temp_buffer, sizeof(temp_buffer), "0x%02X (%d)%s", config.rf_sync, config.rf_sync, config.rf_sync == 0x12 ? "" : " !");
+	snprintf(temp_buffer, sizeof(temp_buffer), "%d%s", config.rf_sync, config.rf_sync == 0x12 ? "" : " !");
 	data["sync"] = temp_buffer;
-	data["txFormat"] = config.rf_ax25 ? "AX.25 (nakhonthai)" : "TNC2 (LoRa APRS std)";
-#endif
+	data["txFormat"] = config.rf_ax25 ? "AX.25" : "TNC2";
+#else
 	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_tx);
 	data["freqTx"] = temp_buffer;
 	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_rx);
 	data["freqRx"] = temp_buffer;
 	data["txPower"] = config.rf_power ? "HIGH" : "LOW";
+#endif
 
 	data["modem"] = MODEM_TYPE[config.modem_type];
 	data["fx25"] = FX25_MODE[config.fx25_mode];
@@ -4621,7 +4622,8 @@ alert("An error occurred.");
 <td align="right"><b>Antenna RX switch GPIO:</b></td>
 <td style="text-align: left;"><input min="-1" max="{{gpioMax}}" name="lrx" type="number" value="{{lRx}}" /> Active:<input type="radio" name="lrx_active" value="0" {{#if lRxHigh}}{{else}}checked="checked"{{/if}}/>LOW <input type="radio" name="lrx_active" value="1" {{#if lRxHigh}}checked="checked"{{/if}}/>HIGH</td>
 </tr>
-<tr><td colspan="2" style="text-align:left;"><i>*Heltec V3: NSS 8, SCK 9, MISO 11, MOSI 10, RESET 12, BUSY 13, DIO1 14, antenna switch -1. -1 = not used. The radio restarts with the new pins after Apply.</i></td></tr>
+<tr><td colspan="2" style="text-align:left;white-space:normal;"><i>*Heltec V3: NSS 8, SCK 9, MISO 11, MOSI 10, RESET 12, BUSY 13, DIO1 14, antenna switch -1. -1 = not used. The radio restarts with the new pins after Apply.</i></td></tr>
+<tr><td colspan="2" align="right">
 <input class="button" id="submitRF" name="commitRF" type="submit" value="Apply" maxlength="80"/>
 <input type="hidden" name="commitRF"/>
 </td></tr></table>
