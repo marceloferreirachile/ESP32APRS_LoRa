@@ -49,6 +49,7 @@ void Ax25TxAbort(bool keyed);
 void loraRememberFrame(const uint8_t *raw, size_t len);
 const char *loraLastFrame(size_t *len);
 uint32_t loraGetTxBusy();
+void loraSetOnAir(bool on);
 
 // LoRa-only diagnostics (lora_compat.cpp)
 int16_t loraGetLastTxState();

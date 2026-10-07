@@ -1629,7 +1629,9 @@ bool APRS_poll(void)
                                 // uint8_t syncWordTX[] = {0x1, 0xe, 0x91, 0x6f, 0x5f, 0x43, 0x5a, 0x95};
                                 uint8_t syncWordTX[] = {0xf5, 0xd4, 0xd9, 0x59, 0x7, 0xc2, 0x1, 0x3f};
                                 radioHal->setSyncWord(syncWordTX, 8);
+                                loraSetOnAir(true);
                                 lastTxState = radioHal->transmit(txBufPtr, i);
+                                loraSetOnAir(false);
                                 delay(100);
                                 free(txBufPtr);
 
@@ -1680,7 +1682,9 @@ bool APRS_poll(void)
                             }
                             uint8_t syncWordTX[] = {0x84, 0xB5, 0x12, 0xAD};
                             radioHal->setSyncWord(syncWordTX, 4);
+                            loraSetOnAir(true);
                             lastTxState = radioHal->transmit(txBufPtr, i);
+                            loraSetOnAir(false);
                             delay(100);
                             free(txBufPtr);
 
@@ -1711,7 +1715,9 @@ bool APRS_poll(void)
                         if (config.rf_mode == RF_MODE_LoRa && !loraChannelClear())
                             lastTxState = LORA_TX_CHANNEL_BUSY;
                         else
+                            loraSetOnAir(true);
                             lastTxState = radioHal->transmit(byteArr, i);
+                            loraSetOnAir(false);
                     }
                     free(byteArr);
                     ret = true;

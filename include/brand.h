@@ -26,6 +26,35 @@
 #define BRAND_TXD_CARD "#151515"
 #endif
 
+// /txdebug wording: the scheduler concepts are the same, the radio words differ
+#ifdef RADIO_LORA
+#define TXD_LBL_PTTSEEN "On air seen"
+#define TXD_LBL_TXNOW "On air now"
+#define TXD_LBL_PTTOFF "TX end pending"
+#define TXD_LBL_DCD "Channel busy (LBT count)"
+#define TXD_LBL_REJECT "Radio refused (frame pending)"
+#define TXD_LBL_WAIT "Last wait to air (queue + LBT)"
+#define TXD_EV_PTTON "ON AIR"
+#define TXD_EV_PTTOFF1 "TX END"
+#define TXD_EV_PTTOFF2 "TX END DONE"
+#define TXD_EV_REJECT "RADIO REFUSED"
+#define TXD_AIRTIME_NOTE "On air to radio TX end"
+#define TXD_FOOTER "Scheduler completion is released only after the radio reports the end of TX."
+#else
+#define TXD_LBL_PTTSEEN "PTT observed"
+#define TXD_LBL_TXNOW "TX state now"
+#define TXD_LBL_PTTOFF "Deferred PTT OFF"
+#define TXD_LBL_DCD "DCD / Channel"
+#define TXD_LBL_REJECT "AX.25 rejected"
+#define TXD_LBL_WAIT "Last wait to PTT"
+#define TXD_EV_PTTON "PTT ON"
+#define TXD_EV_PTTOFF1 "PTT OFF TASK"
+#define TXD_EV_PTTOFF2 "PTT OFF DONE"
+#define TXD_EV_REJECT "AX25 REJECT"
+#define TXD_AIRTIME_NOTE "PTT ON to real PTT OFF"
+#define TXD_FOOTER "Scheduler completion is released only after real PTT OFF."
+#endif
+
 #define BRAND_REPO_URL "https://github.com/" BRAND_PUBLIC_REPO
 
 // Default APRS status text per function (max 67 chars)

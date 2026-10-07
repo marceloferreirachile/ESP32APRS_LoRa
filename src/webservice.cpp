@@ -12245,14 +12245,14 @@ void handle_txdebug(AsyncWebServerRequest *request)
 
     response->printf(
         "<tr><td>RF Scheduler</td><td class='%s'>%s</td></tr>"
-        "<tr><td>PTT observed</td><td class='%s'>%s</td></tr>"
-        "<tr><td>TX state now</td><td class='%s'>%s</td></tr>"
-        "<tr><td>Deferred PTT OFF</td><td class='%s'>%s</td></tr>"
-        "<tr><td>DCD / Channel</td><td class='%s'>%s</td></tr>"
+        "<tr><td>" TXD_LBL_PTTSEEN "</td><td class='%s'>%s</td></tr>"
+        "<tr><td>" TXD_LBL_TXNOW "</td><td class='%s'>%s</td></tr>"
+        "<tr><td>" TXD_LBL_PTTOFF "</td><td class='%s'>%s</td></tr>"
+        "<tr><td>" TXD_LBL_DCD "</td><td class='%s'>%s</td></tr>"
         "<tr><td>Completed TX</td><td>%lu</td></tr>"
-        "<tr><td>AX.25 rejected</td><td>%lu</td></tr>"
+        "<tr><td>" TXD_LBL_REJECT "</td><td>%lu</td></tr>"
         "<tr><td>Last full cycle</td><td>%lu ms</td></tr>"
-        "<tr><td>Last wait to PTT</td><td>%lu ms</td></tr>"
+        "<tr><td>" TXD_LBL_WAIT "</td><td>%lu ms</td></tr>"
         "<tr><td>Current cycle</td><td>%lu ms</td></tr>"
         "<tr><td>Watchdog recoveries</td><td class='%s'>%lu</td></tr>"
         "</table>",
@@ -12269,8 +12269,13 @@ void handle_txdebug(AsyncWebServerRequest *request)
         pttOffPending ? "on" : "ok",
         pttOffPending ? "YES" : "NO",
 
+#ifdef RADIO_LORA
+        loraGetTxBusy() ? "on" : "ok",
+        String(loraGetTxBusy()).c_str(), // LoRa: times the channel was busy (listen before talk)
+#else
         dcdBusy ? "on" : "ok",
         dcdBusy ? "BUSY" : "FREE",
+#endif
 
         (unsigned long)completed,
         (unsigned long)rejected,
@@ -12489,7 +12494,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
     // -------------------------------------------------------------------------
     response->print(
         "<h3>LEARNED RF AIRTIME</h3>"
-        "<small>PTT ON to real PTT OFF | RAM only | diagnostic</small>"
+        "<small>" TXD_AIRTIME_NOTE " | RAM only | diagnostic</small>"
         "<table class='log'>"
         "<tr><th>Job</th><th>Samples</th><th>Last</th>"
         "<th>Average</th><th style='text-align:right'>Max</th></tr>"
@@ -12693,17 +12698,17 @@ void handle_txdebug(AsyncWebServerRequest *request)
                 break;
 
             case 2:
-                eventName = "PTT ON";
+                eventName = TXD_EV_PTTON;
                 snprintf(value, sizeof(value), "%lu ms",
                          (unsigned long)events[i].value);
                 break;
 
             case 3:
-                eventName = "PTT OFF TASK";
+                eventName = TXD_EV_PTTOFF1;
                 break;
 
             case 4:
-                eventName = "PTT OFF DONE";
+                eventName = TXD_EV_PTTOFF2;
                 break;
 
             case 5:
@@ -12713,7 +12718,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
                 break;
 
             case 6:
-                eventName = "AX25 REJECT";
+                eventName = TXD_EV_REJECT;
                 snprintf(value, sizeof(value), "count %lu",
                          (unsigned long)events[i].value);
                 break;
@@ -12891,7 +12896,7 @@ void handle_txdebug(AsyncWebServerRequest *request)
         "</div>"
         "</div>"
         "<p><small>"
-        "Scheduler completion is released only after real PTT OFF."
+        TXD_FOOTER
         "</small></p>"
     );
 
