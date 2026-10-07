@@ -205,7 +205,12 @@ void AFSK_init(int8_t adc_pin, int8_t dac_pin, int8_t ptt_pin, int8_t sql_pin, i
                bool ptt_act, bool sql_act, bool pwr_act)
 {
     loraRadioUp = APRS_init(&config);
-    log_i("[LoRa] radio init %s", loraRadioUp ? "OK" : "FAILED");
+    // Always printed (not log_*): the release build has logging off, and this is
+    // the first thing to check on a new board / after an update.
+    Serial.printf("[LoRa] radio init %s: type=%d %.3f MHz SF%d BW%.1f CR4/%d sync=0x%02X pwr=%d dBm TX=%s\r\n",
+                  loraRadioUp ? "OK" : "FAILED", config.rf_type, config.rf_freq, config.rf_sf,
+                  config.rf_bw, config.rf_cr, config.rf_sync, config.rf_power,
+                  config.rf_ax25 ? "AX.25" : "TNC2(<\\xFF\\x01)");
 }
 
 void AFSK_deinit() {}
