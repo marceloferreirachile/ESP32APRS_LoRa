@@ -600,7 +600,10 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.wifi_power = doc["WiFiPwr"];
         config.wifi_ap_ch = doc["WiFiAPCH"];
         strlcpy(config.wifi_ap_ssid, doc["WiFiAP_SSID"] | "ESP32LoRa", sizeof(config.wifi_ap_ssid));
-        strlcpy(config.wifi_ap_pass, doc["WiFiAP_PASS"] | "aprsthnetwork", sizeof(config.wifi_ap_pass));
+        strlcpy(config.wifi_ap_pass, doc["WiFiAP_PASS"] | "", sizeof(config.wifi_ap_pass));
+        // LU6JMF: the old public default password becomes an open AP (existing saved configs too)
+        if (strcmp(config.wifi_ap_pass, "aprsthnetwork") == 0)
+            config.wifi_ap_pass[0] = 0;
         // log_d("Load WiFiAP: SSID=%s Pass=%s",config.wifi_ap_ssid,config.wifi_ap_pass);
         for (int i = 0; i < 5; i++)
         {
