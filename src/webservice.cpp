@@ -11708,6 +11708,8 @@ void handle_about(AsyncWebServerRequest *request)
 	strcat(webString, "<tr><td align=\"right\"><b>Chat: </b></td><td align=\"left\">Telegram:<a href=\"https://t.me/HS5TQA\" target=\"_line\">@HS5TQA</a> , WeChat:HS5TQA</td></tr>");
 	strcat(webString, "<tr><td align=\"right\"><b>Sponsors: </b></td><td align=\"left\"><a href=\"https://github.com/sponsors/nakhonthai\" target=\"_sponsor\">https://github.com/sponsors/nakhonthai</a></td></tr>");
 	strcat(webString, "<tr><td align=\"right\"><b>Donate: </b></td><td align=\"left\"><a href=\"https://www.paypal.me/0hs5tqa0\" target=\"_sponsor\">https://www.paypal.me/0hs5tqa0</a></td></tr>");
+	strcat(webString, "<tr><td align=\"right\"><b>LoRa fork: </b></td><td align=\"left\">Marcelo Ferreira LU6JMF</td></tr>");
+	strcat(webString, "<tr><td align=\"right\"><b>License: </b></td><td align=\"left\">GNU GPL v3. Source code of this exact version available on request, free of charge, for at least 3 years: <a href=\"mailto:marcelobrachile@gmail.com\">marcelobrachile@gmail.com</a> (include the version number)</td></tr>");
 
 	strcat(webString, "</table>");
 	strcat(webString, "</td></tr></table><br />");
