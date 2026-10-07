@@ -2771,9 +2771,12 @@ int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t a
             if (channel == 0)
             {
                 pkgList[i].audio_level = (int16_t)audioLvl;
-                //     pkgList[i].rssi = rssi;
-                //     pkgList[i].snr = snr;
-                //     pkgList[i].freqErr = freqErr;
+#ifdef RADIO_LORA
+                // signal report of the frame being processed (set by Ax25ReadNextRxFrame)
+                pkgList[i].rssi = rssi;
+                pkgList[i].snr = snr;
+                pkgList[i].freqErr = freqErr;
+#endif
             }
             else
             {
@@ -2839,9 +2842,12 @@ int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t a
         if (channel == 0)
         {
             pkgList[i].audio_level = (int16_t)audioLvl;
-            //     pkgList[i].rssi = rssi;
-            //     pkgList[i].snr = snr;
-            //     pkgList[i].freqErr = freqErr;
+#ifdef RADIO_LORA
+            // signal report of the frame being processed (set by Ax25ReadNextRxFrame)
+            pkgList[i].rssi = rssi;
+            pkgList[i].snr = snr;
+            pkgList[i].freqErr = freqErr;
+#endif
         }
         else
         {

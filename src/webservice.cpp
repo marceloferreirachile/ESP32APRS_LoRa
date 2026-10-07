@@ -555,7 +555,11 @@ webString->print("function printLastHeard(data) {\n");
 	webString->print("<td align=\"left\">${row.path}</td>\n");
 	webString->print("<td>${row.dx !== null ? row.dx : \"-\"}</td>\n");
 	webString->print("<td>${row.packet}</td>\n");
+#ifdef RADIO_LORA
+	webString->print("<td style=\"color:green;\">${row.audio !== '-' ? row.audio : \"-\"}</td>\n");
+#else
 	webString->print("<td style=\"color:green;\">${row.audio !== '-' ? row.audio + \"dBV\" : \"-\"}</td>\n");
+#endif
 	webString->print("`;\n");
 	webString->print("tableBody.appendChild(tr);\n");
 	webString->print("});\n");
@@ -729,6 +733,17 @@ static const char *DASHBOARD_TEMPLATE =
 	"<div id=\"sidebarInfo\">\n</div>\n"
 	"<br />\n"
 	"<table>\n<tr>\n<th colspan=\"2\">Radio Info</th>\n</tr>\n"
+#ifdef RADIO_LORA
+	"{{#if rf}}"
+	"<tr>\n<td>FREQ</td>\n<td style=\"background: #ffffff;\">{{freq}} MHz</td>\n</tr>\n"
+	"<tr>\n<td>MODE</td>\n<td style=\"background: #ffffff;\">{{loraMode}}</td>\n</tr>\n"
+	"<tr>\n<td>TX PWR</td>\n<td style=\"background: #ffffff;\">{{txPower}} dBm</td>\n</tr>\n"
+	"<tr>\n<td>SYNC</td>\n<td style=\"background: #ffffff;\">{{sync}}</td>\n</tr>\n"
+	"<tr>\n<td>TX FORMAT</td>\n<td style=\"background: #ffffff;\">{{txFormat}}</td>\n</tr>\n"
+	"{{else}}"
+	"<tr>\n<td>RADIO</td>\n<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n</tr>\n"
+	"{{/if}}"
+#else
 	"{{#if rf}}"
 	"<tr>\n<td>Freq.TX</td>\n<td style=\"background: #ffffff;\">{{freqTx}} MHz</td>\n</tr>\n"
 	"<tr>\n<td>Freq.RX</td>\n<td style=\"background: #ffffff;\">{{freqRx}} MHz</td>\n</tr>\n"
@@ -736,6 +751,7 @@ static const char *DASHBOARD_TEMPLATE =
 	"{{/if}}"
 	"<tr>\n<td>MODEM</td>\n<td style=\"background: #ffffff;\">{{modem}}</td>\n</tr>\n"
 	"<tr>\n<td>FX.25</td>\n<td style=\"background: #ffffff;\">{{fx25}}</td>\n</tr>\n"
+#endif
 	"</table>\n\n"
 	"{{#if igate}}"
 	"<br />\n<table>\n<tr>\n<th colspan=\"2\">APRS-IS SERVER</th>\n</tr>\n"
@@ -774,7 +790,11 @@ static const char *DASHBOARD_TEMPLATE =
 	"<th>VIA LAST PATH</th>\n"
 	"<th data-sort=\"dx\" style=\"min-width:5ch\">DX<span class=\"arrow\"></span></th>\n"
 	"<th data-sort=\"packet\" style=\"min-width:5ch\">PACKET<span class=\"arrow\"></span></th>\n"
+#ifdef RADIO_LORA
+	"<th data-sort=\"audio\" style=\"min-width:9ch\">RSSI/SNR<span class=\"arrow\"></span></th>\n"
+#else
 	"<th data-sort=\"audio\" style=\"min-width:5ch\">AUDIO<span class=\"arrow\"></span></th>\n"
+#endif
 	"</tr></thread>\n<tbody id=\"aprsTableBody\"></tbody>\n"
 	"</table>\n</div>\n";
 
@@ -792,6 +812,19 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	JsonDocument data;
 
 	data["rf"] = config.rf_en; // truthy flag for {{#if rf}}
+#ifdef RADIO_LORA
+	snprintf(temp_buffer, sizeof(temp_buffer), "%.3f", config.rf_freq);
+	data["freq"] = temp_buffer;
+	if (config.rf_mode == RF_MODE_LoRa)
+		snprintf(temp_buffer, sizeof(temp_buffer), "LoRa SF%d BW%.1f CR4/%d", config.rf_sf, config.rf_bw, config.rf_cr);
+	else
+		snprintf(temp_buffer, sizeof(temp_buffer), "FSK mode %d", config.rf_mode);
+	data["loraMode"] = temp_buffer;
+	data["txPower"] = config.rf_power;
+	snprintf(temp_buffer, sizeof(temp_buffer), "0x%02X (%d)%s", config.rf_sync, config.rf_sync, config.rf_sync == 0x12 ? "" : " !");
+	data["sync"] = temp_buffer;
+	data["txFormat"] = config.rf_ax25 ? "AX.25 (nakhonthai)" : "TNC2 (LoRa APRS std)";
+#endif
 	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_tx);
 	data["freqTx"] = temp_buffer;
 	snprintf(temp_buffer, sizeof(temp_buffer), "%.4f", config.freq_rx);
@@ -880,8 +913,13 @@ static const char *SIDEBAR_TEMPLATE =
 	"{{#if mqtt}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">MQTT</th>\n"
 	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">MQTT</th>\n{{/if}}"
 	"{{/if}}"
+#ifdef RADIO_LORA
+	"{{#if loraUp}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">LoRa</th>\n"
+	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">LoRa</th>\n{{/if}}"
+#else
 	"{{#if fx25}}<th style=\"background:#0b0; color:#030; width:50%;border-radius: 10px;border: 2px solid white;\">FX.25</th>\n"
 	"{{else}}<th style=\"background:#606060; color:#b0b0b0;border-radius: 10px;border: 2px solid white;\" aria-disabled=\"true\">FX.25</th>\n{{/if}}"
+#endif
 	"</tr>\n</table>\n<br />\n"
 	"<table>\n<tr>\n<th colspan=\"2\">STATISTICS</th>\n</tr>\n"
 	"<tr>\n<td style=\"width: 60px;text-align: right;\">RADIO RX:</td>\n<td style=\"background: #ffffff;\">{{rxCount}}</td>\n</tr>\n"
@@ -928,6 +966,9 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	data["mqttCompiled"] = false;
 #endif
 	data["fx25"] = config.fx25_mode > 0;
+#ifdef RADIO_LORA
+	data["loraUp"] = config.rf_en;
+#endif
 
 	data["rxCount"] = status.rxCount;
 	data["allCount"] = status.allCount;
@@ -1370,10 +1411,25 @@ void event_lastHeard(bool gethtml)
 					}
 					snprintf(temp_html, sizeof(temp_html), "\"packet\":\"%d\",", packet);
 					strcat(html, temp_html);
+#ifdef RADIO_LORA
+					if (pkg.rssi > -140.0F && !(pkg.rssi == 0 && pkg.snr == 0))
+					{
+						snprintf(temp_html, sizeof(temp_html), "\"audio\":\"%.0f/%.1f\"},", pkg.rssi, pkg.snr);
+						strcat(html, temp_html);
+					}
+					else
+					{
+						strcat(html, "\"audio\":\"-\"},");
+					}
+					if (0)
+					{
+					}
+#else
 					if (pkg.audio_level == 0)
 					{
 						strcat(html, "\"audio\":\"-\"},");
 					}
+#endif
 					else
 					{
 						double Vrms = (double)pkg.audio_level / 1000;
@@ -2337,12 +2393,295 @@ static void sendHtmlChunked(AsyncWebServerRequest *request, String &page, const 
 	request->send(resp);
 }
 
+#ifdef RADIO_LORA
+// -----------------------------------------------------------------------------
+// LU6JMF - AR-LORA: RADIO page for the LoRa module (replaces the SA868 /
+// AFSK / audio-calibration page of the audio build). Same layout and rules as
+// the other 2.1.5 pages: template + renderTemplate + sendHtmlChunked, POST via
+// ajax, save, then RF_MODULE(false) -> the radio is re-initialised by
+// taskAPRSPoll (the only task that touches it).
+// -----------------------------------------------------------------------------
+extern float rssi;
+extern float snr;
+extern float freqErr;
+
+static const char *RADIO_LORA_TEMPLATE =
+	"<script type=\"text/javascript\">\n"
+	"$('form').submit(function (e) {\n"
+	"e.preventDefault();\n"
+	"var data = new FormData(e.currentTarget);\n"
+	"document.getElementById(\"submitRadio\").disabled=true;\n"
+	"$.ajax({\n"
+	"url: '/radio',\n"
+	"type: 'POST',\n"
+	"data: data,\n"
+	"contentType: false,\n"
+	"processData: false,\n"
+	"success: function (data) {\n"
+	"alert(\"Submited Successfully\");\n"
+	"},\n"
+	"error: function (data) {\n"
+	"alert(\"An error occurred.\");\n"
+	"},\n"
+	"complete: function (data) {\n"
+	"document.getElementById(\"submitRadio\").disabled=false;\n"
+	"}\n"
+	"});\n"
+	"});\n"
+	"function loraStd(){\n"
+	"document.getElementById('rf_freq').value='433.775';\n"
+	"document.getElementById('rf_sf').value='12';\n"
+	"document.getElementById('rf_bw').value='125';\n"
+	"document.getElementById('rf_cr').value='5';\n"
+	"document.getElementById('rf_sync').value='18';\n"
+	"document.getElementById('rf_preamble').value='8';\n"
+	"document.getElementById('rf_txfmt').value='0';\n"
+	"}\n"
+	"</script>\n"
+	"<form id='formRadio' method=\"POST\" action='#' enctype='multipart/form-data'>\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>LoRa Radio Module</b></span></th>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Enable:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"radioEnable\" value=\"OK\" {{#if enabled}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Module Type:</b></td>\n"
+	"<td style=\"text-align: left;\"><select name=\"rf_type\" id=\"rf_type\">\n"
+	"{{#each typeOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Frequency:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" id=\"rf_freq\" name=\"rf_freq\" min=\"150\" max=\"960\" step=\"0.001\" value=\"{{freq}}\" /> MHz <i>*433.775 = LoRa APRS Argentina</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Freq. Offset:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" name=\"rf_offset\" min=\"-30000\" max=\"30000\" step=\"1\" value=\"{{offset}}\" /> Hz <i>*crystal correction, normally 0</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Spreading Factor:</b></td>\n"
+	"<td style=\"text-align: left;\"><select name=\"rf_sf\" id=\"rf_sf\">\n"
+	"{{#each sfOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Bandwidth:</b></td>\n"
+	"<td style=\"text-align: left;\"><select name=\"rf_bw\" id=\"rf_bw\">\n"
+	"{{#each bwOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n{{/each}}"
+	"</select> kHz</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Coding Rate:</b></td>\n"
+	"<td style=\"text-align: left;\"><select name=\"rf_cr\" id=\"rf_cr\">\n"
+	"{{#each crOptions}}<option value=\"{{value}}\" {{#if selected}}selected{{/if}}>{{label}}</option>\n{{/each}}"
+	"</select></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Sync Word:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" id=\"rf_sync\" name=\"rf_sync\" min=\"1\" max=\"255\" step=\"1\" value=\"{{sync}}\" /> "
+	"<i>*18 (0x12) = LoRa APRS standard, used by every project. 52 (0x34) is LoRaWAN and hears none of them.</i>"
+	"{{#if syncWarn}}<br /><b style=\"color:#d00;\">This sync word does not match the LoRa APRS network.</b>{{/if}}</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Power:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" name=\"rf_power\" min=\"-9\" max=\"22\" step=\"1\" value=\"{{power}}\" /> dBm <i>*SX1262/SX1268 max 22 dBm</i></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>Preamble:</b></td>\n"
+	"<td style=\"text-align: left;\"><input type=\"number\" id=\"rf_preamble\" name=\"rf_preamble\" min=\"6\" max=\"64\" step=\"1\" value=\"{{preamble}}\" /> symbols</td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>RX Boosted Gain:</b></td>\n"
+	"<td style=\"text-align: left;\"><label class=\"switch\"><input type=\"checkbox\" name=\"rxBoost\" value=\"OK\" {{#if rxBoost}}checked{{/if}}><span class=\"slider round\"></span></label></td>\n"
+	"</tr>\n"
+	"<tr>\n"
+	"<td align=\"right\"><b>TX Format:</b></td>\n"
+	"<td style=\"text-align: left;\"><select name=\"rf_txfmt\" id=\"rf_txfmt\">\n"
+	"<option value=\"0\" {{#if ax25}}{{else}}selected{{/if}}>TNC2 &lt;0xFF0x01 (LoRa APRS standard - every project)</option>\n"
+	"<option value=\"1\" {{#if ax25}}selected{{/if}}>AX.25/HDLC (nakhonthai only)</option>\n"
+	"</select><br /><i>*RX always accepts both formats.</i></td>\n"
+	"</tr>\n"
+	"<tr><td colspan=\"2\" align=\"right\">"
+	"<button type=\"button\" class=\"button\" onclick=\"loraStd()\">LoRa APRS standard</button> "
+	"<button class=\"button\" type='submit' id='submitRadio' name=\"commitRadio\"> Apply Change </button>"
+	"<input type=\"hidden\" name=\"commitRadio\"/></td></tr>\n"
+	"</table>\n"
+	"</form>\n"
+	"<br />\n"
+	"<table>\n"
+	"<th colspan=\"2\"><span><b>LoRa Radio Status</b></span></th>\n"
+	"<tr><td align=\"right\"><b>Last packet RSSI / SNR:</b></td><td style=\"text-align: left;\">{{lastRssi}} dBm / {{lastSnr}} dB (freq. error {{lastFreqErr}} Hz)</td></tr>\n"
+	"<tr><td align=\"right\"><b>TX OK / TX error:</b></td><td style=\"text-align: left;\">{{txOk}} / {{txErr}} (last result code {{txLast}})</td></tr>\n"
+	"<tr><td align=\"right\"><b>RX frames dropped (ring full):</b></td><td style=\"text-align: left;\">{{rxDropped}}</td></tr>\n"
+	"<tr><td align=\"right\"><b>Radio re-inits (watchdog / config):</b></td><td style=\"text-align: left;\">{{recover}}</td></tr>\n"
+	"</table>\n";
+
+static bool loraArgNum(AsyncWebServerRequest *request, uint8_t i, float &out)
+{
+	if (request->arg(i) == "" || !isValidNumber(request->arg(i)))
+		return false;
+	out = request->arg(i).toFloat();
+	return true;
+}
+
+static void handle_radio_lora(AsyncWebServerRequest *request)
+{
+	if (request->hasArg("commitRadio"))
+	{
+		bool radioEnable = false;
+		bool rxBoost = false;
+		for (uint8_t i = 0; i < request->args(); i++)
+		{
+			const String &n = request->argName(i);
+			float v = 0;
+			if (n == "radioEnable")
+				radioEnable = (request->arg(i) == "OK");
+			else if (n == "rxBoost")
+				rxBoost = (request->arg(i) == "OK");
+			else if (n == "rf_type" && loraArgNum(request, i, v))
+			{
+				int t = (int)v;
+				if (t == RF_SX1262 || t == RF_SX1268 || t == RF_SX1276 || t == RF_SX1278)
+					config.rf_type = t;
+			}
+			else if (n == "rf_freq" && loraArgNum(request, i, v))
+			{
+				if (v >= 150.0f && v <= 960.0f)
+					config.rf_freq = v;
+			}
+			else if (n == "rf_offset" && loraArgNum(request, i, v))
+			{
+				if (v >= -30000 && v <= 30000)
+					config.rf_freq_offset = (int16_t)v;
+			}
+			else if (n == "rf_sf" && loraArgNum(request, i, v))
+			{
+				if (v >= 6 && v <= 12)
+					config.rf_sf = (uint8_t)v;
+			}
+			else if (n == "rf_bw" && loraArgNum(request, i, v))
+			{
+				if (v >= 7.8f && v <= 500.0f)
+					config.rf_bw = v;
+			}
+			else if (n == "rf_cr" && loraArgNum(request, i, v))
+			{
+				if (v >= 5 && v <= 8)
+					config.rf_cr = (uint8_t)v;
+			}
+			else if (n == "rf_sync" && loraArgNum(request, i, v))
+			{
+				if (v >= 1 && v <= 255)
+					config.rf_sync = (uint8_t)v;
+			}
+			else if (n == "rf_power" && loraArgNum(request, i, v))
+			{
+				if (v >= -9 && v <= 22)
+					config.rf_power = (int8_t)v;
+			}
+			else if (n == "rf_preamble" && loraArgNum(request, i, v))
+			{
+				if (v >= 6 && v <= 64)
+					config.rf_preamable = (uint8_t)v;
+			}
+			else if (n == "rf_txfmt" && loraArgNum(request, i, v))
+			{
+				config.rf_ax25 = ((int)v == 1);
+			}
+		}
+		config.rf_en = radioEnable;
+		config.rf_rx_boost = rxBoost;
+		config.rf_mode = RF_MODE_LoRa;
+		request->send(200, "text/html", "OK");
+		saveConfiguration("/default.cfg", config);
+		RF_MODULE(false); // ask taskAPRSPoll to re-init the radio with the new settings
+		return;
+	}
+
+	esp_task_wdt_reset();
+	JsonDocument data;
+	char buf[24];
+	data["enabled"] = config.rf_en;
+
+	JsonArray types = data["typeOptions"].to<JsonArray>();
+	const int typeVal[] = {RF_SX1262, RF_SX1268, RF_SX1276, RF_SX1278};
+	const char *typeLbl[] = {"SX1262 (Heltec V3, T-Beam S3...)", "SX1268 (433 MHz modules)", "SX1276", "SX1278"};
+	for (int k = 0; k < 4; k++)
+	{
+		JsonObject o = types.add<JsonObject>();
+		o["value"] = typeVal[k];
+		o["label"] = typeLbl[k];
+		o["selected"] = (config.rf_type == typeVal[k]);
+	}
+
+	snprintf(buf, sizeof(buf), "%.3f", config.rf_freq);
+	data["freq"] = buf;
+	data["offset"] = config.rf_freq_offset;
+
+	JsonArray sf = data["sfOptions"].to<JsonArray>();
+	for (int k = 7; k <= 12; k++)
+	{
+		JsonObject o = sf.add<JsonObject>();
+		o["value"] = k;
+		snprintf(buf, sizeof(buf), "SF%d%s", k, k == 12 ? " (LoRa APRS)" : "");
+		o["label"] = buf;
+		o["selected"] = (config.rf_sf == k);
+	}
+	JsonArray bw = data["bwOptions"].to<JsonArray>();
+	const float bwVal[] = {62.5f, 125.0f, 250.0f, 500.0f};
+	for (int k = 0; k < 4; k++)
+	{
+		JsonObject o = bw.add<JsonObject>();
+		snprintf(buf, sizeof(buf), "%g", bwVal[k]);
+		o["value"] = buf;
+		snprintf(buf, sizeof(buf), "%g%s", bwVal[k], bwVal[k] == 125.0f ? " (LoRa APRS)" : "");
+		o["label"] = buf;
+		o["selected"] = (fabsf(config.rf_bw - bwVal[k]) < 0.1f);
+	}
+	JsonArray cr = data["crOptions"].to<JsonArray>();
+	for (int k = 5; k <= 8; k++)
+	{
+		JsonObject o = cr.add<JsonObject>();
+		o["value"] = k;
+		snprintf(buf, sizeof(buf), "4/%d%s", k, k == 5 ? " (LoRa APRS)" : "");
+		o["label"] = buf;
+		o["selected"] = (config.rf_cr == k);
+	}
+	data["sync"] = config.rf_sync;
+	data["syncWarn"] = (config.rf_sync != 0x12);
+	data["power"] = config.rf_power;
+	data["preamble"] = config.rf_preamable;
+	data["rxBoost"] = config.rf_rx_boost;
+	data["ax25"] = config.rf_ax25;
+
+	snprintf(buf, sizeof(buf), "%.1f", rssi);
+	data["lastRssi"] = buf;
+	snprintf(buf, sizeof(buf), "%.1f", snr);
+	data["lastSnr"] = buf;
+	snprintf(buf, sizeof(buf), "%.0f", freqErr);
+	data["lastFreqErr"] = buf;
+	data["txOk"] = loraGetTxOk();
+	data["txErr"] = loraGetTxErr();
+	data["txLast"] = loraGetLastTxState();
+	data["rxDropped"] = loraGetRxDropped();
+	data["recover"] = loraRecoverCount;
+
+	String html_str = renderTemplate(RADIO_LORA_TEMPLATE, data.as<JsonVariant>());
+	sendHtmlChunked(request, html_str, "Sysinfo");
+}
+#endif // RADIO_LORA
+
 void handle_radio(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
+#ifdef RADIO_LORA
+	handle_radio_lora(request);
+	return;
+#endif
 	// bool noiseEn=false;
 	bool radioEnable = false;
 	if (request->hasArg("commitRadio"))
