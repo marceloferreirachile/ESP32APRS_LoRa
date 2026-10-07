@@ -63,7 +63,9 @@ char *allocateStringMemory(size_t size)
 #endif
 	// Regular heap allocation
 	ptr = (char *)calloc(size, sizeof(char));
-	memset(ptr, 0, size); // Initialize memory to zero
+	// LU6JMF: calloc can fail on a fragmented heap (no PSRAM); never memset NULL.
+	if (ptr != NULL)
+		memset(ptr, 0, size); // Initialize memory to zero
 	return ptr;
 }
 
@@ -11560,6 +11562,8 @@ void handle_check_version(AsyncWebServerRequest *request)
 	request->send(200, "application/json", resp);
 }
 
+extern char lu6jmfPrevRebootInfo[48]; // main.cpp - reason of the previous boot
+
 void handle_about(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
@@ -11665,6 +11669,14 @@ void handle_about(AsyncWebServerRequest *request)
 		strcat(webString, temp_str);
 
 		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Chip ID: </b></td><td align=\"left\"> %s</td></tr>", strCID);
+		strcat(webString, temp_str);
+
+		// LU6JMF: stability diagnostics - why the last boot happened and heap health.
+		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Last reset: </b></td><td align=\"left\"> %s</td></tr>", lu6jmfPrevRebootInfo);
+		strcat(webString, temp_str);
+
+		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Heap min / largest block: </b></td><td align=\"left\">%.1f / %.1f KByte</td></tr>",
+				 (float)ESP.getMinFreeHeap() / 1024, (float)ESP.getMaxAllocHeap() / 1024);
 		strcat(webString, temp_str);
 
 		snprintf(temp_str, 512, "<tr><td align=\"right\"><b>Flash: </b></td><td align=\"left\">%d KByte</td></tr>", ESP.getFlashChipSize() / 1024);

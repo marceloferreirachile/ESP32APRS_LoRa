@@ -171,12 +171,18 @@ int igateProcess(AX25Msg &Packet)
     {
         memset(Raw, 0, 300); // Clear frame packet
         size_t hSize = header.length();
+        // LU6JMF: bound both copies to the 300-byte buffer (header + info could overflow the heap)
+        if (hSize > 299)
+            hSize = 299;
+        size_t iLen = Packet.len;
+        if (hSize + iLen > 299)
+            iLen = 299 - hSize;
         memcpy(&Raw[0], header.c_str(), hSize);           // Copy header to frame packet
-        memcpy(&Raw[hSize], &Packet.info[0], Packet.len); // Copy info to frame packet
+        memcpy(&Raw[hSize], &Packet.info[0], iLen);       // Copy info to frame packet
         char *ptr = &Raw[0];
         int i, rmv = 0;
         // Remove CR,LF in frame packet
-        for (i = 0; i < (hSize + Packet.len - rmv); i++)
+        for (i = 0; i < (int)(hSize + iLen - rmv); i++)
         {
             if ((Raw[i] == '\r') || (Raw[i] == '\n'))
             {

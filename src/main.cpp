@@ -4624,6 +4624,18 @@ void bluetooth_init()
 
 bool AFSKInitAct = false;
 unsigned long timeTask;
+
+// LU6JMF: firmware-initiated restart reason, kept across the software reset
+// (RTC_NOINIT survives esp_restart, is lost on power-off). Magic-guarded.
+#define LU6JMF_WHY_MAGIC 0x4C364A52
+#define LU6JMF_WHY_AUTO 1
+#define LU6JMF_WHY_HEAP 2
+RTC_NOINIT_ATTR uint32_t lu6jmfRebootWhyMagic;
+RTC_NOINIT_ATTR uint32_t lu6jmfRebootWhyStore;
+RTC_NOINIT_ATTR uint32_t lu6jmfRebootHeapStore;
+// Previous boot's info, filled once in setup().
+char lu6jmfPrevRebootInfo[48] = "";
+
 void setup()
 {
     i2c0_mutex = xSemaphoreCreateMutex();
@@ -4632,6 +4644,30 @@ void setup()
     // pinMode(20,INPUT);
     //  byte *ptr;
     int BootReason = esp_reset_reason();
+    {
+        const char *rs = "?";
+        switch (BootReason)
+        {
+        case ESP_RST_POWERON: rs = "POWERON"; break;
+        case ESP_RST_SW: rs = "SW"; break;
+        case ESP_RST_PANIC: rs = "PANIC"; break;
+        case ESP_RST_INT_WDT: rs = "INT_WDT"; break;
+        case ESP_RST_TASK_WDT: rs = "TASK_WDT"; break;
+        case ESP_RST_WDT: rs = "WDT"; break;
+        case ESP_RST_BROWNOUT: rs = "BROWNOUT"; break;
+        case ESP_RST_DEEPSLEEP: rs = "DEEPSLEEP"; break;
+        default: break;
+        }
+        const char *why = "";
+        if (BootReason == ESP_RST_SW && lu6jmfRebootWhyMagic == LU6JMF_WHY_MAGIC)
+            why = (lu6jmfRebootWhyStore == LU6JMF_WHY_HEAP) ? " (low heap)" : (lu6jmfRebootWhyStore == LU6JMF_WHY_AUTO) ? " (auto reset)" : "";
+        snprintf(lu6jmfPrevRebootInfo, sizeof(lu6jmfPrevRebootInfo), "%s%s", rs, why);
+        if (BootReason == ESP_RST_SW && lu6jmfRebootWhyMagic == LU6JMF_WHY_MAGIC && lu6jmfRebootWhyStore == LU6JMF_WHY_HEAP)
+            log_d("Last reset: %s, free heap was %u", lu6jmfPrevRebootInfo, (unsigned)lu6jmfRebootHeapStore);
+        else
+            log_d("Last reset: %s", lu6jmfPrevRebootInfo);
+        lu6jmfRebootWhyMagic = 0; // consumed; set again only right before a firmware restart
+    }
 #ifdef BOARD_HAS_PSRAM
     // if (psramInit())
     // {
@@ -4661,6 +4697,14 @@ void setup()
     // TNC2Raw = (int *)malloc(sizeof(int) * PKGTXSIZE);
 #endif
 
+    // LU6JMF: if any core table failed to allocate, restart now (clean, early,
+    // reason visible) instead of crashing later on a NULL pointer.
+    if (pkgList == NULL || Telemetry == NULL || txQueue == NULL || msgQueue == NULL)
+    {
+        log_d("FATAL: core table allocation failed, restarting");
+        delay(200);
+        esp_restart();
+    }
     memset(pkgList, 0, sizeof(pkgListType) * PKGLISTSIZE);
     memset(Telemetry, 0, sizeof(TelemetryType) * TLMLISTSIZE);
     memset(txQueue, 0, sizeof(txQueueType) * PKGTXSIZE);
@@ -6780,7 +6824,9 @@ void loop()
         {
             autoResetTimeout = millis() + (config.reset_timeout * 60000);
             log_d("Auto Reset System");
-            vTaskSuspendAll();
+            lu6jmfRebootWhyStore = LU6JMF_WHY_AUTO;
+            lu6jmfRebootWhyMagic = LU6JMF_WHY_MAGIC;
+            // LU6JMF: no vTaskSuspendAll() here - WiFi/PowerOff calls need the scheduler running.
             WiFi.disconnect(true); // Disconnect from the network
             WiFi.persistent(false);
             WiFi.mode(WIFI_OFF); // Switch WiFi off
@@ -6798,7 +6844,10 @@ void loop()
             if (++heapCount >= 3)
             {
                 heapCount = 0;
-                vTaskSuspendAll();
+                lu6jmfRebootWhyStore = LU6JMF_WHY_HEAP;
+                lu6jmfRebootHeapStore = ESP.getFreeHeap();
+                lu6jmfRebootWhyMagic = LU6JMF_WHY_MAGIC;
+                // LU6JMF: no vTaskSuspendAll() here - WiFi/PowerOff calls need the scheduler running.
                 WiFi.disconnect(true); // Disconnect from the network
                 WiFi.persistent(false);
                 WiFi.mode(WIFI_OFF); // Switch WiFi off
