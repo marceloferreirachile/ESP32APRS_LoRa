@@ -1778,7 +1778,7 @@ void defaultConfig()
     config.igate_lon = 100.4930;
     config.igate_alt = 0;
     config.igate_interval = 600;
-    sprintf(config.igate_symbol, "A&");
+    sprintf(config.igate_symbol, "L&"); // LU6JMF: L overlay = LoRa iGate (audio AR-APRS keeps A&)
     memset(config.igate_object, 0, sizeof(config.igate_object));
     memset(config.igate_phg, 0, sizeof(config.igate_phg));
     config.igate_path = 8;
@@ -1805,7 +1805,7 @@ void defaultConfig()
     config.digi_delay = 0;
     config.digiFilter = FILTER_OBJECT | FILTER_ITEM | FILTER_MESSAGE | FILTER_MICE | FILTER_POSITION | FILTER_WX;
 
-    sprintf(config.digi_symbol, "A#");
+    sprintf(config.digi_symbol, "L#"); // LU6JMF: L overlay = LoRa digi (audio AR-APRS keeps A#)
     memset(config.digi_phg, 0, sizeof(config.digi_phg));
     sprintf(config.digi_comment, "");
     strlcpy(config.digi_status, BRAND_STATUS_DIGI, sizeof(config.digi_status));
