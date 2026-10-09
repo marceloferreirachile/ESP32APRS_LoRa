@@ -14257,6 +14257,43 @@ void radioDisp()
     display.print("5");
     display.setTextColor(WHITE);
 
+#ifdef RADIO_LORA
+    // LU6JMF: LoRa radio info (the audio version showed FreqRX/FreqTX/Modem/FX.25)
+    display.setCursor(3, 18);
+    display.print("Freq:");
+    str = String(config.rf_freq, 3) + " MHz";
+    x = str.length() * 6;
+    display.setCursor(126 - x, 18);
+    display.print(str);
+
+    display.setCursor(3, 26);
+    display.print("SF/BW:");
+    str = "SF" + String(config.rf_sf) + " " + String(config.rf_bw, 0) + "k";
+    x = str.length() * 6;
+    display.setCursor(126 - x, 26);
+    display.print(str);
+
+    display.setCursor(3, 35);
+    display.print("CR/Sync:");
+    str = "4/" + String(config.rf_cr) + " 0x" + String(config.rf_sync, HEX);
+    x = str.length() * 6;
+    display.setCursor(126 - x, 35);
+    display.print(str);
+
+    display.setCursor(3, 44);
+    display.print("TX Power:");
+    str = String(config.rf_power) + " dBm";
+    x = str.length() * 6;
+    display.setCursor(126 - x, 44);
+    display.print(str);
+
+    display.setCursor(3, 53);
+    display.print("Format:");
+    str = config.rf_ax25 ? "AX.25" : "LoRa APRS";
+    x = str.length() * 6;
+    display.setCursor(126 - x, 53);
+    display.print(str);
+#else
     display.setCursor(3, 18);
     display.print("FreqRX:");
     str = String(config.freq_rx, 3) + " MHz";
@@ -14295,6 +14332,7 @@ void radioDisp()
     display.setCursor(126 - x, 53);
     display.print(str);
 
+#endif
     // display.setCursor(3, 53);
     // display.print("TX Power");
     // // str = "V" + String(VERSION);

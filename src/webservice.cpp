@@ -1417,6 +1417,9 @@ void event_lastHeard(bool gethtml)
 					snprintf(temp_html, sizeof(temp_html), "\"packet\":\"%d\",", packet);
 					strcat(html, temp_html);
 #ifdef RADIO_LORA
+					// LU6JMF: LoRa shows RSSI/SNR of the packet (RF only). The audio
+					// branch must NOT run here - it appended a 2nd "audio" key
+					// ("-inf") and broke the JSON, so LAST HEARD showed nothing.
 					if (pkg.rssi > -140.0F && !(pkg.rssi == 0 && pkg.snr == 0))
 					{
 						snprintf(temp_html, sizeof(temp_html), "\"audio\":\"%.0f/%.1f\"},", pkg.rssi, pkg.snr);
@@ -1426,35 +1429,19 @@ void event_lastHeard(bool gethtml)
 					{
 						strcat(html, "\"audio\":\"-\"},");
 					}
-					if (0)
-					{
-					}
 #else
 					if (pkg.audio_level == 0)
 					{
 						strcat(html, "\"audio\":\"-\"},");
 					}
-#endif
 					else
 					{
 						double Vrms = (double)pkg.audio_level / 1000;
 						double audBV = 20.0F * log10(Vrms);
-						// if (audBV < -20.0F)
-						// {
-						// 	strcat(html, " audio:\"");
-						// }
-						// else if (audBV > -5.0F)
-						// {
-						// 	strcat(html, "<td style=\"color: #f00000;\">");
-						// }
-						// else
-						// {
-						// 	strcat(html, "<td style=\"color: #008000;\">");
-						// }
 						snprintf(temp_html, sizeof(temp_html), "\"audio\":\"%.1f\"},", audBV);
 						strcat(html, temp_html);
-						//strcat(html, "dBV</td></tr>\n");
 					}
+#endif
 				}
 			}
 		}
