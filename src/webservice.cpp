@@ -11317,7 +11317,7 @@ static const char *ABOUT_TEMPLATE =
 #ifdef RADIO_LORA
 	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\" style=\"white-space:normal;\">AR-LORA 1.0 &mdash; based on ESP32APRS_LoRa (nakhonthai), core from AR-APRS de LU6JMF</td></tr>\n"
 #else
-	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\">v2.0-lu6jmf (custom mods on top of V1.8a)</td></tr>\n"
+	"<tr><td align=\"right\"><b>Version: </b></td><td align=\"left\" style=\"white-space:normal;\">AR-APRS v" VERSION "-" VERSION_BUILD " &mdash; based on ESP32APRS_Audio (nakhonthai)</td></tr>\n"
 #endif
 	"<tr><td align=\"right\" style=\"vertical-align:top;\"><b>Changes: </b></td><td align=\"left\" style=\"white-space:normal;\">\n"
 	"See README / git log in the repository for full change history, or "
