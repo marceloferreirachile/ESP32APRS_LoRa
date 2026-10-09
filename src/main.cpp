@@ -1663,8 +1663,8 @@ void defaultConfig()
         config.wifi_sta[i].wifi_ssid[0] = 0;
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
-    sprintf(config.wifi_ap_ssid, BRAND_DEVICE_NAME);
-    sprintf(config.wifi_ap_pass, "aprsthnetwork");
+    sprintf(config.wifi_ap_ssid, BRAND_DEVICE_NAME "_AP");
+    config.wifi_ap_pass[0] = 0; // LU6JMF: open setup AP, access control is the web login (admin/admin)
 
     // Blutooth
     config.bt_slave = false;
