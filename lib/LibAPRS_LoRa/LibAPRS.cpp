@@ -91,7 +91,7 @@ static long valtable[] = {1193046471L, 119304647L, 11930465L, 1988411L, 198841L,
 bool received = false;
 // LU6JMF: TCXO supply voltage (DIO3). Heltec V3 = 1.8 V (Heltec docs, CA2RXU, Meshtastic);
 // RadioLib's default 1.6 V was used before.
-#if defined(HELTEC_V3_GPS)
+#if defined(HELTEC_V3_GPS) || defined(HELTEC_HTIT_TRACKER)
 #define LORA_TCXO_VOLTAGE 1.8
 #else
 #define LORA_TCXO_VOLTAGE 1.6

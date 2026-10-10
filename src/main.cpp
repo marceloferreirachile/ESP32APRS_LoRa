@@ -162,6 +162,29 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 #endif
 
+#if defined(ST7735_160x80)
+// LU6JMF: Heltec Wireless Tracker V1.1 - 160x80 ST7735 TFT (ported from the
+// nakhonthai ESP32APRS_LoRa main branch; the AR-APRS 2.1.5 core only had OLED).
+#include <Adafruit_GFX_Buffer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#define SCREEN_WIDTH 160
+#define SCREEN_HEIGHT 80
+#define BLACK ST77XX_BLACK
+#define WHITE ST77XX_WHITE
+#define ST7735_CS_Pin 38
+#define ST7735_REST_Pin 39
+#define ST7735_DC_Pin 40
+#define ST7735_SCLK_Pin 41
+#define ST7735_MOSI_Pin 42
+#define ST7735_VTFT_CTRL_Pin 3 // Vext: TFT + GNSS power, active HIGH
+#define ST7735_MODEL INITR_MINI160x80_PLUGIN
+SPIClass TFT_SPI(HSPI);
+typedef Adafruit_ST7735 display_t;
+typedef Adafruit_GFX_Buffer<display_t> GFXBuffer_t;
+GFXBuffer_t display = GFXBuffer_t(SCREEN_HEIGHT, SCREEN_WIDTH, display_t(&TFT_SPI, ST7735_CS_Pin, ST7735_DC_Pin, ST7735_REST_Pin));
+#endif
+
 #define FORMAT_LITTLEFS_IF_FAILED true
 extern fs::LITTLEFSFS LITTLEFS;
 
@@ -207,6 +230,9 @@ void IRAM_ATTR LED_Status(uint8_t r, uint8_t g, uint8_t b)
 #else
 #if defined(HELTEC_V3_GPS)
 #define LED_TX 35
+#define LED_RX -1
+#elif defined(HELTEC_HTIT_TRACKER)
+#define LED_TX 18
 #define LED_RX -1
 #elif defined(RADIO_LORA)
 #define LED_TX -1
@@ -292,7 +318,7 @@ long timeNetwork, timeAprs, timeGui;
 long autoResetTimeout = 0;
 
 // cppQueue PacketBuffer(sizeof(AX25Msg), 5, IMPLEMENTATION); // Instantiate queue
-#ifdef OLED
+#if defined OLED || defined ST7735_160x80
 cppQueue dispBuffer(300, 5, IMPLEMENTATION);
 cppQueue queTxDisp(sizeof(txDisp), 5, IMPLEMENTATION); // Instantiate queue
 
@@ -1929,7 +1955,7 @@ void defaultConfig()
 // memset(config.wx_type, 0, sizeof(config.wx_type));
 
 // OLED DISPLAY
-#ifdef OLED
+#if defined OLED || defined ST7735_160x80
     config.oled_enable = true;
 #else
     config.oled_enable = false;
@@ -2296,6 +2322,25 @@ config.oled_enable = true;
     config.i2c_enable = true;   // on-board OLED
     config.i2c_sda_pin = 17;
     config.i2c_sck_pin = 18;
+#elif defined(HELTEC_HTIT_TRACKER)
+    // Heltec Wireless Tracker V1.1: same SX1262 wiring as the V3; on-board UC6580 GNSS on UART1
+    config.rf_dio1_gpio = 14;
+    config.rf_reset_gpio = 12;
+    config.rf_dio0_gpio = 13; // BUSY
+    config.rf_nss_gpio = 8;
+    config.rf_sclk_gpio = 9;
+    config.rf_miso_gpio = 11;
+    config.rf_mosi_gpio = 10;
+    config.gnss_enable = true;
+    config.gnss_channel = 2; // UART1
+    config.uart1_enable = true;
+    config.uart1_baudrate = 115200;
+    config.uart1_rx_gpio = 33;
+    config.uart1_tx_gpio = 34;
+    config.uart1_rts_gpio = -1;
+    config.i2c_enable = false; // TFT is on SPI
+    config.i2c_sda_pin = -1;
+    config.i2c_sck_pin = -1;
 #endif
     // Network defaults for Argentina (the audio core still ships nakhonthai's Thai servers / UTC+7)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -4649,7 +4694,7 @@ boolean APRSConnect()
 
 long oledSleepTimeout = 0;
 bool showDisp = false;
-#ifdef OLED
+#if defined OLED || defined ST7735_160x80
 RTC_DATA_ATTR bool gps_mode;
 RTC_DATA_ATTR uint8_t curTab;
 int timeHalfSec = 0;
@@ -4737,6 +4782,11 @@ void setup()
     pinMode(37, OUTPUT);
     digitalWrite(37, HIGH);
     delay(50);
+#elif defined(HELTEC_HTIT_TRACKER)
+    // Heltec Wireless Tracker V1.1: Vext (GPIO3, active HIGH) powers the TFT and the GNSS.
+    pinMode(ST7735_VTFT_CTRL_Pin, OUTPUT);
+    digitalWrite(ST7735_VTFT_CTRL_Pin, HIGH);
+    delay(100);
 #endif
 
     // Set up serial port
@@ -4934,6 +4984,45 @@ void setup()
         LED_Status(0, 0, 200);
         delay(1000);
     }
+#elif defined(ST7735_160x80)
+    // LU6JMF: Heltec Wireless Tracker TFT init (from the nakhonthai LoRa code) + AR-LORA boot screen
+    TFT_SPI.begin(ST7735_SCLK_Pin, -1, ST7735_MOSI_Pin, ST7735_CS_Pin);
+    TFT_SPI.setFrequency(40000000);
+    ledcAttach(ST7735_LED_K_Pin, 10000, 8);
+    if (config.disp_brightness < 10)
+        config.disp_brightness = 250; // never boot with the backlight off
+    ledcWrite(ST7735_LED_K_Pin, config.disp_brightness);
+    display.initR(ST7735_MODEL);
+    if (config.disp_flip)
+        display.setRotation(3);
+    else
+        display.setRotation(1);
+    display.invertDisplay(false);
+    display.setAddrWindow(0, 0, 160, 80);
+    display.enableDisplay(true);
+    display.fillScreen(ST77XX_BLACK);
+    display.setTextSize(1);
+    display.setFont(&FreeSansBold9pt7b);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(10, 18);
+    display.print(BRAND_SHORT);
+    display.fillRoundRect(80, 26, 70, 22, 3, 0x7A39); // violet
+    display.setCursor(92, 42);
+    display.print("LoRa");
+    display.setFont();
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(10, 32);
+    display.printf("V%s", VERSION);
+    display.setCursor(10, 60);
+    display.print("LU6JMF");
+    display.display();
+    LED_Status(255, 0, 0);
+    delay(1000);
+    LED_Status(0, 255, 0);
+    delay(1000);
+    LED_Status(0, 0, 255);
+    delay(1000);
+    LED_Status(0, 0, 0);
 #elif defined(GUI_LCD)
     if (config.oled_enable)
     {
@@ -5013,6 +5102,11 @@ void setup()
 #ifdef OLED
         display.clearDisplay();
         display.setCursor(10, 22);
+        display.print("Factory Reset!");
+        display.display();
+#elif defined(ST7735_160x80)
+        display.fillScreen(ST77XX_BLACK);
+        display.setCursor(10, 35);
         display.print("Factory Reset!");
         display.display();
 #endif
@@ -5095,6 +5189,14 @@ void setup()
         RF_MODULE(true);
     log_d("Free heap: %d", ESP.getHeapSize());
 
+#if defined(ST7735_160x80)
+    if (config.oled_enable == true)
+    {
+        display.fillScreen(ST77XX_BLACK);
+        display.setTextSize(1);
+        display.display();
+    }
+#endif
 #ifdef OLED
     if (config.oled_enable == true)
     {
@@ -6647,7 +6749,7 @@ void loop()
     //         btn_count = 0;
     //     }
     // }
-    #ifdef OLED
+    #if defined OLED || defined ST7735_160x80
     if (digitalRead(BOOT_PIN) == LOW)
     {
         btn_count++;
@@ -6796,8 +6898,12 @@ void loop()
                         timeHalfSec = 0;
                         oledSleepTimeout = 0;
                         i2c_busy = true;
+#ifdef OLED
                         display.clearDisplay();
                         display.display();
+#elif defined(ST7735_160x80)
+                        ledcWrite(ST7735_LED_K_Pin, 5); // dim the backlight (same as the original LoRa code)
+#endif
                         i2c_busy = false;
                     }
                 }
@@ -11115,7 +11221,7 @@ void taskNetwork(void *pvParameters)
     } // for loop
 }
 
-#ifdef OLED
+#if defined OLED || defined ST7735_160x80
 // Routine
 void line_angle(signed int startx, signed int starty, unsigned int length, unsigned int angle, unsigned int color)
 {

@@ -11261,6 +11261,16 @@ void handle_check_version(AsyncWebServerRequest *request)
 	const char *latestDate = doc["date"] | "";
 	const char *latestTag = doc["tag"] | "";
 	const char *latestFilename = doc["filename"] | "";
+	// LU6JMF: version.json has a single "filename" (the Heltec V3 one). Each board
+	// links to ITS OWN binary in the same release, built from the latest version.
+	char boardFilename[64];
+#if defined(HELTEC_HTIT_TRACKER)
+	snprintf(boardFilename, sizeof(boardFilename), "HELTEC_TRACKER_v%s-%s.bin", latestVersion, latestBuild);
+	latestFilename = boardFilename;
+#elif defined(HELTEC_V3_GPS)
+	snprintf(boardFilename, sizeof(boardFilename), "HELTEC_V3_v%s-%s.bin", latestVersion, latestBuild);
+	latestFilename = boardFilename;
+#endif
 
 	bool updateAvailable = (strcmp(latestVersion, VERSION) != 0) || (strcmp(latestBuild, VERSION_BUILD) != 0);
 
@@ -11464,6 +11474,9 @@ void handle_about(AsyncWebServerRequest *request)
 #if defined(HELTEC_V3_GPS)
 	strcpy(hwVersion, "Heltec WiFi LoRa 32 V3");
 	sprintf(FirmwareOTA, "HELTEC_V3_%s", ver);
+#elif defined(HELTEC_HTIT_TRACKER)
+	strcpy(hwVersion, "Heltec Wireless Tracker V1.1");
+	sprintf(FirmwareOTA, "HELTEC_TRACKER_%s", ver);
 #elif defined(TTGO_TWR)
 	strcpy(hwVersion, "LiLyGo T-TWRPlus");
 	sprintf(FirmwareOTA, "ESP32S3_TWR_%s", ver);
