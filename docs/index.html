@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AR-LORA - Installer (LU6JMF)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; line-height: 1.5; color: #1d1530; }
+  h1 { font-size: 1.4em; color: #2E1450; }
+  .box { border: 1px solid #cbbde3; border-radius: 8px; padding: 20px; margin: 20px 0; background: #f5f1fb; }
+  esp-web-install-button { display: block; margin: 20px 0; }
+  esp-web-install-button button { background: #7B4FC4; color: #fff; border: 0; border-radius: 6px; padding: 10px 18px; font-size: 1em; cursor: pointer; }
+  ol { padding-left: 20px; }
+  .warn { background: #fff3cd; border: 1px solid #ffe69c; border-radius: 6px; padding: 12px; margin: 16px 0; }
+  a { color: #4B2C7A; }
+</style>
+</head>
+<body>
+
+<h1>AR-LORA &middot; Argentina LORA System &mdash; Installer v1.0-lu6jmf</h1>
+
+<p>LoRa APRS firmware (iGate, digipeater, tracker) for the <strong>Heltec WiFi LoRa 32 V3</strong> (433 MHz), based on ESP32APRS_LoRa (nakhonthai) with the core of AR-APRS (LU6JMF). Flashes everything in a single click, directly from your browser (Chrome or Edge), no software installation needed.</p>
+
+<div class="box">
+  <ol>
+    <li>Screw the 433 MHz antenna on <strong>before</strong> powering the board (transmitting without an antenna can damage the radio).</li>
+    <li>Connect the Heltec V3 to your computer via USB cable.</li>
+    <li>Click the button below and select the board's serial port.</li>
+    <li>Wait for flashing to finish (~1 minute).</li>
+  </ol>
+
+  <esp-web-install-button manifest="./manifest.json">
+    <button slot="activate">Install AR-LORA v1.0-lu6jmf</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer (doesn't work on mobile).</span>
+    <span slot="not-allowed">This page needs to be served over HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+</div>
+
+<div class="box">
+  <p><strong>First access:</strong> connect to the WiFi network <code>AR-LORA_AP</code> (no password), open <code>http://192.168.4.1</code> and log in with <code>admin</code> / <code>admin</code>. The board starts with callsign NOCALL and every mode off: it does not transmit until you configure it. Default radio: 433.775 MHz, SF12, BW 125 kHz, CR 4/5, sync 0x12 (LoRa APRS standard).</p>
+</div>
+
+<div class="warn">
+  <strong>Warning:</strong> this erases everything currently on the board (including its configuration) and flashes from scratch.
+</div>
+
+<div class="box">
+  <p>Already running AR-LORA and want to update without USB? See the <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/latest">release notes</a> ("Existing device" section).</p>
+</div>
+
+<p>Repository: <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa">github.com/marceloferreirachile/ESP32APRS_LoRa</a></p>
+
+<p style="font-size:0.85em;opacity:0.8">License: GNU GPL v3, based on ESP32APRS by Somkiat Nakhonthai (HS5TQA). The complete source code of any released version is available on request, free of charge, for at least 3 years: <a href="mailto:marcelobrachile@gmail.com">marcelobrachile@gmail.com</a> (include the version number).</p>
+
+</body>
+</html>
