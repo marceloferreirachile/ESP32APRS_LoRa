@@ -1,9 +1,9 @@
 {
-  "version": "1.0",
+  "version": "1.1-beta",
   "build": "lu6jmf",
-  "date": "2026-10-10",
-  "tag": "v1.0-lu6jmf",
-  "filename": "HELTEC_V3_v1.0-lu6jmf.bin",
+  "date": "2026-10-11",
+  "tag": "v1.1-beta-lu6jmf",
+  "filename": "HELTEC_V3_v1.1-beta-lu6jmf.bin",
   "fs_version": "1.0",
   "fs_build": "lu6jmf",
   "fs_date": "2026-10-10",

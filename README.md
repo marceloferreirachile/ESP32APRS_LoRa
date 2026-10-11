@@ -1,6 +1,6 @@
 # AR-LORA · Argentina LORA System
 
-LoRa APRS firmware (iGate, digipeater, tracker) for the **Heltec WiFi LoRa 32 V3 (433 MHz)**, by LU6JMF (Marcelo, Concepción del Uruguay, Entre Ríos, Argentina).
+LoRa APRS firmware (iGate, digipeater, tracker) for the **Heltec WiFi LoRa 32 V3** and the **Heltec Wireless Tracker V1.1** (433 MHz), by LU6JMF (Marcelo, Concepción del Uruguay, Entre Ríos, Argentina).
 
 It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APRS** (the LU6JMF audio APRS firmware):
 - TX queue with priorities and scheduler;
@@ -14,6 +14,8 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 ## Install
 
+**Current version: v1.1-beta-lu6jmf (beta)**, which adds the Wireless Tracker, Bluetooth (BLE KISS TNC) and a button menu. Previous stable for the Heltec V3: v1.0-lu6jmf.
+
 **New board / full reset (USB):** use the one-click browser installer: **https://marceloferreirachile.github.io/ESP32APRS_LoRa/**
 
 **First access:**
@@ -23,7 +25,7 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 The board starts with callsign NOCALL and every mode off, so it does not transmit until configured.
 
-**Existing board, no USB:** About tab → Manual Firmware Update → upload `HELTEC_V3_v1.0-lu6jmf.bin` from the [latest release](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/latest). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
+**Existing board, no USB:** About tab → Manual Firmware Update → upload the file for your board (`HELTEC_V3_v1.1-beta-lu6jmf.bin` or `HELTEC_TRACKER_v1.1-beta-lu6jmf.bin`) from the [releases](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
 
 ## License / source code
 

@@ -18,23 +18,35 @@
 </head>
 <body>
 
-<h1>AR-LORA &middot; Argentina LORA System &mdash; Installer v1.0-lu6jmf</h1>
+<h1>AR-LORA &middot; Argentina LORA System &mdash; Installer v1.1-beta-lu6jmf</h1>
 
-<p>LoRa APRS firmware (iGate, digipeater, tracker) for the <strong>Heltec WiFi LoRa 32 V3</strong> (433 MHz), based on ESP32APRS_LoRa (nakhonthai) with the core of AR-APRS (LU6JMF). Flashes everything in a single click, directly from your browser (Chrome or Edge), no software installation needed.</p>
+<p>LoRa APRS firmware (iGate, digipeater, tracker) for the <strong>Heltec WiFi LoRa 32 V3</strong> and the <strong>Heltec Wireless Tracker V1.1</strong> (433 MHz), based on ESP32APRS_LoRa (nakhonthai) with the core of AR-APRS (LU6JMF). Flashes everything in a single click, directly from your browser (Chrome or Edge), no software installation needed.</p>
+
+<div class="warn">
+  <strong>Beta:</strong> v1.1-beta adds the Heltec Wireless Tracker, Bluetooth (BLE KISS TNC for phone apps) and a button menu. It is still being field-tested. For the Heltec V3, the previous stable version is <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/tag/v1.0-lu6jmf">v1.0-lu6jmf</a>.
+</div>
 
 <div class="box">
   <ol>
     <li>Screw the 433 MHz antenna on <strong>before</strong> powering the board (transmitting without an antenna can damage the radio).</li>
-    <li>Connect the Heltec V3 to your computer via USB cable.</li>
-    <li>Click the button below and select the board's serial port.</li>
+    <li>Connect the board to your computer via USB cable.</li>
+    <li>Click the button for <strong>your</strong> board and select its serial port.</li>
     <li>Wait for flashing to finish (~1 minute).</li>
   </ol>
 
   <esp-web-install-button manifest="./manifest.json">
-    <button slot="activate">Install AR-LORA v1.0-lu6jmf</button>
+    <button slot="activate">Install on Heltec V3</button>
     <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer (doesn't work on mobile).</span>
     <span slot="not-allowed">This page needs to be served over HTTPS to work (it already is).</span>
   </esp-web-install-button>
+
+  <esp-web-install-button manifest="./manifest-tracker.json">
+    <button slot="activate">Install on Wireless Tracker</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer (doesn't work on mobile).</span>
+    <span slot="not-allowed">This page needs to be served over HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+
+  <p style="font-size:0.9em">Each button installs the version built for that board. Installing the wrong one will not work correctly. If the Wireless Tracker does not show up as a serial port, unplug it, hold its BOOT button (the one that is not RST) while plugging the USB cable back in, then try again.</p>
 </div>
 
 <div class="box">
@@ -46,7 +58,7 @@
 </div>
 
 <div class="box">
-  <p>Already running AR-LORA and want to update without USB? See the <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/latest">release notes</a> ("Existing device" section).</p>
+  <p>Already running AR-LORA and want to update without USB? See the <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/tag/v1.1-beta-lu6jmf">release notes</a> ("Existing device" section).</p>
 </div>
 
 <p>Repository: <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa">github.com/marceloferreirachile/ESP32APRS_LoRa</a></p>
