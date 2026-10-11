@@ -41,3 +41,11 @@ A placa LoRa deve receber AO MESMO TEMPO:
 - [ ] **Login de fábrica:** confirmar com o Marcelo se fica `admin`/`admin` ou `admin`/`Admin` (pergunta em aberto em 10/out).
 - [ ] **Ícone do símbolo na página IGATE/DIGI:** a imagem ainda vem de `aprs.nakhonthai.net`. No áudio já foi resolvido com "servidor primeiro, fallback local".
 - [ ] **Nome do job no `/txdebug`:** o status do digi aparece como "DIGI POS" porque usa `LU6JMF_TXJOB_DIGI_POSITION`. Separar para não confundir.
+- [ ] **BLE derruba a Wireless Tracker V1.1 (10/out/2026, bloqueia a 1.1):** o testador de Buenos Aires ligou o Bluetooth (bin `1.1-dev-lu6jmf-test`, commit db1ebb7) e a placa entrou em loop de reinícios. Saiu com reinstalação.
+  - No código, `bluetooth_init()` (NimBLE + NuSerial) roda no `taskNetwork` logo depois do `webService()`, então a placa reinicia antes de dar para desligar o BLE pela página.
+  - Causa ainda não confirmada, falta o log serial (Guru Meditation/Backtrace). Hipóteses a verificar, não confirmadas:
+    - falta de memória (sem PSRAM, mais o buffer da TFT de cerca de 25 KB);
+    - conflito BLE/WiFi.
+  - Teste a fazer: ligar o BLE na V3 (LU6JMF-3, `heltec_V3_GPS` também tem `-DBLUETOOTH`) com USB no Mac e o monitor serial com decoder. Isso mostra se o problema é geral, e afetaria a 1.0 publicada, ou só da Tracker.
+  - Saída do loop: segurar o PRG durante a tela de boot ("Factory Reset!") sobe com os padrões só em RAM; o default.cfg antigo continua lá até um Apply. Melhoria possível: proteção contra loop, que desliga o BLE depois de N reinícios seguidos.
+  - O perfil BLE (serviço 00000001-ba2a-…, notify 0003, write 0002) é o mesmo do app aprs.fi/Mobilinkd. Usar o MODE KISS.
