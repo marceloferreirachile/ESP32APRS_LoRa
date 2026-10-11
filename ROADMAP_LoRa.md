@@ -49,3 +49,22 @@ A placa LoRa deve receber AO MESMO TEMPO:
   - Teste a fazer: ligar o BLE na V3 (LU6JMF-3, `heltec_V3_GPS` também tem `-DBLUETOOTH`) com USB no Mac e o monitor serial com decoder. Isso mostra se o problema é geral, e afetaria a 1.0 publicada, ou só da Tracker.
   - Saída do loop: segurar o PRG durante a tela de boot ("Factory Reset!") sobe com os padrões só em RAM; o default.cfg antigo continua lá até um Apply. Melhoria possível: proteção contra loop, que desliga o BLE depois de N reinícios seguidos.
   - O perfil BLE (serviço 00000001-ba2a-…, notify 0003, write 0002) é o mesmo do app aprs.fi/Mobilinkd. Usar o MODE KISS.
+  - **Medido na V3 (11/out, build de diagnóstico):** BLE desligado ~117 KB livres estável; BLE ligado ~47 KB (mínimo 24 KB). O BLE consome cerca de 70 KB.
+    - Abaixo de 50 KB por mais de 5 s, a proteção "Automatic Restart when heap memory not enough" (`loop()`) reinicia a placa → loop. Confirmado pelo backtrace com o ELF certo.
+    - O reinício ainda dá `assert failed`, porque `vTaskSuspendAll()` vem antes de `WiFi.disconnect()`. Corrigir a ordem.
+    - Tentativa 1 (não testada, no `platformio.ini` da V3 e da Tracker): `CONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED`, `ROLE_OBSERVER_DISABLED`, `MAX_CONNECTIONS=1`. Se não bastar: desativar o BLE sem PSRAM ou desligar o AP com o BLE ativo.
+  - **Resolvido (11/out), no mesmo critério do CA2RXU: BLE e WiFi nunca juntos.**
+    - BLE desabilitado: WiFi normal.
+    - BLE habilitado (gravado): todo boot tem 2 min de WiFi (janela para desabilitar o BLE pela página); depois WiFi OFF e BLE ON.
+    - Apply no bloco Bluetooth grava e reinicia. A página agora mostra a resposta real da placa (antes era sempre "Submited Successfully").
+    - PRG 2 s na tela WiFi do display com BLE ativo: reinicia (volta a janela de WiFi).
+    - Reinício por memória baixa corrigido: WiFi off antes do `vTaskSuspendAll()`. Mesmo ajuste no auto-reset.
+    - NimBLE só periférico, 1 conexão (`platformio.ini` da V3 e da Tracker).
+    - Medido na V3: BLE ON + WiFi OFF = ~93 KB livres estável (mínimo 88 KB).
+    - App aprs.fi (iPhone) conectou na V3 e o envio de baliza pelo app pareceu funcionar. Falta testar RX com tráfego (Buenos Aires).
+- [ ] **Menu do botão PRG (implementado 11/out, falta compilar e testar na V3 e na Tracker):**
+  - 1 toque = próxima página (espera 0,4 s para ver se é toque duplo). 2 toques = MENU: Screen OFF, BLE ON/WiFi OFF ou BLE OFF/WiFi ON (grava e reinicia), Power OFF, Reboot, Factory Reset, Exit.
+  - No menu: 1 toque = próximo item, segurar 2 s = escolher. Power OFF, Reboot e Factory Reset pedem confirmação. Fecha sozinho com 15 s sem uso.
+  - Power OFF saiu da página System (segurar 2 s) e foi para o menu; religa com o PRG (deep sleep com ext0 no GPIO0). Consumo em deep sleep (display/rádio) não medido.
+  - Factory Reset ao ligar: só com o PRG segurado 15 s (contagem na tela, soltar cancela). Grava os padrões no default.cfg (apaga a configuração) e reinicia.
+  - msgBox agora desenha também na TFT da Tracker (antes só no OLED).
