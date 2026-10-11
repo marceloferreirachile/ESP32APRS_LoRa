@@ -1,5 +1,36 @@
 # AR-LORA — releases e procedimento de publicação
 
+## v1.1-beta-lu6jmf — 11/out/2026 (pre-release)
+- **Código:** tag privada `v1.1-beta-lu6jmf` (commit `2a29f68`), branch `lu6jmf/from-2.1.5`.
+- **Público:** commit `ff2d601` no `master`. Release `v1.1-beta-lu6jmf` marcada como **pre-release**, com `HELTEC_V3_v1.1-beta-lu6jmf.bin`, `HELTEC_TRACKER_v1.1-beta-lu6jmf.bin`, `main_shell.html`, `style.css` e `icons.dat`. Os arquivos web são idênticos aos do 1.0.
+- **Instalador:** um botão por placa.
+  - `manifest.json` → `docs/bin/heltec_v3/`;
+  - `manifest-tracker.json` → `docs/bin/tracker/`.
+  - Mesmas posições de gravação do 1.0.
+- **version.json:** 1.1-beta. Decisão do Marcelo: avisar quem está no 1.0.
+- **md5 conferido na release:**
+  - V3 `2d0fdc66…`;
+  - Tracker `7f68f574…`.
+  - Idênticos aos compilados.
+- **Novidades:**
+  - Wireless Tracker V1.1;
+  - BLE KISS TNC alternando com o WiFi (janela de 2 min);
+  - menu do PRG;
+  - Factory Reset com 15 s;
+  - KISS reconhecido automaticamente;
+  - reinícios limpos.
+- **Validado na LU6JMF-3 (V3.2):**
+  - BLE com 92 KB livres;
+  - APRSSwift e aprs.fi conectam;
+  - baliza do app vai para a fila de TX (`[KISS] TX queued`);
+  - menu: BLE ON e BLE mode.
+- **Falta confirmar (Buenos Aires):**
+  - Tracker com o menu na TFT;
+  - Power OFF / acordar com o PRG;
+  - contagem de 15 s;
+  - RX de outras estações e envio dos pacotes recebidos ao celular;
+  - baliza do app chegando ao aprs.fi por iGate LoRa.
+
 ## v1.0-lu6jmf — 10/out/2026
 - **Código:** tag privada `v1.0-lu6jmf` (commit `1eba251`), branch `lu6jmf/from-2.1.5`, repositório privado `ESP32APRS_LoRa-LU6JMF`.
 - **Público:** https://github.com/marceloferreirachile/ESP32APRS_LoRa (branch `master`, só binários, instalador, README e LICENSE).
