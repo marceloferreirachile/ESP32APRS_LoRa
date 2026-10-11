@@ -10,6 +10,8 @@
 #include <Arduino.h>
 #include <AsyncTCP.h>
 #include <esp_task_wdt.h>
+#include "driver/rtc_io.h" // LU6JMF: Power OFF do menu acorda com o PRG
+#include "esp_sleep.h"
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include "main.h"
@@ -4716,9 +4718,23 @@ void postTransmission()
 }
 
 #ifdef BLUETOOTH
+// LU6JMF (11/out/2026): Bluetooth e WiFi nunca juntos (mesmo criterio do CA2RXU).
+// Medido na Heltec V3 sem PSRAM: WiFi+web+iGate ~113 KB livres; BLE come ~70 KB e
+// os picos do WiFi ~60 KB -> abaixo do limite de 50 KB -> reinicio em loop.
+// Regra:
+// - BLE desabilitado: WiFi normal, sempre.
+// - BLE habilitado (gravado na config): todo boot sobe com WiFi por 2 minutos (janela
+//   para entrar na pagina e desabilitar o BLE); depois desliga o WiFi e liga o BLE.
+// - Apply no bloco Bluetooth da pagina grava e reinicia a placa (pedido do Marcelo).
+// - Para voltar ao WiFi: reiniciar (ou PRG 2 s na pagina WiFi do display) e, dentro
+//   dos 2 minutos, desabilitar o BLE na pagina WiFi -> fica WiFi on / BLE off.
+#define BLE_WIFI_WINDOW_MS (2UL * 60UL * 1000UL)
+volatile bool bleActive = false;     // BLE rodando (WiFi desligado)
+volatile bool bleSwitchReq = false;  // Apply no bloco Bluetooth: reiniciar a placa
+volatile bool bleKissSeen = false;   // app mandou KISS com MODE em TNC2: link passa a KISS
+
 void bluetooth_init()
 {
-    if (config.bt_master == true)
     {
 #if !defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32C6)
         // Initialize BLE stack and Nordic UART service
@@ -4743,6 +4759,9 @@ void bluetooth_init()
 #define WDT_TIMEOUT 10
 
 bool AFSKInitAct = false;
+#if defined OLED || defined ST7735_160x80
+static void lu6ScreenLines(const char *title, const char *const *lines, uint8_t n, int8_t sel); // LU6JMF menu
+#endif
 void setup()
 {
     // byte *ptr;
@@ -4836,7 +4855,7 @@ void setup()
 
     Serial.println();
     Serial.println("Start " BRAND_SHORT " V" + String(VERSION));
-    Serial.println("Push BOOT after 3 sec for Factory Default config.");
+    Serial.println("Hold PRG 15 s at boot for Factory Reset.");
 
 // if (!EEPROM.begin(EEPROM_SIZE))
 // {
@@ -5097,26 +5116,51 @@ void setup()
 
     if (digitalRead(BOOT_PIN) == LOW)
     {
-        defaultConfig();
-        Serial.println("Manual Default configure!");
-#ifdef OLED
-        display.clearDisplay();
-        display.setCursor(10, 22);
-        display.print("Factory Reset!");
-        display.display();
-#elif defined(ST7735_160x80)
-        display.fillScreen(ST77XX_BLACK);
-        display.setCursor(10, 35);
-        display.print("Factory Reset!");
-        display.display();
-#endif
+        // LU6JMF (11/out/2026): Factory Reset so segurando o PRG 15 s. Antes bastava o PRG
+        // estar apertado neste momento (facil de acontecer sem querer, o mesmo botao troca
+        // as paginas). Soltar antes dos 15 s = boot normal. O reset grava os padroes de
+        // fabrica no default.cfg (apaga a configuracao) e reinicia.
+        uint32_t t0 = millis();
+        int lastLeft = -1;
+        bool doReset = false;
         while (digitalRead(BOOT_PIN) == LOW)
         {
-            delay(500);
-            LED_Status(0, 0, 0);
-            delay(500);
-            LED_Status(255, 255, 255);
+            int left = 15 - (int)((millis() - t0) / 1000);
+            if (left <= 0)
+            {
+                doReset = true;
+                break;
+            }
+            if (left != lastLeft)
+            {
+                lastLeft = left;
+                char l1[24];
+                snprintf(l1, sizeof(l1), "in %d s", left);
+                Serial.printf("Factory Reset %s (release PRG to cancel)\n", l1);
+#if defined OLED || defined ST7735_160x80
+                const char *lines[] = {l1, "Release PRG: cancel"};
+                lu6ScreenLines("Factory Reset", lines, 2, -1);
+#endif
+            }
+            LED_Status((left & 1) ? 255 : 0, 0, 0);
+            delay(50);
         }
+        LED_Status(0, 0, 0);
+        if (doReset)
+        {
+            defaultConfig();
+            saveConfiguration("/default.cfg", config);
+            Serial.println("Factory Reset done. Restarting.");
+#if defined OLED || defined ST7735_160x80
+            const char *lines[] = {"Done.", "Release PRG..."};
+            lu6ScreenLines("Factory Reset!", lines, 2, -1);
+#endif
+            while (digitalRead(BOOT_PIN) == LOW)
+                delay(100);
+            delay(500);
+            esp_restart();
+        }
+        Serial.println("Factory Reset cancelled.");
     }
     LED_Status(0, 0, 0);
 
@@ -6645,10 +6689,14 @@ void loraKissTx(uint8_t *frame, size_t len)
     AX25Msg msg;
     ax25_decode(frame, len, 0, &msg);
     if (msg.len == 0 || !isValidCallsignChars(msg.src.call))
+    {
+        Serial.printf("[KISS] frame %u bytes REJECTED (info len %u, src '%s')\n", (unsigned)len, (unsigned)msg.len, msg.src.call);
         return;
+    }
     String tnc2;
     if (packet2Raw(tnc2, msg) > 0)
     {
+        Serial.printf("[KISS] TX queued: %s\n", tnc2.c_str());
         pkgTxPushJob(tnc2.c_str(), tnc2.length(), 0, RF_CHANNEL,
                      LU6JMF_TXJOB_EXTERNAL, LU6JMF_TXPRIO_NORMAL);
     }
@@ -6682,7 +6730,342 @@ void msgBox(String msg)
     display.setCursor(x1, y1 + 5);
     display.print(msg);
     display.display();
+#elif defined(ST7735_160x80)
+    // LU6JMF: o msgBox nao desenhava nada na TFT da Wireless Tracker
+    ledcWrite(ST7735_LED_K_Pin, config.disp_brightness);
+    display.setFont();
+    display.setTextSize(1);
+    int x = msg.length() * 6;
+    int x1 = (SCREEN_WIDTH / 2) - (x / 2);
+    int y1 = (SCREEN_HEIGHT / 2) - 4;
+    display.fillRect(x1 - 7, y1 - 8, x + 14, 24, BLACK);
+    display.drawRect(x1 - 5, y1 - 6, x + 10, 20, WHITE);
+    display.setTextColor(WHITE);
+    display.setCursor(x1, y1);
+    display.print(msg);
+    display.display();
 #endif
+}
+#endif
+
+#if defined OLED || defined ST7735_160x80
+// ---------------------------------------------------------------------------
+// LU6JMF (11/out/2026): menu do botao PRG, no modelo do CA2RXU.
+//   1 toque  = proxima pagina (igual antes; espera 0,4 s para ver se e toque duplo)
+//   2 toques = abre o MENU: Screen OFF, BLE OFF / WiFi ON ou BLE ON / WiFi OFF (conforme o estado),
+//              BLE mode KISS/TNC2 (troca na hora, sem reiniciar), Power OFF (religa com o PRG),
+//              Reboot, Factory Reset, Exit
+//   No menu: 1 toque = proximo item, segurar 2 s = escolher.
+//   Power OFF, Reboot e Factory Reset pedem confirmacao (segurar 2 s = sim, 1 toque = nao).
+//   O menu fecha sozinho depois de 15 s sem uso.
+// ---------------------------------------------------------------------------
+bool lu6MenuActive = false;
+bool lu6ScreenOff = false;
+static uint8_t lu6MenuSel = 0;
+static int8_t lu6Confirm = -1;
+static uint32_t lu6MenuLastMs = 0;
+static bool lu6ClickPending = false;
+static uint32_t lu6ClickMs = 0;
+enum
+{
+    LU6_SCREEN_OFF,
+    LU6_BLE_OFF,
+    LU6_BLE_ON,
+    LU6_BLE_MODE,
+    LU6_POWER_OFF,
+    LU6_REBOOT,
+    LU6_FACTORY,
+    LU6_EXIT
+};
+static uint8_t lu6Items[7];
+static uint8_t lu6ItemCount = 0;
+#define LU6_DBLCLICK_MS 400
+#define LU6_MENU_TIMEOUT_MS 15000
+
+static const char *lu6ItemName(uint8_t id)
+{
+    switch (id)
+    {
+    case LU6_SCREEN_OFF:
+        return "Screen OFF";
+    case LU6_BLE_OFF:
+        return "BLE OFF / WiFi ON";
+    case LU6_BLE_ON:
+        return "BLE ON / WiFi OFF";
+    case LU6_BLE_MODE:
+        return config.bt_mode == 2 ? "BLE mode: KISS" : "BLE mode: TNC2";
+    case LU6_POWER_OFF:
+        return "Power OFF";
+    case LU6_REBOOT:
+        return "Reboot";
+    case LU6_FACTORY:
+        return "Factory Reset";
+    default:
+        return "Exit";
+    }
+}
+
+static void lu6BuildItems()
+{
+    lu6ItemCount = 0;
+    lu6Items[lu6ItemCount++] = LU6_SCREEN_OFF;
+#ifdef BLUETOOTH
+    lu6Items[lu6ItemCount++] = config.bt_master ? LU6_BLE_OFF : LU6_BLE_ON;
+    lu6Items[lu6ItemCount++] = LU6_BLE_MODE;
+#endif
+    lu6Items[lu6ItemCount++] = LU6_POWER_OFF;
+    lu6Items[lu6ItemCount++] = LU6_REBOOT;
+    lu6Items[lu6ItemCount++] = LU6_FACTORY;
+    lu6Items[lu6ItemCount++] = LU6_EXIT;
+}
+
+// Title bar + up to 5 lines. sel >= 0 marks the selected line with "> ".
+static void lu6ScreenLines(const char *title, const char *const *lines, uint8_t n, int8_t sel)
+{
+#ifdef OLED
+    display.clearDisplay();
+    display.setFont();
+    display.setTextSize(1);
+    display.fillRect(0, 0, SCREEN_WIDTH, 9, WHITE);
+    display.setTextColor(BLACK);
+    display.setCursor(2, 1);
+    display.print(title);
+    display.setTextColor(WHITE);
+    for (uint8_t i = 0; i < n; i++)
+    {
+        display.setCursor(2, 10 + i * 9); // 6 linhas cabem em 64 px
+        if (sel >= 0)
+            display.print(i == sel ? "> " : "  ");
+        display.print(lines[i]);
+    }
+    display.display();
+#elif defined(ST7735_160x80)
+    ledcWrite(ST7735_LED_K_Pin, config.disp_brightness);
+    display.fillScreen(BLACK);
+    display.setFont();
+    display.setTextSize(1);
+    display.fillRect(0, 0, SCREEN_WIDTH, 11, WHITE);
+    display.setTextColor(BLACK);
+    display.setCursor(2, 2);
+    display.print(title);
+    display.setTextColor(WHITE);
+    for (uint8_t i = 0; i < n; i++)
+    {
+        display.setCursor(2, 13 + i * 11); // 6 linhas cabem em 80 px
+        if (sel >= 0)
+            display.print(i == sel ? "> " : "  ");
+        display.print(lines[i]);
+    }
+    display.display();
+#endif
+}
+
+static void lu6DrawMenu()
+{
+    // Janela de ate 5 itens que acompanha a selecao (7 itens nao cabem no OLED 64 px).
+    const uint8_t maxVis = 5;
+    uint8_t vis = lu6ItemCount < maxVis ? lu6ItemCount : maxVis;
+    uint8_t start = (lu6MenuSel < vis) ? 0 : (lu6MenuSel - vis + 1);
+    const char *names[maxVis];
+    for (uint8_t i = 0; i < vis; i++)
+        names[i] = lu6ItemName(lu6Items[start + i]);
+    lu6ScreenLines("MENU   hold 2s = OK", names, vis, lu6MenuSel - start);
+}
+
+static void lu6DrawConfirm(uint8_t id)
+{
+    const char *lines[] = {"Hold 2s = YES", "Press   = NO"};
+    lu6ScreenLines(id == LU6_FACTORY ? "Factory Reset?" : (id == LU6_POWER_OFF ? "Power OFF?" : "Reboot?"), lines, 2, -1);
+}
+
+static void lu6ResumePages()
+{
+    showDisp = true;
+    timeSec = timeHalfSec = millis();
+    oledSleepTimeout = millis() + (config.oled_timeout * 1000);
+}
+
+static void lu6CloseMenu()
+{
+    lu6MenuActive = false;
+    lu6Confirm = -1;
+    lu6ResumePages();
+}
+
+static void lu6ScreenOffNow()
+{
+#ifdef OLED
+    display.clearDisplay();
+    display.display();
+#elif defined(ST7735_160x80)
+    display.fillScreen(BLACK);
+    display.display();
+    ledcWrite(ST7735_LED_K_Pin, 0);
+#endif
+}
+
+static void lu6Wake()
+{
+    lu6ScreenOff = false;
+#ifdef ST7735_160x80
+    ledcWrite(ST7735_LED_K_Pin, config.disp_brightness);
+#endif
+    lu6ResumePages();
+}
+
+static void lu6RestartMsg(const char *title, const char *l1)
+{
+    const char *lines[] = {l1, "Restarting..."};
+    lu6ScreenLines(title, lines, 2, -1);
+    Serial.printf("[MENU] %s: %s, restarting\n", title, l1);
+    delay(1500);
+    esp_restart();
+}
+
+static void lu6Exec(uint8_t id)
+{
+    switch (id)
+    {
+    case LU6_SCREEN_OFF:
+        lu6MenuActive = false;
+        lu6Confirm = -1;
+        lu6ScreenOff = true;
+        lu6ScreenOffNow();
+        break;
+    case LU6_BLE_OFF:
+        config.bt_master = false;
+        saveConfiguration("/default.cfg", config);
+        lu6RestartMsg("BLE OFF", "WiFi ON");
+        break;
+    case LU6_BLE_ON:
+        // Mesmo efeito do Apply na pagina: grava e reinicia; depois do boot ha 2 min
+        // de WiFi e entao WiFi OFF / BLE ON (ver bluetooth_init).
+        config.bt_master = true;
+        saveConfiguration("/default.cfg", config);
+        lu6RestartMsg("BLE ON", "WiFi OFF in 2 min");
+        break;
+#ifdef BLUETOOTH
+    case LU6_BLE_MODE:
+        // Troca KISS <-> TNC2 na hora: o modo e lido a cada pacote, nao precisa reiniciar.
+        config.bt_mode = (config.bt_mode == 2) ? 1 : 2;
+        bleKissSeen = false;
+        saveConfiguration("/default.cfg", config);
+        Serial.printf("[MENU] BLE mode -> %s\n", config.bt_mode == 2 ? "KISS" : "TNC2");
+        lu6DrawMenu();
+        break;
+#endif
+    case LU6_POWER_OFF:
+    {
+        const char *lines[] = {"Press PRG to turn on"};
+        lu6ScreenLines("Power OFF", lines, 1, -1);
+        Serial.println("[MENU] Power OFF (deep sleep, PRG wakes up)");
+        while (digitalRead(BOOT_PIN) == LOW) // soltar o PRG antes (senao acorda na hora)
+            delay(50);
+        delay(1500);
+        lu6ScreenOffNow();
+        // Acorda com o PRG (GPIO0 e um pino RTC no ESP32-S3) -> boot normal.
+        rtc_gpio_pullup_en((gpio_num_t)BOOT_PIN);
+        rtc_gpio_pulldown_dis((gpio_num_t)BOOT_PIN);
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_PIN, 0);
+        esp_deep_sleep_start();
+        break;
+    }
+    case LU6_REBOOT:
+        lu6RestartMsg("Reboot", "");
+        break;
+    case LU6_FACTORY:
+        defaultConfig();
+        saveConfiguration("/default.cfg", config);
+        lu6RestartMsg("Factory Reset", "Done.");
+        break;
+    default:
+        lu6CloseMenu();
+        break;
+    }
+}
+
+// PRG held 2 s while the menu is open or the screen is off
+static void lu6MenuLong()
+{
+    lu6MenuLastMs = millis();
+    if (lu6ScreenOff)
+    {
+        lu6Wake();
+        return;
+    }
+    if (lu6Confirm >= 0)
+    {
+        lu6Exec((uint8_t)lu6Confirm);
+        return;
+    }
+    uint8_t id = lu6Items[lu6MenuSel];
+    if (id == LU6_REBOOT || id == LU6_FACTORY || id == LU6_POWER_OFF)
+    {
+        lu6Confirm = id;
+        lu6DrawConfirm(id);
+    }
+    else
+    {
+        lu6Exec(id);
+    }
+}
+
+static void lu6NextPage()
+{
+    StandByTick = millis() + (config.pwr_stanby_delay * 1000);
+    if (save_mode)
+        save_act = true;
+    showDisp = true;
+    timeSec = timeHalfSec = millis();
+    curTab++;
+    if (curTab > 7)
+        curTab = 0;
+    log_d("curTab=%d", curTab);
+}
+
+static void lu6ShortPress()
+{
+    if (lu6ScreenOff)
+    {
+        lu6Wake();
+        return;
+    }
+    if (lu6MenuActive)
+    {
+        lu6MenuLastMs = millis();
+        if (lu6Confirm >= 0)
+            lu6Confirm = -1; // NO
+        else
+            lu6MenuSel = (lu6MenuSel + 1) % lu6ItemCount;
+        lu6DrawMenu();
+        return;
+    }
+    if (lu6ClickPending && (millis() - lu6ClickMs) < LU6_DBLCLICK_MS)
+    {
+        lu6ClickPending = false; // double press: open the menu
+        lu6BuildItems();
+        lu6MenuSel = 0;
+        lu6Confirm = -1;
+        lu6MenuActive = true;
+        lu6MenuLastMs = millis();
+        lu6DrawMenu();
+    }
+    else
+    {
+        lu6ClickPending = true;
+        lu6ClickMs = millis();
+    }
+}
+
+static void lu6MenuTick()
+{
+    if (lu6ClickPending && (millis() - lu6ClickMs) >= LU6_DBLCLICK_MS)
+    {
+        lu6ClickPending = false; // single press: next page (as before)
+        lu6NextPage();
+    }
+    if (lu6MenuActive && (millis() - lu6MenuLastMs) > LU6_MENU_TIMEOUT_MS)
+        lu6CloseMenu();
 }
 #endif
 
@@ -6756,7 +7139,15 @@ void loop()
         if (btn_count > 200) // Push BOOT >2sec
         {
             btn_count = 0;
-            if (curTab == 0)
+            if (lu6ScreenOff || lu6MenuActive)
+            {
+                lu6MenuLong();
+                while (digitalRead(BOOT_PIN) == LOW)
+                {
+                    delay(100);
+                }
+            }
+            else if (curTab == 0)
             {
                 showDisp = true;
                 timeSec = timeHalfSec = millis();
@@ -6770,18 +7161,21 @@ void loop()
                     delay(100);
                 }
             }
-            else if (curTab == 4) // System display
-            {
-                msgBox("POWER OFF");
-                while (digitalRead(BOOT_PIN) == LOW)
-                {
-                    delay(100);
-                }
-                // PowerOff();
-                esp_deep_sleep_start();
-            }
+            // LU6JMF (11/out/2026): o POWER OFF da pagina System (segurar 2 s) foi para o
+            // menu (2 toques), com confirmacao; a placa religa com o PRG.
             else if (curTab == 6) // Wifi display
             {
+#ifdef BLUETOOTH
+                if (bleActive)
+                {
+                    msgBox("WiFi ON");
+                    while (digitalRead(BOOT_PIN) == LOW)
+                    {
+                        delay(100);
+                    }
+                    esp_restart(); // LU6JMF: reinicia -> 2 min de WiFi para desabilitar o BLE
+                }
+#endif
                 if (manualWiFi)
                 {
                     manualWiFi = false;
@@ -6832,25 +7226,15 @@ void loop()
             }
             else
             {
-                StandByTick = millis() + (config.pwr_stanby_delay * 1000);
-                if (save_mode)
-                    save_act = true;
-                showDisp = true;
-                timeSec = timeHalfSec = millis();
-                // if (oledSleepTimeout > 0)
-                //{
-                curTab++;
-                if (curTab > 7)
-                    curTab = 0;
-                //}
-                log_d("curTab=%d", curTab);
+                lu6ShortPress(); // LU6JMF: page change / double press menu
             }
         }
         btn_count = 0;
     }
+    lu6MenuTick();
 
     // Popup Display
-    if (config.oled_enable == true)
+    if (config.oled_enable == true && !lu6MenuActive && !lu6ScreenOff)
     {
         if (dispBuffer.getCount() > 0)
         {
@@ -6973,10 +7357,14 @@ void loop()
             if (++heapCount > 5)
             {
                 heapCount = 0;
-                vTaskSuspendAll();
+                // LU6JMF: WiFi off BEFORE suspending the scheduler. With the scheduler
+                // suspended, WiFi.disconnect() blocks on a mutex and aborts (assert in
+                // xQueueSemaphoreTake) instead of restarting cleanly.
+                Serial.printf("[SYS] Low heap (%u) - restarting\n", ESP.getFreeHeap());
                 WiFi.disconnect(true); // Disconnect from the network
                 WiFi.persistent(false);
                 WiFi.mode(WIFI_OFF); // Switch WiFi off
+                vTaskSuspendAll();
                 //PowerOff();
                 esp_restart();
             }
@@ -6991,11 +7379,11 @@ void loop()
         if ((config.reset_timeout > 0) && (millis() > autoResetTimeout))
         {
             autoResetTimeout = millis() + (config.reset_timeout * 60000);
-            log_d("Auto Reset System");
-            vTaskSuspendAll();
-            WiFi.disconnect(true); // Disconnect from the network
+            Serial.println("[SYS] Auto Reset (reset_timeout) - restarting");
+            WiFi.disconnect(true); // Disconnect from the network (before suspending, see low-heap restart)
             WiFi.persistent(false);
             WiFi.mode(WIFI_OFF); // Switch WiFi off
+            vTaskSuspendAll();
             // PowerOff();
             esp_restart();
         }
@@ -8460,8 +8848,17 @@ void taskAPRS(void *pvParameters)
         {
             if (NuSerial.available())
             {
-                log_d("Bluetooth RX Data: %d Byte", NuSerial.available());
-                if (config.bt_mode == 1)
+                Serial.printf("[BLE] RX %d bytes (mode %d)\n", NuSerial.available(), config.bt_mode);
+                // LU6JMF (11/out/2026): apps APRS (aprs.fi, APRSSwift) falam KISS. Se chegar um
+                // frame KISS (comeca com FEND 0xC0) com o MODE em TNC2, trata como KISS em vez de
+                // transmitir bytes binarios como texto, e passa a responder em KISS.
+                if (config.bt_mode == 1 && NuSerial.peek() == 0xC0)
+                {
+                    if (!bleKissSeen)
+                        Serial.println("[BLE] KISS frame received in TNC2 mode: switching this link to KISS");
+                    bleKissSeen = true;
+                }
+                if (config.bt_mode == 1 && !bleKissSeen)
                 { // TNC2RAW MODE
                     String rxValue = NuSerial.readString();
                     uint8_t SendMode = TNC_CHANNEL;
@@ -8471,7 +8868,7 @@ void taskAPRS(void *pvParameters)
                         SendMode |= INET_CHANNEL;
                     pkgTxPushJob(rxValue.c_str(), rxValue.length(), 1, SendMode, LU6JMF_TXJOB_EXTERNAL, LU6JMF_TXPRIO_NORMAL);
                 }
-                else if (config.bt_mode == 2)
+                else if (config.bt_mode == 2 || bleKissSeen)
                 {
                     // KISS MODE
                     size_t num = NuSerial.available();
@@ -9004,10 +9401,10 @@ void taskAPRS(void *pvParameters)
                         }
                     }
 #ifdef BLUETOOTH
-                    if (config.bt_master)
+                    if (bleActive)
                     { // Output TNC2RAW to BT Serial
                       // SerialBT.println(tnc2);
-                        if (config.bt_mode == 1)
+                        if (config.bt_mode == 1 && !bleKissSeen)
                         {
                             char *rawP = (char *)malloc(tnc2.length());
                             memcpy(rawP, tnc2.c_str(), tnc2.length());
@@ -9021,7 +9418,7 @@ void taskAPRS(void *pvParameters)
 #endif
                             free(rawP);
                         }
-                        else if (config.bt_mode == 2)
+                        else if (config.bt_mode == 2 || bleKissSeen)
                         { // KISS
                             uint8_t pkg[500];
                             int sz = kiss_wrapper(pkg);
@@ -10776,12 +11173,34 @@ void taskNetwork(void *pvParameters)
     // PPPOS_Start();    // Start PPP connection if enabled
     // #endif
 
-#ifdef BLUETOOTH
-    bluetooth_init(); // Initialize Bluetooth if enabled
-#endif
-
     for (;;)
     {
+#ifdef BLUETOOTH
+        if (bleSwitchReq)
+        {
+            // LU6JMF: Apply no bloco Bluetooth -> reinicia (deixa a resposta HTTP sair antes)
+            Serial.println("[BLE] Bluetooth settings applied - restarting");
+            vTaskDelay(1500 / portTICK_PERIOD_MS);
+            WiFi.disconnect(true);
+            WiFi.persistent(false);
+            WiFi.mode(WIFI_OFF);
+            esp_restart();
+        }
+        if (!bleActive && config.bt_master && millis() > BLE_WIFI_WINDOW_MS)
+        {
+            // LU6JMF: fim da janela de 2 min de WiFi -> WiFi off, BLE on.
+            Serial.printf("[BLE] WiFi OFF, starting Bluetooth (free heap %u)\n", ESP.getFreeHeap());
+            WiFi.disconnect(true);
+            WiFi.persistent(false);
+            WiFi.mode(WIFI_OFF);
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            bluetooth_init();
+            bleActive = true;
+            Serial.printf("[BLE] Bluetooth started (free heap %u)\n", ESP.getFreeHeap());
+            for (;;)
+                vTaskDelay(1000 / portTICK_PERIOD_MS); // rede parada ate reiniciar
+        }
+#endif
         unsigned long now = millis();
         timeNetwork = now - timeNetworkOld;
         timeNetworkOld = now;

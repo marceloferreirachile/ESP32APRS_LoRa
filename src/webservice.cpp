@@ -33,6 +33,9 @@ extern bool psramLock(TickType_t timeout = portMAX_DELAY);
 extern void psramUnlock();
 
 extern int offset;
+#ifdef BLUETOOTH
+extern volatile bool bleSwitchReq; // main.cpp: Apply Bluetooth -> reiniciar
+#endif
 
 // Helper function to allocate memory with PSRAM support
 char *allocateStringMemory(size_t size)
@@ -10625,6 +10628,7 @@ static const char *WIRELESS_TEMPLATE =
 	"<script type=\"text/javascript\">\n"
 	"$('form').submit(function (e) {\n"
 	"e.preventDefault();\n"
+	"var fid = e.currentTarget.id;\n"
 	"var data = new FormData(e.currentTarget);\n"
 	"if(e.currentTarget.id===\"formBluetooth\") document.getElementById(\"submitBluetooth\").disabled=true;\n"
 	"if(e.currentTarget.id===\"formWiFiAP\") document.getElementById(\"submitWiFiAP\").disabled=true;\n"
@@ -10636,7 +10640,7 @@ static const char *WIRELESS_TEMPLATE =
 	"contentType: false,\n"
 	"processData: false,\n"
 	"success: function (data) {\n"
-	"alert(\"Submited Successfully\");\n"
+	"if (fid===\"formBluetooth\") alert(data); else alert(\"Submited Successfully\");\n"
 	"},\n"
 	"error: function (data) {\n"
 	"alert(\"An error occurred.\");\n"
@@ -10749,7 +10753,9 @@ static const char *WIRELESS_TEMPLATE =
 	"<tr><td colspan=\"2\" align=\"right\">\n"
 	"<div><button class=\"button\" type='submit' id='submitBluetooth'  name=\"commitBluetooth\"> Apply Change </button></div>\n"
 	"<input type=\"hidden\" name=\"commitBluetooth\"/>\n"
-	"</td></tr></table><br />\n"
+	"</td></tr>\n"
+	"<tr><td colspan=\"2\" style=\"text-align: left; white-space: normal;\"><i>Note: when Bluetooth is enabled, WiFi turns OFF. If you need WiFi, restart the board and open this web page: you have 2 minutes to disable Bluetooth. That keeps WiFi ON and Bluetooth OFF until you change it again.</i></td></tr>\n"
+	"</table><br />\n"
 	"</form>"
 	"{{/if}}";
 
@@ -10937,8 +10943,19 @@ void handle_wireless(AsyncWebServerRequest *request)
 				}
 			}
 		}
+		// LU6JMF: BLE habilitado fica gravado; Apply grava e reinicia a placa.
+		// A cada boot com BLE habilitado ha 2 min de WiFi antes da troca (ver main.cpp bluetooth_init).
 		config.bt_master = btMaster;
-		saveConfig(request);
+		if (!saveConfiguration("/default.cfg", config))
+		{
+			request->send(501, "text/html", "Save config failed.");
+			return;
+		}
+		if (btMaster)
+			request->send(200, "text/html", "Saved. Restarting... WiFi stays ON for 2 minutes, then turns OFF and Bluetooth turns ON.");
+		else
+			request->send(200, "text/html", "Saved. Restarting with WiFi ON and Bluetooth OFF.");
+		bleSwitchReq = true; // main.cpp taskNetwork reinicia a placa
 	}
 	#endif
 	else
