@@ -1,11 +1,12 @@
 # AR-LORA — releases e procedimento de publicação
 
 ## v1.1-lu6jmf — 13/out/2026
-- **Código:** o mesmo do `v1.1-beta-lu6jmf`, só com `-DVERSION="1.1"`. O "Send Beacon" do menu ficou fora; está guardado em `~/dev/lu6jmf-patches/send-beacon-menu.patch`.
+- **Código:** o do `v1.1-beta-lu6jmf` com `-DVERSION="1.1"`, mais o "Send Beacon" no menu do PRG. O Send Beacon foi testado pelo Marcelo e entrou em 13/out com troca silenciosa dos .bin, sem mudar a versão. A tag `v1.1-lu6jmf` foi movida para esse commit.
 - **Motivo:** o Marcelo confirmou que tudo funcionou na Tracker em Buenos Aires (13/out).
-- **md5 do firmware:**
-  - V3 `25efdce3…`;
-  - Tracker `364b4f9b…`.
+- **md5 do firmware (final, com Send Beacon):**
+  - V3 `660a5aab…`;
+  - Tracker `70b2dc63…`.
+  - Primeira publicação, sem Send Beacon: V3 `25efdce3…`, Tracker `364b4f9b…`.
 - **littlefs:** igual ao do 1.0/1.1-beta (`8414d3cb…`).
 - **version.json:** 1.1. Avisa quem está no 1.0 e no 1.1-beta.
 
@@ -65,7 +66,7 @@
   - página 5 do OLED;
   - About.
 - **Ainda não testado:** recepção e digipeat de outras estações LoRa. Não há estações LoRa em Concepción del Uruguay; isso fica para os testes em Buenos Aires.
-- **Nota temporária:** as release notes têm a linha "Reception and digipeating of other LoRa stations will be confirmed in field tests". **Tirar depois que Buenos Aires confirmar** (`gh release edit`).
+- **Nota temporária "field tests":** retirada das release notes em 13/out (`gh release edit`). Notas públicas ficam curtas: novidades e instalação.
 
 ## Padrões de fábrica (placa nova ou Factory Reset)
 O firmware cria o `default.cfg` sozinho no primeiro boot. O instalador **não** leva nenhum `default.cfg`.
