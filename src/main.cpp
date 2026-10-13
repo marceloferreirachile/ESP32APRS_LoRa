@@ -771,6 +771,7 @@ number of pulses, and pulses per revolution */
 // }
 
 char EVENT_TX_POSITION = 0;
+volatile bool lu6BeaconReq = false; // LU6JMF: "Send Beacon" do menu do PRG (tratado na taskAPRS)
 unsigned char SB_SPEED = 0, SB_SPEED_OLD = 0;
 int16_t SB_HEADING = 0;
 uint16_t tx_interval = 0, igate_tx_interval, digi_tx_interval; // How often we transmit, in seconds
@@ -6752,7 +6753,7 @@ void msgBox(String msg)
 // ---------------------------------------------------------------------------
 // LU6JMF (11/out/2026): menu do botao PRG, no modelo do CA2RXU.
 //   1 toque  = proxima pagina (igual antes; espera 0,4 s para ver se e toque duplo)
-//   2 toques = abre o MENU: Screen OFF, BLE OFF / WiFi ON ou BLE ON / WiFi OFF (conforme o estado),
+//   2 toques = abre o MENU: Send Beacon (modos ligados), Screen OFF, BLE OFF / WiFi ON ou BLE ON / WiFi OFF (conforme o estado),
 //              BLE mode KISS/TNC2 (troca na hora, sem reiniciar), Power OFF (religa com o PRG),
 //              Reboot, Factory Reset, Exit
 //   No menu: 1 toque = proximo item, segurar 2 s = escolher.
@@ -6768,6 +6769,7 @@ static bool lu6ClickPending = false;
 static uint32_t lu6ClickMs = 0;
 enum
 {
+    LU6_SEND_BEACON,
     LU6_SCREEN_OFF,
     LU6_BLE_OFF,
     LU6_BLE_ON,
@@ -6777,7 +6779,7 @@ enum
     LU6_FACTORY,
     LU6_EXIT
 };
-static uint8_t lu6Items[7];
+static uint8_t lu6Items[8];
 static uint8_t lu6ItemCount = 0;
 #define LU6_DBLCLICK_MS 400
 #define LU6_MENU_TIMEOUT_MS 15000
@@ -6786,6 +6788,8 @@ static const char *lu6ItemName(uint8_t id)
 {
     switch (id)
     {
+    case LU6_SEND_BEACON:
+        return "Send Beacon";
     case LU6_SCREEN_OFF:
         return "Screen OFF";
     case LU6_BLE_OFF:
@@ -6808,6 +6812,7 @@ static const char *lu6ItemName(uint8_t id)
 static void lu6BuildItems()
 {
     lu6ItemCount = 0;
+    lu6Items[lu6ItemCount++] = LU6_SEND_BEACON;
     lu6Items[lu6ItemCount++] = LU6_SCREEN_OFF;
 #ifdef BLUETOOTH
     lu6Items[lu6ItemCount++] = config.bt_master ? LU6_BLE_OFF : LU6_BLE_ON;
@@ -6926,6 +6931,19 @@ static void lu6Exec(uint8_t id)
 {
     switch (id)
     {
+    case LU6_SEND_BEACON:
+    {
+        bool any = config.trk_en || (config.igate_en && config.igate_bcn) ||
+                   ((config.digi_en || config.digi_auto) && config.digi_bcn);
+        const char *lines[] = {any ? "Sending now..." : "No beacon enabled"};
+        lu6ScreenLines("Send Beacon", lines, 1, -1);
+        Serial.printf("[MENU] Send Beacon: %s\n", any ? "requested" : "no beacon enabled");
+        if (any)
+            lu6BeaconReq = true;
+        delay(1500);
+        lu6CloseMenu();
+        break;
+    }
     case LU6_SCREEN_OFF:
         lu6MenuActive = false;
         lu6Confirm = -1;
@@ -8940,6 +8958,21 @@ void taskAPRS(void *pvParameters)
         // }
         // Ax25TransmitBuffer(); // transmit buffer (will return if nothing to be transmitted)
         // Ax25TransmitCheck();  // check for pending transmission request
+
+        // LU6JMF (11/out/2026): "Send Beacon" do menu do PRG -> baliza agora dos modos ligados
+        if (lu6BeaconReq)
+        {
+            lu6BeaconReq = false;
+            if (config.trk_en)
+            {
+                EVENT_TX_POSITION = 6;
+                tx_interval = config.trk_interval;
+            }
+            if (config.igate_en && config.igate_bcn)
+                iGatetickInterval = 0;
+            if ((config.digi_en || config.digi_auto) && config.digi_bcn)
+                DiGiInterval = 0;
+        }
 
         if (config.trk_en)
         { // TRACKER MODE
