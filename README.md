@@ -14,7 +14,7 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 ## Install
 
-**Current version: v1.1-beta-lu6jmf (beta)**, which adds the Wireless Tracker, Bluetooth (BLE KISS TNC) and a button menu. Previous stable for the Heltec V3: v1.0-lu6jmf.
+**Current version: v1.1-lu6jmf**, which adds the Wireless Tracker, Bluetooth (BLE KISS TNC) and a button menu.
 
 **New board / full reset (USB):** use the one-click browser installer: **https://marceloferreirachile.github.io/ESP32APRS_LoRa/**
 
@@ -25,7 +25,7 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 The board starts with callsign NOCALL and every mode off, so it does not transmit until configured.
 
-**Existing board, no USB:** About tab → Manual Firmware Update → upload the file for your board (`HELTEC_V3_v1.1-beta-lu6jmf.bin` or `HELTEC_TRACKER_v1.1-beta-lu6jmf.bin`) from the [releases](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
+**Existing board, no USB:** About tab → Manual Firmware Update → upload the file for your board (`HELTEC_V3_v1.1-lu6jmf.bin` or `HELTEC_TRACKER_v1.1-lu6jmf.bin`) from the [releases](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
 
 ## License / source code
 
