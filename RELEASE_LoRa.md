@@ -1,5 +1,14 @@
 # AR-LORA — releases e procedimento de publicação
 
+## v1.1-lu6jmf — 13/out/2026
+- **Código:** o mesmo do `v1.1-beta-lu6jmf`, só com `-DVERSION="1.1"`. O "Send Beacon" do menu ficou fora; está guardado em `~/dev/lu6jmf-patches/send-beacon-menu.patch`.
+- **Motivo:** o Marcelo confirmou que tudo funcionou na Tracker em Buenos Aires (13/out).
+- **md5 do firmware:**
+  - V3 `25efdce3…`;
+  - Tracker `364b4f9b…`.
+- **littlefs:** igual ao do 1.0/1.1-beta (`8414d3cb…`).
+- **version.json:** 1.1. Avisa quem está no 1.0 e no 1.1-beta.
+
 ## v1.1-beta-lu6jmf — 11/out/2026 (pre-release)
 - **Código:** tag privada `v1.1-beta-lu6jmf` (commit `2a29f68`), branch `lu6jmf/from-2.1.5`.
 - **Público:** commit `ff2d601` no `master`. Release `v1.1-beta-lu6jmf` marcada como **pre-release**, com `HELTEC_V3_v1.1-beta-lu6jmf.bin`, `HELTEC_TRACKER_v1.1-beta-lu6jmf.bin`, `main_shell.html`, `style.css` e `icons.dat`. Os arquivos web são idênticos aos do 1.0.
@@ -24,6 +33,13 @@
   - APRSSwift e aprs.fi conectam;
   - baliza do app vai para a fila de TX (`[KISS] TX queued`);
   - menu: BLE ON e BLE mode.
+- **Confirmado em Buenos Aires (11/out, LU2APR, Wireless Tracker 1.1-beta):** app no celular por BLE em modo KISS.
+  - Mensagem LU2APR-8 → LU2APR-9 saiu em RF.
+  - O eco veio pelo digi LU2APR-10*.
+  - Os ACKs da LU2APR-9 chegaram ao celular.
+  - Ou seja, TX e RX pelo Bluetooth funcionando nos dois sentidos.
+  - Em modo TNC2 o app não vê nada, porque a placa manda texto e o app espera KISS.
+  - Teve um loop de reinício ao ativar o BLE, que o testador atribuiu a algo local. Causa não confirmada.
 - **Falta confirmar (Buenos Aires):**
   - Tracker com o menu na TFT;
   - Power OFF / acordar com o PRG;
