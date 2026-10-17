@@ -6,6 +6,7 @@
 - **Padrões:** NTP `pool.ntp.org`, APRS-IS `rotate.aprs2.net`, sem servidor MQTT.
 - **Ícones:** LAST HEARD pega os ícones em `vpn.tracktotal.ar` (estilo aprs.fi), e sem internet usa os da placa. Seletores de símbolo e favicon usam os da placa. jQuery das páginas TNC2/GNSS também vem da placa.
 - **Correção VPN (ESP32-S3):** com a VPN ligada a placa reiniciava em loop (Guru Meditation em `wireguard_random_bytes`, gerador aleatório do WireGuard nunca iniciado no caminho `wireguard_setup()`). Corrigido em 17/out e testado na V3 de 433 (LU6JMF-3 online na VPN). A Tracker compila (68,3%), falta testar com o testador.
+- **Cabeçalho:** no lado esquerdo, o Host Name da placa (ou o indicativo, enquanto o nome for o de fábrica "AR-LORA"), os modos ativos e a frequência LoRa com o SF, igual ao AR-APRS 2.1.6.
 - **Painel PRIME:** página aberta `/boardinfo` (JSON sem dados privados), lida pelo servidor da VPN a cada 10 min. `/sysinfo` e `/dashboard` passam a pedir login, porque mostravam o nome do Wi-Fi para quem chegasse na placa.
 
 ## v1.1-lu6jmf — 13/out/2026
