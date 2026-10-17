@@ -208,6 +208,39 @@ static String lu6jmfVpnRegJson(const String &espId)
 	return s;
 }
 
+// LU6JMF (same as AR-APRS 2.1.6): left side of the page header - which board this is: the Host Name
+// (System page); while it is still the factory name, the station callsign. Below it the enabled
+// modes and the LoRa frequency/mode.
+static String lu6jmfHeaderInfo()
+{
+	String call = String(config.host_name);
+	call.trim();
+	if (call.length() == 0 || call.equalsIgnoreCase(BRAND_DEVICE_NAME) || call.equalsIgnoreCase("ESP32APRS") || call.equalsIgnoreCase("ESP32APRS_LoRa"))
+		call = lu6jmfStationCall();
+	call.replace("&", "&amp;");
+	call.replace("<", "&lt;");
+	call.replace(">", "&gt;");
+	String h = "<div style=\"position:absolute;left:14px;top:10px;text-align:left;font-size:11px;line-height:16px;color:#d7d7d7;\">";
+	if (call.length())
+		h += "<b style=\"font-size:15px;color:#fff;\">" + call + "</b><br>";
+	else
+		h += "<b style=\"font-size:13px;color:#ffb347;\">NOCALL - not configured</b><br>";
+	String modes = lu6jmfModes();
+	modes.replace(" ", " &middot; ");
+	h += modes.length() ? modes : String("no mode enabled");
+	if (config.rf_en)
+	{
+		char f[64];
+		if (config.rf_mode == RF_MODE_LoRa)
+			snprintf(f, sizeof(f), "<br>%.3f MHz &middot; SF%d", config.rf_freq, config.rf_sf);
+		else
+			snprintf(f, sizeof(f), "<br>%.3f MHz", config.rf_freq);
+		h += f;
+	}
+	h += "</div>";
+	return h;
+}
+
 void saveConfig(AsyncWebServerRequest *request)
 {
 	String html;
@@ -389,7 +422,7 @@ void setMainPage(AsyncWebServerRequest *request)
 					 "<h1 style=\"margin-bottom:2px;\">" BRAND_SHORT "</h1>\n"
 					 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">" BRAND_LONG " &middot; V%s%s</div>\n",
 					 VERSION, VERSION_BUILD);
-			tpl.replace("{{H1}}", temp_buffer);
+			tpl.replace("{{H1}}", "<div style=\"position:relative;\">" + lu6jmfHeaderInfo() + String(temp_buffer) + "</div>");
 
 #ifdef MQTT
 			tpl.replace("{{MQTT_TAB_JS}}", "} else if (tabName == 'MQTT') {\n$(\"#contentmain\").load(\"/mqtt\");\n");
@@ -650,11 +683,14 @@ webString->print("function printLastHeard(data) {\n");
 	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\">ESP32IGate Firmware V" + String(VERSION) + "</div>\n");
 	// webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
 	// LU6JMF - Marcelo Ferreira: AR-APRS header, version generated from build data.
+	webString->print("<div style=\"position:relative;\">");
+	webString->print(lu6jmfHeaderInfo());
 	webString->print("<h1 style=\"margin-bottom:2px;\">" BRAND_SHORT "</h1>\n");
 	snprintf(temp_buffer, sizeof(temp_buffer),
 			 "<div style=\"text-align:center;font-size:11px;margin-bottom:2px;\">" BRAND_LONG " &middot; V%s%s</div>\n",
 			 VERSION, VERSION_BUILD);
 	webString->print(temp_buffer);
+	webString->print("</div>");
 	webString->print("<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\" style=\"color:#d7d7d7;\">[LOG OUT]</a></div>\n");
 	webString->print("<div class=\"row\">\n");
 	webString->print("<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
