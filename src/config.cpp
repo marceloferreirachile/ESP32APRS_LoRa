@@ -1285,6 +1285,18 @@ bool loadConfiguration(const char *filename, Configuration &config)
             strlcpy(config.digi_status, BRAND_STATUS_DIGI, sizeof(config.digi_status));
         if (strstr(config.trk_status, "github.com/nakhonthai") != NULL)
             strlcpy(config.trk_status, BRAND_STATUS_TRK, sizeof(config.trk_status));
+        // HS5TQA's VPN left on a board where the VPN is OFF -> our server, old keys/addresses cleared,
+        // so "New Register" starts clean. A board with his VPN switched ON is left alone.
+        if (!config.vpn && strstr(config.wg_peer_address, "nakhonthai") != NULL)
+        {
+            strlcpy(config.wg_peer_address, "vpn.tracktotal.ar", sizeof(config.wg_peer_address));
+            config.wg_port = 51820;
+            config.wg_local_address[0] = 0;
+            strlcpy(config.wg_netmask_address, "255.255.255.0", sizeof(config.wg_netmask_address));
+            config.wg_gw_address[0] = 0;
+            config.wg_public_key[0] = 0;
+            config.wg_private_key[0] = 0;
+        }
         if (strstr(config.ntp_host, "pool.ntp.org") != NULL && config.timeZone == 7)
             config.timeZone = -3; // Thai default UTC+7 carried over -> Argentina
 #endif
