@@ -1,5 +1,12 @@
 # AR-LORA — releases e procedimento de publicação
 
+## Próxima versão (em desenvolvimento) — mesmas regras do AR-APRS 2.1.6
+- **VPN própria:** `vpn.tracktotal.ar` no lugar do servidor do HS5TQA. O New Register salva e reinicia sozinho, manda indicativo, firmware, versão, chip, Host Name e modos, e mostra o endereço da placa pela internet (`vpn.tracktotal.ar:20000+N`).
+- **Configuração antiga do HS5TQA** (VPN desligada) é trocada pela nossa ao carregar a configuração, inclusive depois do OTA.
+- **Padrões:** NTP `pool.ntp.org`, APRS-IS `rotate.aprs2.net`, sem servidor MQTT.
+- **Ícones:** LAST HEARD pega os ícones em `vpn.tracktotal.ar` (estilo aprs.fi), e sem internet usa os da placa. Seletores de símbolo e favicon usam os da placa. jQuery das páginas TNC2/GNSS também vem da placa.
+- **Painel PRIME:** página aberta `/boardinfo` (JSON sem dados privados), lida pelo servidor da VPN a cada 10 min. `/sysinfo` e `/dashboard` passam a pedir login, porque mostravam o nome do Wi-Fi para quem chegasse na placa.
+
 ## v1.1-lu6jmf — 13/out/2026
 - **Código:** o do `v1.1-beta-lu6jmf` com `-DVERSION="1.1"`, mais o "Send Beacon" no menu do PRG. O Send Beacon foi testado pelo Marcelo e entrou em 13/out com troca silenciosa dos .bin, sem mudar a versão. A tag `v1.1-lu6jmf` foi movida para esse commit.
 - **Motivo:** o Marcelo confirmou que tudo funcionou na Tracker em Buenos Aires (13/out).

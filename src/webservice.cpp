@@ -164,6 +164,49 @@ extern Adafruit_SH1106 display;
 #endif // OLED
 
 bool defaultSetting = false;
+#define LU6JMF_FW_NAME BRAND_SHORT
+
+// LU6JMF: station callsign as shown to the user (iGate callsign + SSID), "" when not configured
+static String lu6jmfStationCall()
+{
+	String c = String(config.aprs_mycall);
+	c.trim();
+	if (c.length() == 0 || c.equalsIgnoreCase("NOCALL"))
+		return "";
+	if (config.aprs_ssid > 0)
+		c += "-" + String(config.aprs_ssid);
+	return c;
+}
+
+// LU6JMF: modes enabled, short text ("iGate Digi")
+static String lu6jmfModes()
+{
+	String m = "";
+	if (config.igate_en) m += "iGate ";
+	if (config.digi_en) m += "Digi ";
+	if (config.trk_en) m += "Tracker ";
+	if (config.wx_en) m += "WX ";
+	m.trim();
+	return m;
+}
+
+// LU6JMF: what "New Register" sends to vpn.tracktotal.ar, so the PRIME panel knows which board it is.
+// JSON is valid JavaScript; '<' escaped so a Host Name can never close the <script>.
+static String lu6jmfVpnRegJson(const String &espId)
+{
+	JsonDocument d;
+	d["name"] = espId;
+	d["call"] = lu6jmfStationCall();
+	d["fw"] = LU6JMF_FW_NAME;
+	d["ver"] = String(VERSION) + VERSION_BUILD;
+	d["chip"] = ESP.getChipModel();
+	d["host"] = config.host_name;
+	d["modes"] = lu6jmfModes();
+	String s;
+	serializeJson(d, s);
+	s.replace("<", "\\u003c");
+	return s;
+}
 
 void saveConfig(AsyncWebServerRequest *request)
 {
@@ -336,6 +379,11 @@ void setMainPage(AsyncWebServerRequest *request)
 			// of the configurable network hostname (matches the "black"
 			// palette/branding already used in the newer TX-SCHEDULER engine).
 			tpl.replace("{{TITLE}}", "<title>" BRAND_SHORT " - " BRAND_LONG "</title>\n");
+			// LU6JMF: boards updated only by OTA keep the old main_shell.html in LittleFS (HS5TQA server links)
+			tpl.replace("<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/${row.icon}\"", "<td><img src=\"https://vpn.tracktotal.ar/symbols/icons/${row.icon}\"");
+			tpl.replace("http://aprs.nakhonthai.net/symbols/icons/", "/symbols/icons/");
+			tpl.replace("<link rel=\"shortcut icon\" href=\"http://aprs.nakhonthai.net/favicon.ico\" type=\"image/x-icon\" />",
+						"<link rel=\"icon\" href=\"/symbols/icons/35-1.png\" type=\"image/png\" />");
 
 			snprintf(temp_buffer, sizeof(temp_buffer),
 					 "<h1 style=\"margin-bottom:2px;\">" BRAND_SHORT "</h1>\n"
@@ -384,7 +432,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	webString->print("<meta name=\"KeyWords\" content=\"ESP32,ESP32C3,AFSK,APRS\" />\n");
 	webString->print("<meta http-equiv=\"Cache-Control\" content=\"no-cache, no-store, must-revalidate\" />\n");
 	webString->print("<meta http-equiv=\"pragma\" content=\"no-cache\" />\n");
-	webString->print("<link rel=\"shortcut icon\" href=\"http://aprs.nakhonthai.net/favicon.ico\" type=\"image/x-icon\" />\n");
+	webString->print("<link rel=\"icon\" href=\"/symbols/icons/35-1.png\" type=\"image/png\" />\n"); // LU6JMF: icon from the board (was aprs.nakhonthai.net/favicon.ico)
 	webString->print("<meta http-equiv=\"Expires\" content=\"0\" />\n");
 
 	char temp_buffer[512];
@@ -552,7 +600,7 @@ webString->print("function printLastHeard(data) {\n");
 	webString->print("const tr = document.createElement(\"tr\");\n");
 	webString->print("tr.innerHTML = `\n");
 	webString->print("<td>${row.time}</td>\n");
-	webString->print("<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/${row.icon}\" style=\"width:20px;height:20px;\" onerror=\"iconError(this, '${row.icon}', '${(row.callsign||'?').charAt(0)}');\"><span style=\"display:none;width:20px;height:20px;\"></span></td>\n");
+	webString->print("<td><img src=\"https://vpn.tracktotal.ar/symbols/icons/${row.icon}\" style=\"width:20px;height:20px;\" onerror=\"iconError(this, '${row.icon}', '${(row.callsign||'?').charAt(0)}');\"><span style=\"display:none;width:20px;height:20px;\"></span></td>\n");
 	// Clickable callsign -> aprs.fi - custom mod by LU6JMF (Marcelo, CdU/Entre Rios, Argentina) - Set/2026
 	webString->print("<td><a style=\"text-decoration:underline;\" href=\"https://www.qrz.com/db/${encodeURIComponent(row.callsign.split('-')[0])}\" target=\"_blank\" rel=\"noopener\">${row.callsign}</a> <a href=\"https://aprs.fi/#!z=12&call=a%2F${encodeURIComponent(row.callsign)}&timerange=3600&tail=3600\" target=\"_blank\" rel=\"noopener\" title=\"Ver en aprs.fi\">🗺</a></td>\n");
 	webString->print("<td align=\"left\">${row.path}</td>\n");
@@ -806,10 +854,9 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	// 2.1.5: feed the task watchdog - this handler runs on the async_tcp task itself
 	esp_task_wdt_reset();
 	char temp_buffer[200];
-	// if (!request->authenticate(config.http_username, config.http_password))
-	// {
-	// 	return request->requestAuthentication();
-	// }
+	// LU6JMF: login required (was open: showed the WiFi network name to anyone reaching the board)
+	if (!request->authenticate(config.http_username, config.http_password))
+		return request->requestAuthentication();
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
 	JsonDocument data;
@@ -1011,7 +1058,7 @@ static const char *SYMBOL_TEMPLATE =
 	"<tr><th colspan=\"16\">{{title}}</th></tr>\n"
 	"{{#each rows}}"
 	"<tr>\n"
-	"{{#each this}}<td><img onclick=\"{{onclick}}\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{icon}}\"></td>{{/each}}"
+	"{{#each this}}<td><img onclick=\"{{onclick}}\" src=\"/symbols/icons/{{icon}}\"></td>{{/each}}"
 	"</tr>\n"
 	"{{/each}}"
 	"</table>\n<br />"
@@ -1088,8 +1135,52 @@ static const char *SYSINFO_TEMPLATE =
 	"<td><b>{{cpuTemp}}</b></td>\n"
 	"</tr>\n</table>\n";
 
+
+// LU6JMF: /boardinfo - read every few minutes by vpn.tracktotal.ar through the tunnel, for the
+// PRIME panel. Open on purpose, so it only carries what the board already shows on the air.
+void handle_boardinfo(AsyncWebServerRequest *request)
+{
+	JsonDocument d;
+	char b[48];
+	d["fw"] = LU6JMF_FW_NAME;
+	d["ver"] = String(VERSION) + VERSION_BUILD;
+	d["chip"] = ESP.getChipModel();
+	d["call"] = lu6jmfStationCall();
+	d["modes"] = lu6jmfModes();
+	d["uptime"] = (millis() / 1000) - upTimeStamp;
+	d["heapFree"] = ESP.getFreeHeap();
+	float t = temperatureRead();
+	if (!isnan(t) && t > -40.0f && t < 125.0f)
+		d["cpuTemp"] = roundf(t * 10) / 10;
+	if (VBat_Flag)
+		d["vbat"] = roundf(VBat * 100) / 100;
+	d["rf"] = config.rf_en;
+#ifdef RADIO_LORA
+	snprintf(b, sizeof(b), "%.3f", config.rf_freq);
+	d["freq"] = b;
+	if (config.rf_mode == RF_MODE_LoRa)
+		snprintf(b, sizeof(b), "SF%d BW%g CR%d", config.rf_sf, config.rf_bw, config.rf_cr);
+	else
+		snprintf(b, sizeof(b), "FSK mode %d", config.rf_mode);
+	d["loraMode"] = b;
+	d["txPower"] = config.rf_power;
+#else
+	snprintf(b, sizeof(b), "%.4f", config.freq_tx);
+	d["freqTx"] = b;
+	snprintf(b, sizeof(b), "%.4f", config.freq_rx);
+	d["freqRx"] = b;
+	d["txPower"] = config.rf_power ? "HIGH" : "LOW";
+#endif
+	String out;
+	serializeJson(d, out);
+	request->send(200, "application/json", out);
+}
+
 void handle_sysinfo(AsyncWebServerRequest *request)
 {
+	// LU6JMF: login required (was open: reachable from the Internet through the VPN port)
+	if (!request->authenticate(config.http_username, config.http_password))
+		return request->requestAuthentication();
 	JsonDocument data;
 	char temp_buffer[64];
 
@@ -3148,8 +3239,8 @@ static const char *VPN_TEMPLATE =
 	"});\n"
 	"function vpnMsg(t) { var e = document.getElementById('vpnreg'); if (e) e.textContent = t; }\n"
 	"function loadVPNConfig() {\n"
-	"const url = \"http://hs1.hs5tqa.ampr.org:81/wg/create\";\n"
-	"const espID = {'name': '{{espId}}'};\n"
+	"const url = \"https://vpn.tracktotal.ar/wg/create\";\n"
+	"const espID = {{regJson}};\n"
 	"vpnMsg('Registering... the server can take up to a minute, please wait.');\n"
 	"const ctl = new AbortController();\n"
 	"const tm = setTimeout(() => ctl.abort(), 90000);\n"
@@ -3162,7 +3253,7 @@ static const char *VPN_TEMPLATE =
 	".then(response => { if (!response.ok) throw new Error('server answered ' + response.status); return response.json(); })\n"
 	".then(data => {\n"
 	"clearTimeout(tm);\n"
-	"vpnMsg('Done. Check the fields below, then click Apply Change and reboot the device.');\n"
+	"vpnMsg('Registered. Saving...');\n"
 	"console.log(\"VPN Data:\", data);\n"
 	"document.getElementById(\"wg_enable\").checked = true;\n"
 	"document.getElementById(\"wg_peer_address\").value = data.Enpoint.split(\":\")[0];\n"
@@ -3172,6 +3263,12 @@ static const char *VPN_TEMPLATE =
 	"document.getElementById(\"wg_gw_address\").value = data.Gateway;\n"
 	"document.getElementById(\"wg_public_key\").value = data.PublicKey;\n"
 	"document.getElementById(\"wg_private_key\").value = data.PrivateKey;\n"
+	// LU6JMF: save right away and restart, so New Register is enough (no Apply Change / reboot by hand)
+	"var fd = new FormData(document.getElementById('fromVPN'));\n"
+	"fetch('/vpn',{method:'POST',body:fd})\n"
+	".then(r => { if (!r.ok) throw new Error('save answered ' + r.status); return r.text(); })\n"
+	".then(() => { vpnMsg('Saved. Restarting the board - the VPN starts in about a minute.'); var rb = new FormData(); rb.append('REBOOT','1'); setTimeout(() => fetch('/system',{method:'POST',body:rb}), 1500); })\n"
+	".catch(err => vpnMsg('Registered, but could not save (' + err + '). Click Apply Change, then reboot.'));\n"
 	"})\n"
 	".catch(err => { clearTimeout(tm); vpnMsg('Could not register: ' + err + '. Wait a minute and try again.'); console.error(\"VPN API Error:\", err); });\n}\n"
 	"</script>\n"
@@ -3203,12 +3300,14 @@ static const char *VPN_TEMPLATE =
 	"<table>\n"
 	"<th colspan=\"2\"><span><b>Helper: Free VPN Wireguard for Web Service</b></span></th>\n"
 	"<tr><td align=\"left\">1. Click New Register button to get VPN config from web service.</td></tr>\n"
-	"<tr><td align=\"left\">2. The VPN config will fill in the form automatically.</td></tr>\n"
-	"<tr><td align=\"left\">3. Click Apply Change and reboot again.</td></tr>\n"
+	"<tr><td align=\"left\">2. The board saves the VPN config and restarts by itself.</td></tr>\n"
+	"<tr><td align=\"left\">3. Wait about a minute for the VPN to connect.</td></tr>\n"
 	"<tr><td align=\"left\">4. Enjoy your free VPN service!</td></tr>\n"
 	"{{#if amprUrl}}"
 	"<tr><td>Your External by AMPR URL: <a href=\"{{amprUrl}}\" target=\"_blank\">{{amprUrl}}</a></td></tr>\n"
-	"<tr><td>Fast Direct URL: <a href=\"{{directUrl}}\" target=\"_blank\">{{directUrl}}</a></td></tr>\n"
+	"{{/if}}"
+	"{{#if directUrl}}"
+	"<tr><td>Your board from the Internet: <a href=\"{{directUrl}}\" target=\"_blank\">{{directUrl}}</a></td></tr>\n"
 	"{{/if}}"
 	"<tr><td><button type=\"button\" onclick=\"loadVPNConfig()\">New Register</button></td></tr>\n"
 	"<tr><td id=\"vpnreg\" align=\"left\"></td></tr>\n"
@@ -3335,6 +3434,7 @@ void handle_vpn(AsyncWebServerRequest *request)
 		String ESP32_ID = WiFi.macAddress();
 		ESP32_ID.replace(":", "");
 		data["espId"] = ESP32_ID;
+		data["regJson"] = lu6jmfVpnRegJson(ESP32_ID); // LU6JMF: board info for the PRIME panel
 		data["vpnEnabled"] = config.vpn;
 		data["peerAddress"] = config.wg_peer_address;
 		data["port"] = config.wg_port;
@@ -3358,9 +3458,15 @@ void handle_vpn(AsyncWebServerRequest *request)
 			data["vpnStatus"] = st;
 		}
 
-		// Check if local address starts with "10.44."
 		String wg_local_addr = String(config.wg_local_address);
-		if (wg_local_addr.startsWith("10.44."))
+		// LU6JMF: our own VPN server (vpn.tracktotal.ar, 10.66.1.N): the board's page is at port 20000+N
+		if (wg_local_addr.startsWith("10.66.1."))
+		{
+			int lastoct = wg_local_addr.substring(wg_local_addr.lastIndexOf('.') + 1).toInt();
+			data["directUrl"] = "http://vpn.tracktotal.ar:" + String(20000 + lastoct);
+		}
+		// HS5TQA server (10.44.x.y) - kept for boards still registered there
+		else if (wg_local_addr.startsWith("10.44."))
 		{
 			int lastoct = wg_local_addr.substring(wg_local_addr.lastIndexOf('.') + 1).toInt();
 			int thirdoct = wg_local_addr.substring(wg_local_addr.indexOf('.', wg_local_addr.indexOf('.') + 1) + 1, wg_local_addr.lastIndexOf('.')).toInt();
@@ -3820,7 +3926,7 @@ document.getElementById("submitObj").disabled=false;
 <tr><td align="right"><b>Enable:</b></td><td align="left"><label class="switch"><input type="checkbox" name="objEn{{num}}" value="OK"{{#if enabled}} checked{{/if}}><span class="slider round"></span></label></td></tr>
 <tr><td align="right"><b>Item/Obj Name:</b></td><td align="left"><input maxlength="9" name="objName{{num}}" type="text" value="{{name}}" />{{#if firstRow}} <i>3-9 character</i>{{/if}}</td></tr>
 <tr><td align="right"><b>Latitude / Longitude:</b></td><td align="left"><input style="width:120px;" step="any" name="objLat{{num}}" type="number" value="{{lat}}" /> <input style="width:120px;" step="any" name="objLon{{num}}" type="number" value="{{lon}}" />{{#if firstRow}} <i>independent of the digi's own position</i>{{/if}}</td></tr>
-<tr><td align="right"><b>Symbol:</b></td><td align="left">Table:<input maxlength="1" size="1" id="obj{{num}}Table" name="obj{{num}}Table" type="text" value="{{symTable}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> Symbol:<input maxlength="1" size="1" id="obj{{num}}Symbol" name="obj{{num}}Symbol" type="text" value="{{symSymbol}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> <img border="1" style="vertical-align: middle;" id="obj{{num}}ImgSymbol" onclick="openWindowSymbolObj({{idx}});" src="http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png">{{#if firstRow}} <i>*Click icon or type Table/Symbol directly</i>{{/if}}</td></tr>
+<tr><td align="right"><b>Symbol:</b></td><td align="left">Table:<input maxlength="1" size="1" id="obj{{num}}Table" name="obj{{num}}Table" type="text" value="{{symTable}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> Symbol:<input maxlength="1" size="1" id="obj{{num}}Symbol" name="obj{{num}}Symbol" type="text" value="{{symSymbol}}" style="background-color: rgb(97, 239, 170);" oninput="objSymRefresh({{idx}});" /> <img border="1" style="vertical-align: middle;" id="obj{{num}}ImgSymbol" onclick="openWindowSymbolObj({{idx}});" src="/symbols/icons/{{symImgNum}}-{{symImgTable}}.png">{{#if firstRow}} <i>*Click icon or type Table/Symbol directly</i>{{/if}}</td></tr>
 <tr><td align="right"><b>Text/Comment:</b></td><td align="left"><input style="width:96%;box-sizing:border-box;" maxlength="{{maxLen}}" name="objText{{num}}" type="text" value="{{text}}" oninput="var n=this.maxLength-this.value.length;var c=document.getElementById('objCnt{{num}}');c.textContent=n+' left';c.style.color=(n<0)?'red':'#2e7d32';" /><br /><span id="objCnt{{num}}" style="font-size:8pt;color:{{charsLeftColor}};">{{charsLeft}} left</span>{{#if firstRow}} <i style="font-size:8pt;">(own buffer, not shared)</i>{{/if}}</td></tr>
 <tr><td align="right"><b>Interval:</b></td><td align="left"><input type="radio" name="objMode{{num}}" value="0"{{#if fixedMode}} checked{{/if}}> Fixed: <select name="objInv{{num}}">{{#each intervalOptions}}<option value="{{value}}"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}</select> + max sends <input style="width:60px;" min="0" max="65535" name="objLim{{num}}" type="number" value="{{limit}}" /><br /><input type="radio" name="objMode{{num}}" value="1"{{#if fixedMode}}{{else}} checked{{/if}}> Active for: <select name="objActFor{{num}}">{{#each afOptions}}<option value="{{value}}"{{#if selected}} selected{{/if}}>{{label}}</option>{{/each}}{{#if firstRow}}</select><br /><i>either mode (Permanent off): never exceeds 72h total send time</i></td></tr>
 {{else}}</select></td></tr>
@@ -3849,7 +3955,7 @@ if(table==1){
 }else if(table==2){
  txttable.value='\\';
 }
-imgicon.src = "http://aprs.nakhonthai.net/symbols/icons/"+symbol.toString()+'-'+table.toString()+'.png';
+imgicon.src = "/symbols/icons/"+symbol.toString()+'-'+table.toString()+'.png';
 }
 function objSymRefresh(sel) {
 var txtsymbol=document.getElementById('obj'+(sel+1)+'Symbol');
@@ -3858,7 +3964,7 @@ var imgicon=document.getElementById('obj'+(sel+1)+'ImgSymbol');
 var sym=txtsymbol.value.charCodeAt(0);
 var tbl=(txttable.value=='\\')?2:1;
 if(!isNaN(sym)&&sym>0){
- imgicon.src = "http://aprs.nakhonthai.net/symbols/icons/"+sym.toString()+'-'+tbl.toString()+'.png';
+ imgicon.src = "/symbols/icons/"+sym.toString()+'-'+tbl.toString()+'.png';
 }
 }
 </script>
@@ -7031,7 +7137,7 @@ static const char *IGATE_TEMPLATE =
 	"document.getElementById('igateSymbol').value = String.fromCharCode(symbol);\n"
 	"if(table==1){\n document.getElementById('igateTable').value='/';\n"
 	"}else if(table==2){\n document.getElementById('igateTable').value='\\\\';\n}\n"
-	"document.getElementById('igateImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"document.getElementById('igateImgSymbol').src = \"/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
 	"\n}\n"
 	"function calculatePHGR(){document.forms.formIgate.texttouse.value=\"PHG\"+calcPower(document.forms.formIgate.power.value)+calcHeight(document.forms.formIgate.haat.value)+calcGain(document.forms.formIgate.gain.value)+calcDirection(document.forms.formIgate.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n"
 	"function onRF2INETCheck() {\n"
@@ -7078,7 +7184,7 @@ static const char *IGATE_TEMPLATE =
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Station Symbol:</b></td>\n"
-	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"igateTable\" name=\"igateTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"igateSymbol\" name=\"igateSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"igateImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"igateTable\" name=\"igateTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"igateSymbol\" name=\"igateSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"igateImgSymbol\" onclick=\"openWindowSymbol();\" src=\"/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Item/Obj Name:</b></td>\n"
@@ -8051,7 +8157,7 @@ static const char *DIGI_TEMPLATE =
 	"document.getElementById('digiSymbol').value = String.fromCharCode(symbol);\n"
 	"if(table==1){\n document.getElementById('digiTable').value='/';\n"
 	"}else if(table==2){\n document.getElementById('digiTable').value='\\\\';\n}\n"
-	"document.getElementById('digiImgSymbol').src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"document.getElementById('digiImgSymbol').src = \"/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
 	"\n}\n"
 	"function calculatePHGR(){document.forms.formDIGI.texttouse.value=\"PHG\"+calcPower(document.forms.formDIGI.power.value)+calcHeight(document.forms.formDIGI.haat.value)+calcGain(document.forms.formDIGI.gain.value)+calcDirection(document.forms.formDIGI.direction.selectedIndex)}function Log2(e){return Math.log(e)/Math.log(2)}function calcPerHour(e){return e<10?e:String.fromCharCode(65+(e-10))}function calcHeight(e){return String.fromCharCode(48+Math.round(Log2(e/10),0))}function calcPower(e){if(e<1)return 0;if(e>=1&&e<4)return 1;if(e>=4&&e<9)return 2;if(e>=9&&e<16)return 3;if(e>=16&&e<25)return 4;if(e>=25&&e<36)return 5;if(e>=36&&e<49)return 6;if(e>=49&&e<64)return 7;if(e>=64&&e<81)return 8;if(e>=81)return 9}function calcDirection(e){if(e==\"0\")return\"0\";if(e==\"1\")return\"1\";if(e==\"2\")return\"2\";if(e==\"3\")return\"3\";if(e==\"4\")return\"4\";if(e==\"5\")return\"5\";if(e==\"6\")return\"6\";if(e==\"7\")return\"7\";if(e==\"8\")return\"8\"}function calcGain(e){return e>9?\"9\":e<0?\"0\":Math.round(e,0)}\n"
 	"function selPrecision(idx) {\n"
@@ -8090,7 +8196,7 @@ static const char *DIGI_TEMPLATE =
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>Station Symbol:</b></td>\n"
-	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"digiTable\" name=\"digiTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"digiSymbol\" name=\"digiSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"digiImgSymbol\" onclick=\"openWindowSymbol();\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"digiTable\" name=\"digiTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"digiSymbol\" name=\"digiSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"digiImgSymbol\" onclick=\"openWindowSymbol();\" src=\"/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\"><b>PATH:</b></td>\n"
@@ -9950,7 +10056,7 @@ static const char *TRACKER_TEMPLATE =
 	"txtsymbol.value = String.fromCharCode(symbol);\n"
 	"if(table==1){\n txttable.value='/';\n"
 	"}else if(table==2){\n txttable.value='\\\\';\n}\n"
-	"imgicon.src = \"http://aprs.nakhonthai.net/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
+	"imgicon.src = \"/symbols/icons/\"+symbol.toString()+'-'+table.toString()+'.png';\n"
 	"\n}\n"
 	"function onSmartCheck() {\n"
 	"if (document.querySelector('#smartBcnEnable').checked) {\n"
@@ -10038,7 +10144,7 @@ static const char *TRACKER_TEMPLATE =
 	"<tr><td style=\"text-align: right;\">Location:</td><td style=\"text-align: left;\"><input type=\"radio\" name=\"trackerPosSel\" value=\"0\" {{#if posFix}}checked=\"checked\"{{/if}}/>Fix <input type=\"radio\" name=\"trackerPosSel\" value=\"1\" {{#if posGPS}}checked=\"checked\"{{/if}}/>GPS </td></tr>\n"
 	"<tr>\n"
 	"<td align=\"right\">Symbol Icon:</td>\n"
-	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"trackerTable\" name=\"trackerTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"trackerSymbol\" name=\"trackerSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"trackerImgSymbol\" onclick=\"openWindowSymbol(0);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"trackerTable\" name=\"trackerTable\" type=\"text\" value=\"{{symTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"trackerSymbol\" name=\"trackerSymbol\" type=\"text\" value=\"{{symSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"trackerImgSymbol\" onclick=\"openWindowSymbol(0);\" src=\"/symbols/icons/{{symImgNum}}-{{symImgTable}}.png\"> <i>*Click icon for select symbol</i></td>\n"
 	"</tr>\n"
 	"<tr><td style=\"text-align: right;\">Latitude:</td><td style=\"text-align: left;\"><input min=\"-90\" max=\"90\" step=\"0.00001\" id=\"trackerPosLat\" name=\"trackerPosLat\" type=\"number\" value=\"{{lat}}\" />degrees (positive for North, negative for South)</td></tr>\n"
 	"<tr><td style=\"text-align: right;\">Longitude:</td><td style=\"text-align: left;\"><input min=\"-180\" max=\"180\" step=\"0.00001\" id=\"trackerPosLon\" name=\"trackerPosLon\" type=\"number\" value=\"{{lon}}\" />degrees (positive for East, negative for West)</td></tr>\n"
@@ -10052,11 +10158,11 @@ static const char *TRACKER_TEMPLATE =
 	"<legend>Smart beacon configuration</legend>\n<table>"
 	"<tr>\n"
 	"<td align=\"right\">Move Symbol:</td>\n"
-	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"moveTable\" name=\"moveTable\" type=\"text\" value=\"{{moveTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"moveSymbol\" name=\"moveSymbol\" type=\"text\" value=\"{{moveSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"moveImgSymbol\" onclick=\"openWindowSymbol(1);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{moveImgNum}}-{{moveImgTable}}.png\"> <i>*Click icon for select MOVE symbol</i></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"moveTable\" name=\"moveTable\" type=\"text\" value=\"{{moveTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"moveSymbol\" name=\"moveSymbol\" type=\"text\" value=\"{{moveSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"moveImgSymbol\" onclick=\"openWindowSymbol(1);\" src=\"/symbols/icons/{{moveImgNum}}-{{moveImgTable}}.png\"> <i>*Click icon for select MOVE symbol</i></td>\n"
 	"</tr>\n"
 	"<tr>\n"
 	"<td align=\"right\">Stop Symbol:</td>\n"
-	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"stopTable\" name=\"stopTable\" type=\"text\" value=\"{{stopTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"stopSymbol\" name=\"stopSymbol\" type=\"text\" value=\"{{stopSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"stopImgSymbol\" onclick=\"openWindowSymbol(2);\" src=\"http://aprs.nakhonthai.net/symbols/icons/{{stopImgNum}}-{{stopImgTable}}.png\"> <i>*Click icon for select STOP symbol</i></td>\n"
+	"<td style=\"text-align: left;\">Table:<input maxlength=\"1\" size=\"1\" id=\"stopTable\" name=\"stopTable\" type=\"text\" value=\"{{stopTable}}\" style=\"background-color: rgb(97, 239, 170);\" /> Symbol:<input maxlength=\"1\" size=\"1\" id=\"stopSymbol\" name=\"stopSymbol\" type=\"text\" value=\"{{stopSymbol}}\" style=\"background-color: rgb(97, 239, 170);\" /> <img border=\"1\" style=\"vertical-align: middle;\" id=\"stopImgSymbol\" onclick=\"openWindowSymbol(2);\" src=\"/symbols/icons/{{stopImgNum}}-{{stopImgTable}}.png\"> <i>*Click icon for select STOP symbol</i></td>\n"
 	"</tr>\n"
 	"<tr><td style=\"text-align: right;\">High Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"10\" max=\"1000\" step=\"1\" id=\"hspeed\" name=\"hspeed\" type=\"number\" value=\"{{hspeed}}\" /> km/h</td></tr>\n"
 	"<tr><td style=\"text-align: right;\">Low Speed:</td><td style=\"text-align: left;\"><input size=\"3\" min=\"1\" max=\"250\" step=\"1\" id=\"lspeed\" name=\"lspeed\" type=\"number\" value=\"{{lspeed}}\" /> km/h</td></tr>\n"
@@ -11178,7 +11284,7 @@ void handle_test(AsyncWebServerRequest *request)
 		return;
 	}
 	webString->print("<html>\n<head>\n");
-	webString->print("<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
+	webString->print("<script src=\"/jquery-3.7.1.js\"></script>\n");
 	webString->print("<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
 	webString->print("<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
 	webString->print("<script language=\"JavaScript\">");
@@ -12946,7 +13052,7 @@ void handle_gnss(AsyncWebServerRequest *request)
 		return;
 	}
 	webString->print("<html>\n<head>\n");
-	webString->print("<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
+	webString->print("<script src=\"/jquery-3.7.1.js\"></script>\n");
 	webString->print("<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
 	webString->print("<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
 	webString->print("<script language=\"JavaScript\">");
@@ -13306,6 +13412,8 @@ void webService()
 					{ handle_txdebug(request); });
 	async_server.on("/sidebarInfo", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_sidebar(request); });
+	async_server.on("/boardinfo", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_boardinfo(request); });
 	async_server.on("/sysinfo", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_sysinfo(request); });
 	// async_server.on("/lastHeard", HTTP_GET, [](AsyncWebServerRequest *request)

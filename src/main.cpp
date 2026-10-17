@@ -1782,7 +1782,7 @@ void defaultConfig()
     config.audio_hpf = false;
     config.audio_lpf = false;
     config.preamble = 3;
-    sprintf(config.ntp_host, "aprs.nakhonthai.net");
+    sprintf(config.ntp_host, "pool.ntp.org"); // LU6JMF (was aprs.nakhonthai.net)
 
     // IGATE
     config.igate_bcn = false;
@@ -1797,7 +1797,7 @@ void defaultConfig()
     config.aprs_ssid = 1;
     config.aprs_port = 14580;
     sprintf(config.aprs_mycall, "NOCALL");
-    sprintf(config.aprs_host, "aprs.nakhonthai.net");
+    sprintf(config.aprs_host, "rotate.aprs2.net"); // LU6JMF (was aprs.nakhonthai.net)
     memset(config.aprs_passcode, 0, sizeof(config.aprs_passcode));
     sprintf(config.aprs_moniCall, "%s-%d", config.aprs_mycall, config.aprs_ssid);
     sprintf(config.aprs_filter, "m/10");
@@ -1986,7 +1986,7 @@ config.oled_enable = true;
     config.rx_display = true;
 
     // afsk,TNC
-    sprintf(config.ntp_host, "ntp.nakhonthai.net");
+    sprintf(config.ntp_host, "pool.ntp.org"); // LU6JMF (was ntp.nakhonthai.net)
 
     sprintf(config.path[0], "WIDE1-1");
     sprintf(config.path[1], "WIDE1-1,WIDE2-1");
@@ -1996,7 +1996,7 @@ config.oled_enable = true;
     // VPN Wireguard
     config.vpn = false;
     config.wg_port = 51820;
-    sprintf(config.wg_peer_address, "vpn.nakhonthai.net");
+    sprintf(config.wg_peer_address, "vpn.tracktotal.ar"); // LU6JMF: our VPN server (was vpn.nakhonthai.net)
     sprintf(config.wg_local_address, "192.168.1.2");
     sprintf(config.wg_netmask_address, "255.255.255.0");
     sprintf(config.wg_gw_address, "192.168.1.1");
@@ -2394,7 +2394,7 @@ config.oled_enable = true;
     config.log = 0;
 #ifdef MQTT
     config.en_mqtt = false;
-    sprintf(config.mqtt_host, "mqtt.nakhonthai.net");
+    config.mqtt_host[0] = 0; // LU6JMF: no default MQTT server (was mqtt.nakhonthai.net)
     char strCID[13];
     uint64_t chipid = ESP.getEfuseMac();
     sprintf(strCID, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
