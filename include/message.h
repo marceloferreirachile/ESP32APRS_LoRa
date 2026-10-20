@@ -43,4 +43,6 @@ void dxRecordTrackPacket(const char *callsign, const String &tnc2);
 // void processMessage(const char* message);
 // void sendMessage(const char* message);
 
+void lu6jmfGeneralQuery(const String &tnc2); // APRS 1.2: general queries ?APRS? / ?IGATE? heard on RF
+
 #endif // MESSAGE_H

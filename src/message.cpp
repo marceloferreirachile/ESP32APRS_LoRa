@@ -474,7 +474,8 @@ int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack,
     int i = -1;
     // if (ack > 0) // Check ACK to update
     //{
-    i = pkgMsg_Find(call, msg_id, rxtx);
+    if (msg_id != 0) // LU6JMF: number-less entries (our one-shot query replies) never overwrite each other
+        i = pkgMsg_Find(call, msg_id, rxtx);
     //}
 
     if (i < 0)
@@ -694,6 +695,134 @@ void sendAPRSAck(const String &toCall, const String &msgNo)
     log_d("Send APRS ACK to %s msgNo %s TNC2: %s", toCall.c_str(), msgNo.c_str(), packet.c_str());
 }
 
+// 2.1.6 (APRS 1.2, ch. 15): "responses to queries are one-time transmissions that also do not
+// have a message identifier, so that they too are not acknowledged". With encryption the reply
+// stays a numbered message (the encryption IV is the message number).
+void lu6jmfQueryReply(const String &toCall, const String &text)
+{
+    if (config.msg_encrypt)
+    {
+        sendAPRSMessage(toCall, text, true, false);
+        return;
+    }
+    String to = toCall;
+    to.trim();
+    to.toUpperCase();
+    if (to.length() == 0 || text.length() == 0)
+        return;
+    char toFixed[10];
+    memset(toFixed, 0x20, sizeof(toFixed));
+    memcpy(toFixed, to.c_str(), to.length() > 9 ? 9 : to.length());
+    toFixed[9] = 0;
+    String me = String(config.msg_mycall);
+    me.trim();
+    me.toUpperCase();
+    String path = "";
+    if (config.msg_path < 5)
+    {
+        if (config.msg_path > 0)
+            path += "-" + String(config.msg_path);
+    }
+    else
+        path += "," + getPath(config.msg_path);
+    String packet = me + ">APE32L" + path + "::" + String(toFixed) + ":" + text;
+    uint8_t mode = 0;
+    if (config.msg_rf)
+        mode |= RF_CHANNEL;
+    if (config.msg_inet)
+        mode |= INET_CHANNEL;
+    pkgTxPushJob(packet.c_str(), packet.length(), 0, mode, LU6JMF_TXJOB_MESSAGE, LU6JMF_TXPRIO_HIGH);
+    pkgMsgUpdate(to.c_str(), text.c_str(), 0, -2, false); // shown in the chat, never retried
+    event_chatMessage(false);
+}
+
+extern pkgListType *pkgList;
+extern volatile bool lu6BeaconReq;
+// 2.1.6 (APRS 1.2, ch. 15): general queries heard on RF. ?APRS? -> our position (like ?APRSP);
+// ?IGATE? -> "<IGATE,MSG_CNT=n,LOC_CNT=n". At most one answer per type every 5 minutes.
+void lu6jmfGeneralQuery(const String &tnc2)
+{
+    int colon = tnc2.indexOf(':');
+    if (colon < 0 || colon + 1 >= (int)tnc2.length() || tnc2[colon + 1] != '?')
+        return;
+    String q = tnc2.substring(colon + 1, colon + 9);
+    q.toUpperCase();
+    static unsigned long lastAprs = 0, lastIgate = 0;
+    unsigned long now = millis();
+    if (q.startsWith("?APRS?"))
+    {
+        if (!(config.igate_en || config.digi_en || config.trk_en) || (lastAprs && now - lastAprs < 300000UL))
+            return;
+        lastAprs = now | 1;
+        lu6BeaconReq = true; // taskAPRS sends our position beacon
+    }
+    else if (q.startsWith("?IGATE?"))
+    {
+        if (!config.igate_en || (lastIgate && now - lastIgate < 300000UL))
+            return;
+        lastIgate = now | 1;
+        int loc = 0; // stations heard on RF in the last 30 minutes
+        time_t t = time(NULL);
+        if (pkgList != NULL && psramLock(pdMS_TO_TICKS(200)))
+        {
+            for (int i = 0; i < PKGLISTSIZE; i++)
+                if (pkgList[i].calsign[0] != 0 && pkgList[i].channel == 0 && t - pkgList[i].time <= 1800)
+                    loc++;
+            psramUnlock();
+        }
+        String me = String(config.aprs_mycall);
+        me.trim();
+        me.toUpperCase();
+        if (config.aprs_ssid > 0)
+            me += "-" + String(config.aprs_ssid);
+        String packet = me + ">APE32L:<IGATE,MSG_CNT=" + String((unsigned)status.inet2rf) + ",LOC_CNT=" + String(loc);
+        pkgTxPushJob(packet.c_str(), packet.length(), 0, RF_CHANNEL, LU6JMF_TXJOB_IGATE, LU6JMF_TXPRIO_NORMAL);
+    }
+}
+
+// 2.1.6: duplicate filter for messages addressed to us. The same message can arrive twice:
+// once from RF and once more via APRS-IS, re-injected by a faulty iGate far away (seen
+// 2026-10-15: KE9DJN-10, Indiana USA, re-gating LU6JMF-1 messages as qAR with the TOCALL
+// changed to APRS, so APRS-IS did not drop it as a dupe). Same station + same text + same
+// message number (or none) within 30 s = copy, ignored. A real retry from the sender comes
+// later than that (Yaesu: about once a minute) and is still handled.
+static portMUX_TYPE lu6jmfDupMux = portMUX_INITIALIZER_UNLOCKED;
+// LU6JMF (AR-LORA): a NUMBERED message (same station + text + number) is remembered for 10 min, so
+// the sender's retries (ACK lost) get the ACK again but are not processed/answered again.
+static bool lu6jmfMsgSeenRecently(const String &from, const String &text, const String &no)
+{
+    static uint32_t hashes[8] = {0};
+    static unsigned long seenAt[8] = {0};
+    static uint8_t next = 0;
+    String key = from + ">" + text + "{" + no;
+    key.toUpperCase();
+    uint32_t h = 2166136261u; // FNV-1a
+    for (size_t k = 0; k < key.length(); k++)
+    {
+        h ^= (uint8_t)key[k];
+        h *= 16777619u;
+    }
+    unsigned long now = millis();
+    bool dup = false;
+    portENTER_CRITICAL(&lu6jmfDupMux);
+    for (int k = 0; k < 8; k++)
+    {
+        if (seenAt[k] != 0 && hashes[k] == h && (now - seenAt[k]) < (no.length() ? 600000UL : 30000UL))
+        {
+            dup = true;
+            break;
+        }
+    }
+    if (!dup)
+    {
+        hashes[next] = h;
+        seenAt[next] = now;
+        next = (next + 1) % 8;
+    }
+    portEXIT_CRITICAL(&lu6jmfDupMux);
+    return dup;
+}
+
 // ===== จัดการข้อความขาเข้า =====
 void handleIncomingAPRS(const String &line)
 {
@@ -745,6 +874,31 @@ void handleIncomingAPRS(const String &line)
 
             log_d("📩 Message from %s to %s : %s", fromCall.c_str(), toCall.c_str(), message.c_str());
 
+            // LU6JMF (APRS 1.2 "reply-ack"): a message number "MM}AA" also acknowledges OUR message AA
+            String msgNoMM = msgNo;
+            int rbrace = msgNo.indexOf('}');
+            if (!isAck && rbrace >= 0 && toCall.equalsIgnoreCase(config.msg_mycall))
+            {
+                msgNoMM = msgNo.substring(0, rbrace);
+                String aa = msgNo.substring(rbrace + 1);
+                if (aa.length() > 0)
+                {
+                    int k = pkgMsg_Find(fromCall.c_str(), aa.toInt(), false);
+                    if (k > -1)
+                        msgQueue[k].ack = -2;
+                }
+            }
+
+            // LU6JMF: second copy of the same message -> ACK again (numbered) but don't process/answer again
+            if (!isAck && toCall.equalsIgnoreCase(config.msg_mycall) &&
+                lu6jmfMsgSeenRecently(fromCall, message, msgNoMM))
+            {
+                if (msgNo.length() > 0)
+                    sendAPRSAck(fromCall, msgNo);
+                log_d("Duplicate message from %s ignored: %s", fromCall.c_str(), message.c_str());
+                return;
+            }
+
             // ถ้าเป็นข้อความถึงเราเอง ให้ตอบกลับ ack
             if (toCall.equalsIgnoreCase(config.msg_mycall) && msgNo.length() > 0)
             {
@@ -784,7 +938,7 @@ void handleIncomingAPRS(const String &line)
                         // 2.1.5: query replies now use the normal retry policy (msg_retry /
                         // msg_interval) so a reply lost after the ACK is re-sent until the
                         // asker ACKs it. Before 2.1.4 it was noRetry=true (sent once only).
-                        sendAPRSMessage(fromCall, queryResponse, config.msg_encrypt, false);
+                        lu6jmfQueryReply(fromCall, queryResponse);
                     }
                     else if (config.at_cmd_msg)
                     {
@@ -793,6 +947,18 @@ void handleIncomingAPRS(const String &line)
                             sendAPRSMessage(fromCall, response, config.msg_encrypt);
                     }
                 }
+                event_chatMessage(false);
+            }
+            // LU6JMF (as AR-APRS 2.1.6): a message to us WITHOUT a message number (e.g. a one-shot
+            // query reply, APRS 1.2). Show it in the chat and answer queries; no ACK (nothing to ACK).
+            // Not with encryption (the IV needs the message number).
+            else if (toCall.equalsIgnoreCase(config.msg_mycall) && msgNo.length() == 0 &&
+                     !isAck && !config.msg_encrypt && message.length() > 0)
+            {
+                pkgMsgUpdate(fromCall.c_str(), message.c_str(), 0, -1, true); // RX Message, no number
+                String queryResponse = handleAPRSQuery(message);
+                if (queryResponse != "")
+                    lu6jmfQueryReply(fromCall, queryResponse);
                 event_chatMessage(false);
             }
         }
