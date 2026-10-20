@@ -31,6 +31,6 @@ The board starts with callsign NOCALL and every mode off, so it does not transmi
 
 This firmware is based on ESP32APRS by Somkiat Nakhonthai (HS5TQA) and is distributed under the **GNU General Public License v3** (see [LICENSE](LICENSE)).
 
-The source code is not published here. The complete corresponding source code of any released version is available on request, free of charge, for at least 3 years from its release date: **marcelobrachile@gmail.com** (please include the version number, e.g. v1.0-lu6jmf).
+The complete corresponding source code, including build configuration and scripts, is in this repository: each release tag contains the source of that version (e.g. [v1.1-lu6jmf](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/v1.1-lu6jmf)), and the "Source code" archives of each [release](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases) are that source. Current development: branch [`lu6jmf/from-2.1.5`](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/lu6jmf/from-2.1.5).
 
 73 de LU6JMF
