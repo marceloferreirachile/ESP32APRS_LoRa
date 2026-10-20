@@ -11,6 +11,7 @@
 - **APRS 1.2 (WB2OSZ / APRS Foundation), igual ao AR-APRS 2.1.6:** digi insere o próprio indicativo nos WIDEn-N com N>=2, não repete o mesmo pacote em 30 s nem pacotes próprios, correção do `pkgTxDuplicate` (podia cancelar pacotes na fila), respostas às consultas sem número de mensagem e reply-ack. Consultas gerais por RF: ?APRS? (envia a posição) e ?IGATE? (MSG_CNT/LOC_CNT), no máximo 1 resposta a cada 5 min.
 - **Mensagens:** mensagens sem número (ex.: respostas de consultas) agora aparecem no chat; a mesma mensagem repetida pelo remetente recebe o ACK de novo, mas não é processada/respondida outra vez.
 - **Sensores I2C (BME280, BMP280, Si7021, CCS811, SHT), igual ao AR-APRS 2.1.6:** corrigido reinício depois de uma reconexão completa do WiFi (o sensor era apagado e usado depois); corrigida a trava do I2C presa na configuração; `/txdebug` mostra a pilha da tarefa de sensores.
+- **VPN (segurança):** a chave privada WireGuard agora é gerada na própria placa e nunca sai dela; o servidor recebe só a chave pública. Placas já cadastradas continuam funcionando.
 - **Painel PRIME:** página aberta `/boardinfo` (JSON sem dados privados), lida pelo servidor da VPN a cada 10 min. `/sysinfo` e `/dashboard` passam a pedir login, porque mostravam o nome do Wi-Fi para quem chegasse na placa.
 
 ## v1.1-lu6jmf — 13/out/2026
