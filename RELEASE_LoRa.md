@@ -8,6 +8,8 @@
 - **Correção VPN (ESP32-S3):** com a VPN ligada a placa reiniciava em loop (Guru Meditation em `wireguard_random_bytes`, gerador aleatório do WireGuard nunca iniciado no caminho `wireguard_setup()`). Corrigido em 17/out e testado na V3 de 433 (LU6JMF-3 online na VPN). A Tracker compila (68,3%), falta testar com o testador.
 - **Cabeçalho:** no lado esquerdo, o Host Name da placa (ou o indicativo, enquanto o nome for o de fábrica "AR-LORA"), os modos ativos e a frequência LoRa com o SF, igual ao AR-APRS 2.1.6.
 - **Aba VPN:** Apply Change reinicia a placa sozinho, para ligar/desligar a VPN valer na hora.
+- **APRS 1.2 (WB2OSZ / APRS Foundation), igual ao AR-APRS 2.1.6:** digi insere o próprio indicativo nos WIDEn-N com N>=2, não repete o mesmo pacote em 30 s nem pacotes próprios, correção do `pkgTxDuplicate` (podia cancelar pacotes na fila), respostas às consultas sem número de mensagem e reply-ack. Consultas gerais por RF: ?APRS? (envia a posição) e ?IGATE? (MSG_CNT/LOC_CNT), no máximo 1 resposta a cada 5 min.
+- **Mensagens:** mensagens sem número (ex.: respostas de consultas) agora aparecem no chat; a mesma mensagem repetida pelo remetente recebe o ACK de novo, mas não é processada/respondida outra vez.
 - **Painel PRIME:** página aberta `/boardinfo` (JSON sem dados privados), lida pelo servidor da VPN a cada 10 min. `/sysinfo` e `/dashboard` passam a pedir login, porque mostravam o nome do Wi-Fi para quem chegasse na placa.
 
 ## v1.1-lu6jmf — 13/out/2026
