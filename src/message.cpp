@@ -129,7 +129,13 @@ static String formatUptime(unsigned long secs)
 
 // Returns "" when queryTextIn is not a recognized query (caller falls
 // through to normal AT-command handling, unchanged).
-String handleAPRSQuery(const String &queryTextIn)
+// As AR-APRS 2.1.6: extra APRS queries (?APRSP ?APRS? ?APRSD ?APRSS ?APRST/?PING? ?APRSO).
+extern pkgListType *pkgList;
+extern WiFiClient aprsClient;
+extern volatile bool lu6BeaconReq;
+extern bool sendAPRSObject(uint8_t idx, const char *name, double lat, double lon, const char *symbol, const String &comment);
+
+String handleAPRSQuery(const String &queryTextIn, const String &tnc2Line)
 {
     String q = queryTextIn;
     q.trim();
@@ -145,6 +151,97 @@ String handleAPRSQuery(const String &queryTextIn)
                  VERSION, VERSION_BUILD, formatUptime(upSecs).c_str(),
                  (unsigned long)(ESP.getFreeHeap() / 1024));
         return String(buf);
+    }
+
+    // ?APRS? - list of the queries this station answers.
+    // "?APRS" too: it is the ready-made query text on Yaesu radios (FT5D / FTM-510).
+    if (qUpper == "?APRS?" || qUpper == "?APRS")
+        return String("?APRSP ?APRSD ?APRSS ?APRST ?PING? ?APRSO ?APRSV ?VER ?IGATE ?DX");
+
+    // ?APRSP - send our position now (iGate / Digi / Tracker, whatever is enabled)
+    if (qUpper == "?APRSP")
+    {
+        lu6BeaconReq = true; // taskAPRS picks it up on its next loop
+        return String("Position sent");
+    }
+
+    // ?APRSS - short status of the station
+    if (qUpper == "?APRSS")
+    {
+        time_t now = time(NULL);
+        unsigned long upSecs = (systemUptime > 0 && now > systemUptime) ? (unsigned long)(now - systemUptime) : 0;
+        char buf[100];
+        snprintf(buf, sizeof(buf), "IGate %s IS %s Digi %s Trk %s up %s",
+                 config.igate_en ? "ON" : "OFF",
+                 aprsClient.connected() ? "OK" : "DOWN",
+                 config.digi_en ? "ON" : "OFF",
+                 config.trk_en ? "ON" : "OFF",
+                 formatUptime(upSecs).c_str());
+        return String(buf);
+    }
+
+    // ?APRST / ?PING? - reply with the path the query came through
+    if (qUpper == "?APRST" || qUpper == "?PING?")
+    {
+        int c = tnc2Line.indexOf(':');
+        String hdr = (c > 0) ? tnc2Line.substring(0, c) : tnc2Line;
+        if (hdr.length() > 67)
+            hdr = hdr.substring(0, 67);
+        return hdr;
+    }
+
+    // ?APRSD - stations heard direct on RF (no digipeater) in the last hour
+    if (qUpper == "?APRSD")
+    {
+        String out = "Directs=";
+        time_t now = time(NULL);
+        if (pkgList != NULL && psramLock(pdMS_TO_TICKS(200)))
+        {
+            for (int i = 0; i < PKGLISTSIZE; i++)
+            {
+                pkgListType &p = pkgList[i];
+                if (p.calsign[0] == 0 || p.raw == NULL || p.channel != 0)
+                    continue; // empty slot, or heard from APRS-IS
+                if (now - p.time > 3600)
+                    continue;
+                const char *colon = strchr(p.raw, ':');
+                const char *gt = strchr(p.raw, '>');
+                if (colon == NULL || gt == NULL || gt > colon)
+                    continue;
+                bool digied = false;
+                for (const char *c = gt; c < colon; c++)
+                    if (*c == '*') { digied = true; break; }
+                if (digied)
+                    continue;
+                String call = String(p.calsign);
+                call.trim();
+                if (call.length() == 0 || out.indexOf(" " + call + " ") >= 0 || out.endsWith(" " + call))
+                    continue;
+                if (out.length() + 1 + call.length() > 67)
+                    break;
+                out += " " + call;
+            }
+            psramUnlock();
+        }
+        if (out == "Directs=")
+            out += " none";
+        return out;
+    }
+
+    // ?APRSO - send our enabled objects again
+    if (qUpper == "?APRSO")
+    {
+        int n = 0;
+        for (uint8_t oi = 0; oi < 4; oi++)
+        {
+            if (config.obj_en[oi] && strlen(config.obj_name[oi]) >= 3)
+            {
+                if (sendAPRSObject(oi, config.obj_name[oi], config.obj_lat[oi], config.obj_lon[oi],
+                                   config.obj_symbol[oi], String(config.obj_text[oi])))
+                    n++;
+            }
+        }
+        return String(n) + " Objects Transmitted";
     }
 
     if (qUpper == "?IGATE")
@@ -932,7 +1029,7 @@ void handleIncomingAPRS(const String &line)
                     sendAPRSAck(fromCall, msgNo);
                     // LU6JMF - Marcelo Ferreira: APRS Query feature (?APRSV/?IGATE/?DX),
                     // checked before AT-commands since queries always start with '?'.
-                    String queryResponse = handleAPRSQuery(decrypted);
+                    String queryResponse = handleAPRSQuery(decrypted, line);
                     if (queryResponse != "")
                     {
                         // 2.1.5: query replies now use the normal retry policy (msg_retry /
@@ -956,7 +1053,7 @@ void handleIncomingAPRS(const String &line)
                      !isAck && !config.msg_encrypt && message.length() > 0)
             {
                 pkgMsgUpdate(fromCall.c_str(), message.c_str(), 0, -1, true); // RX Message, no number
-                String queryResponse = handleAPRSQuery(message);
+                String queryResponse = handleAPRSQuery(message, line);
                 if (queryResponse != "")
                     lu6jmfQueryReply(fromCall, queryResponse);
                 event_chatMessage(false);
