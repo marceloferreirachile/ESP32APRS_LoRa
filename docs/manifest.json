@@ -1,15 +1,27 @@
 {
-  "name": "AR-LORA (LU6JMF) v1.1-lu6jmf - Heltec WiFi LoRa 32 V3",
-  "version": "1.1-lu6jmf",
+  "name": "AR-LORA (LU6JMF) v1.2-lu6jmf - Heltec WiFi LoRa 32 V3",
+  "version": "1.2-lu6jmf",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",
       "parts": [
-        { "path": "./bin/heltec_v3/bootloader.bin", "offset": 0 },
-        { "path": "./bin/heltec_v3/partitions.bin", "offset": 32768 },
-        { "path": "./bin/heltec_v3/firmware.bin", "offset": 65536 },
-        { "path": "./bin/heltec_v3/littlefs.bin", "offset": 6750208 }
+        {
+          "path": "./bin/heltec_v3/bootloader.bin",
+          "offset": 0
+        },
+        {
+          "path": "./bin/heltec_v3/partitions.bin",
+          "offset": 32768
+        },
+        {
+          "path": "./bin/heltec_v3/firmware.bin",
+          "offset": 65536
+        },
+        {
+          "path": "./bin/heltec_v3/littlefs.bin",
+          "offset": 6750208
+        }
       ]
     }
   ]
