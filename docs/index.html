@@ -22,6 +22,7 @@
 
 <p>LoRa APRS firmware (iGate, digipeater, tracker) for the <strong>Heltec WiFi LoRa 32 V3</strong> and the <strong>Heltec Wireless Tracker V1.1</strong> (433 MHz), based on ESP32APRS_LoRa (nakhonthai) with the core of AR-APRS (LU6JMF). Flashes everything in a single click, directly from your browser (Chrome or Edge), no software installation needed.</p>
 
+<h2 style="font-size:1.1em; color:#2E1450">New board or full reset</h2>
 <div class="box">
   <ol>
     <li>Screw the 433 MHz antenna on <strong>before</strong> powering the board (transmitting without an antenna can damage the radio).</li>
@@ -52,6 +53,23 @@
 <div class="warn">
   <strong>Warning:</strong> this erases everything currently on the board (including its configuration) and flashes from scratch.
 </div>
+
+<h2 style="font-size:1.1em; color:#2E1450">Update by USB, keeping the configuration</h2>
+<div class="box">
+  <esp-web-install-button manifest="./manifest-update.json">
+    <button slot="activate">Update Heltec V3 (keep configuration)</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer (doesn't work on mobile).</span>
+    <span slot="not-allowed">This page needs to be served over HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+
+  <esp-web-install-button manifest="./manifest-tracker-update.json">
+    <button slot="activate">Update Wireless Tracker (keep configuration)</button>
+    <span slot="unsupported">Your browser doesn't support Web Serial. Use Google Chrome or Microsoft Edge on a computer (doesn't work on mobile).</span>
+    <span slot="not-allowed">This page needs to be served over HTTPS to work (it already is).</span>
+  </esp-web-install-button>
+  <p style="font-size:0.9em">Only for boards that already run AR-LORA. It writes the new firmware and keeps everything else: WiFi, callsign, settings and VPN key. The web files are not changed; if the release notes say they changed, upload them in the <strong>File</strong> tab.</p>
+</div>
+
 
 <div class="box">
   <p>Already running AR-LORA and want to update without USB? See the <a href="https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases/tag/v1.2-lu6jmf">release notes</a> ("Existing device" section).</p>
