@@ -1,7 +1,7 @@
 {
   "name": "AR-LORA (LU6JMF) v1.2-lu6jmf - Heltec Wireless Tracker V1.1 - update (keeps configuration)",
   "version": "1.2-lu6jmf",
-  "new_install_prompt_erase": false,
+  "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32-S3",
