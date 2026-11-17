@@ -804,9 +804,9 @@ String ais2aprs(char *info)
 	String timeStamp = getTimeStampAIS();
 	memset(strtmp, 0, sizeof(strtmp));
 	if(course!=G_UNKNOWN)
-		sprintf(strtmp, "APAIS>APE32L:;%s*%s%02d%02d.%02d%c%c%03d%02d.%02d%c%c%s", object, timeStamp, lat_dd, lat_mm, lat_ss, lat_ns, g_symbol_table, lon_dd, lon_mm, lon_ss, lon_ew, g_symbol_code, csd_spd);
+		sprintf(strtmp, "APAIS>APJMF2:;%s*%s%02d%02d.%02d%c%c%03d%02d.%02d%c%c%s", object, timeStamp, lat_dd, lat_mm, lat_ss, lat_ns, g_symbol_table, lon_dd, lon_mm, lon_ss, lon_ew, g_symbol_code, csd_spd);
 	else
-		sprintf(strtmp, "APAIS>APE32L:;%s*%s%02d%02d.%02d%c%c%03d%02d.%02d%c%c", object, timeStamp, lat_dd, lat_mm, lat_ss, lat_ns, g_symbol_table, lon_dd, lon_mm, lon_ss, lon_ew, g_symbol_code);
+		sprintf(strtmp, "APAIS>APJMF2:;%s*%s%02d%02d.%02d%c%c%03d%02d.%02d%c%c", object, timeStamp, lat_dd, lat_mm, lat_ss, lat_ns, g_symbol_table, lon_dd, lon_mm, lon_ss, lon_ew, g_symbol_code);
 
 	if(strlen(g_comment)>0)
 	{

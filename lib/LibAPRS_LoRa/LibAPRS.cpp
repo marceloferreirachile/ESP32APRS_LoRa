@@ -52,7 +52,7 @@ unsigned long custom_tail = 50UL;
 
 // char CALL[7] = "NOCALL";
 // int CALL_SSID = 0;
-// char DST[7] = "APE32L";
+// char DST[7] = "APJMF2";
 // int DST_SSID = 0;
 // char PATH1[7] = "WIDE1";
 // int PATH1_SSID = 1;
