@@ -817,6 +817,22 @@ static String lu6SosTo()
     to.trim();
     return to;
 }
+// LU6JMF 1.4: activate / cancel the SOS from anywhere (PRG menu, web page, APRS message).
+// Returns false when activating is not possible (Tracker disabled).
+bool lu6SosSet(bool on)
+{
+    if (on && !config.trk_en)
+        return false;
+    if (on == lu6SosActive)
+        return true;
+    lu6SosActive = on;
+    lu6SosSave(on);
+    if (!on)
+        lu6SosCancelBcn = true;
+    lu6SosEvent = on ? 1 : 2;
+    Serial.printf("[SOS] %s\n", on ? "ACTIVATED" : "cancelled");
+    return true;
+}
 // comment of the tracker beacon while SOS is active / right after cancelling it
 static String lu6SosComment(const String &normal)
 {
@@ -7060,11 +7076,7 @@ static void lu6Exec(uint8_t id)
     }
     case LU6_SOS:
     {
-        lu6SosActive = !lu6SosActive;
-        lu6SosSave(lu6SosActive);
-        if (!lu6SosActive)
-            lu6SosCancelBcn = true;
-        lu6SosEvent = lu6SosActive ? 1 : 2;
+        lu6SosSet(!lu6SosActive);
         const char *lines[] = {lu6SosActive ? "Beacon every 1 min" : "Back to normal"};
         lu6ScreenLines(lu6SosActive ? "SOS ACTIVE" : "SOS cancelled", lines, 1, -1);
         Serial.printf("[MENU] SOS %s\n", lu6SosActive ? "ACTIVATED" : "cancelled");

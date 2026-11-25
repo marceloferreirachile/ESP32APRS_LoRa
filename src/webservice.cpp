@@ -419,8 +419,11 @@ static void lu6LogoUpload(AsyncWebServerRequest *request, String filename, size_
 	}
 }
 
+void handle_sos(AsyncWebServerRequest *request); // 1.4: defined below
 void lu6jmfLogoRoutes()
 {
+	async_server.on("/sos", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_sos(request); }); // LU6JMF 1.4: SOS from the DashBoard
 	// 2.1.8: browser tab icon (project mark) - no login needed, cached by the browser
 	async_server.on("/favicon.svg", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ AsyncWebServerResponse *r = request->beginResponse_P(200, "image/svg+xml", LU6_FAVICON_SVG, LU6_FAVICON_SVG_LEN);
@@ -456,7 +459,40 @@ void lu6jmfLogoRoutes()
 
 String lu6jmfUpdateBanner(); // 2.1.8: defined with the update code (near handle_check_version)
 String lu6jmfUpdateBox();
-// LU6JMF (same as AR-APRS 2.1.6): station info in the page header of the page header - which board this is: the Host Name
+// LU6JMF 1.4: SOS on the DashBoard, for a tracker that is out of reach (hidden in a car, a box...)
+extern bool lu6SosActive;
+extern bool lu6SosSet(bool on);
+static String lu6jmfSosBox()
+{
+	if (!config.trk_en && !lu6SosActive)
+		return String("");
+	String s = "<script>function lu6Sos(on){"
+			   "if(on&&!confirm('Send an EMERGENCY (SOS)?\\n\\nThe tracker sends the APRS emergency beacon every minute (RF and Internet) and a message to the SOS contact, until you cancel it.'))return;"
+			   "if(!on&&!confirm('Cancel the SOS?'))return;"
+			   "$.ajax({url:'/sos',type:'POST',data:{on:on?1:0},success:function(){$('#contentmain').load('/dashboard');},"
+			   "error:function(x){alert(x.responseText||'Error');}});}</script>";
+	if (lu6SosActive)
+		s += "<div style=\"clear:both;box-sizing:border-box;width:100%;background:#fde8e8;border:2px solid #c62828;border-radius:8px;padding:8px 10px;margin:4px 0 8px 0;text-align:center;font-size:14px;color:#8b0000;\">"
+			 "<b>&#x26A0; SOS ACTIVE</b> - emergency beacon every minute (RF and Internet). "
+			 "<input type=\"button\" value=\"Cancel SOS\" onclick=\"lu6Sos(0)\" style=\"padding:3px 12px;font-weight:bold;background:#43a047;color:#fff;border:1px solid #2e7d32;border-radius:5px;cursor:pointer;\"></div>";
+	else
+		s += "<div style=\"clear:both;box-sizing:border-box;width:100%;text-align:right;margin:2px 0 6px 0;\">"
+			 "<input type=\"button\" value=\"SOS Emergency\" title=\"Send an APRS emergency (SOS)\" onclick=\"lu6Sos(1)\" style=\"padding:3px 12px;font-weight:bold;background:#c62828;color:#fff;border:1px solid #8b0000;border-radius:5px;cursor:pointer;\"></div>";
+	return s;
+}
+void handle_sos(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+		return request->requestAuthentication();
+	bool on = request->hasArg("on") && request->arg("on") == "1";
+	if (!lu6SosSet(on))
+	{
+		request->send(409, "text/plain", "SOS needs the Tracker: enable it on the TRACKER page first.");
+		return;
+	}
+	request->send(200, "text/plain", on ? "SOS ACTIVE" : "SOS cancelled");
+}
+// LU6JMF (same as AR-APRS 2.1.6): station info in the page header - which board this is: the Host Name
 // (System page); while it is still the factory name, the station callsign. Below it the enabled
 // modes and the LoRa frequency/mode.
 static String lu6jmfHeaderInfo()
@@ -1221,6 +1257,7 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	data["tzStr"] = temp_buffer;
 
 	String html = lu6jmfUpdateBox(); // 2.1.8: "new version available" box on top
+	html += lu6jmfSosBox();			  // 1.4: SOS button (tracker out of reach)
 	html += renderTemplate(DASHBOARD_TEMPLATE, data.as<JsonVariant>());
 	sendHtmlChunked(request, html, "dashboard");
 	lastHeardTimeout = millis() + 500;
