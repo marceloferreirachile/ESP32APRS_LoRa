@@ -14,7 +14,7 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 ## Install
 
-**Current version: v1.4.1-lu6jmf**: SOS emergency for the tracker (PRG menu, DashBoard button or APRS message), safe one-click updates, station logo and messaging improvements.
+**Current version: v1.4-lu6jmf**: SOS emergency for the tracker, safe one-click updates, station logo and messaging improvements.
 
 **New board / full reset (USB):** use the one-click browser installer: **https://marceloferreirachile.github.io/ESP32APRS_LoRa/**
 
@@ -25,12 +25,12 @@ It is built on **ESP32APRS_LoRa** by nakhonthai and carries the core of **AR-APR
 
 The board starts with callsign NOCALL and every mode off, so it does not transmit until configured.
 
-**Existing board, no USB:** About tab → Manual Firmware Update → upload the file for your board (`HELTEC_V3_v1.4.1-lu6jmf.bin` or `HELTEC_TRACKER_v1.4.1-lu6jmf.bin`) from the [releases](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
+**Existing board, no USB:** About tab → Manual Firmware Update → upload the file for your board (`HELTEC_V3_v1.4-lu6jmf.bin` or `HELTEC_TRACKER_v1.4-lu6jmf.bin`) from the [releases](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases). Your configuration is preserved. When a release changes the web files, upload them through the File tab. Never flash `littlefs.bin` on a configured board: it erases the configuration.
 
 ## License / source code
 
 This firmware is based on ESP32APRS by Somkiat Nakhonthai (HS5TQA) and is distributed under the **GNU General Public License v3** (see [LICENSE](LICENSE)).
 
-The complete corresponding source code, including build configuration and scripts, is in this repository: each release tag contains the source of that version (e.g. [v1.4.1-lu6jmf](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/v1.4.1-lu6jmf)), and the "Source code" archives of each [release](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases) are that source. Current development: branch [`lu6jmf/from-2.1.5`](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/lu6jmf/from-2.1.5).
+The complete corresponding source code, including build configuration and scripts, is in this repository: each release tag contains the source of that version (e.g. [v1.4-lu6jmf](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/v1.4-lu6jmf)), and the "Source code" archives of each [release](https://github.com/marceloferreirachile/ESP32APRS_LoRa/releases) are that source. Current development: branch [`lu6jmf/from-2.1.5`](https://github.com/marceloferreirachile/ESP32APRS_LoRa/tree/lu6jmf/from-2.1.5).
 
 73 de LU6JMF

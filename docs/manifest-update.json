@@ -1,6 +1,6 @@
 {
-  "name": "AR-LORA (LU6JMF) v1.4.1-lu6jmf - Heltec WiFi LoRa 32 V3 - update (keeps configuration)",
-  "version": "1.4.1-lu6jmf",
+  "name": "AR-LORA (LU6JMF) v1.4-lu6jmf - Heltec WiFi LoRa 32 V3 - update (keeps configuration)",
+  "version": "1.4-lu6jmf",
   "new_install_prompt_erase": true,
   "builds": [
     {
