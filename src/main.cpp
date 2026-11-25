@@ -50,6 +50,7 @@
 #include <WiFiUdp.h>
 
 #include <WiFiClientSecure.h>
+#include <Preferences.h> // LU6JMF 1.4: SOS state survives a restart
 
 #include <SoftwareSerial.h>
 // SoftwareSerial ss(-1, -1);
@@ -772,6 +773,62 @@ number of pulses, and pulses per revolution */
 
 char EVENT_TX_POSITION = 0;
 volatile bool lu6BeaconReq = false; // LU6JMF: "Send Beacon" do menu do PRG (tratado na taskAPRS)
+// LU6JMF 1.4: SOS / emergency for the tracker (PRG menu). APRS convention:
+//  - Mic-E status "Emergency" (all three message bits 0), the official emergency symbol \!
+//    and "EMERGENCY - SOS" in the comment; repeated every minute while active;
+//  - optional APRS message to a trusted callsign (TRACKER page, "SOS message to");
+//  - cancel: one normal beacon with "SOS cancelled" + message to the same callsign.
+// The state is kept in NVS so an emergency continues after a restart (e.g. battery swap).
+bool lu6SosActive = false;
+volatile bool lu6SosCancelBcn = false;
+volatile bool lu6SosShow = false;
+volatile uint8_t lu6SosEvent = 0; // 1 = just activated, 2 = just cancelled (handled in taskAPRS)
+static uint32_t lu6SosNextMs = 0;
+#define LU6_SOS_INTERVAL_MS 60000UL
+static void lu6SosSave(bool on)
+{
+    Preferences p;
+    if (p.begin("lu6sos", false))
+    {
+        p.putBool("on", on);
+        p.end();
+    }
+}
+static void lu6SosLoad()
+{
+    Preferences p;
+    if (p.begin("lu6sos", true))
+    {
+        lu6SosActive = p.getBool("on", false);
+        p.end();
+    }
+    if (lu6SosActive)
+        lu6SosEvent = 1; // still in emergency after the restart: beacon again right away
+}
+static String lu6SosTo()
+{
+    String to = "";
+    Preferences p;
+    if (p.begin("lu6sos", true))
+    {
+        to = p.getString("to", "");
+        p.end();
+    }
+    to.trim();
+    return to;
+}
+// comment of the tracker beacon while SOS is active / right after cancelling it
+static String lu6SosComment(const String &normal)
+{
+    if (lu6SosActive)
+        return String("EMERGENCY - SOS");
+    if (lu6SosCancelBcn)
+    {
+        lu6SosCancelBcn = false;
+        return String("SOS cancelled - all OK");
+    }
+    return normal;
+}
 unsigned char SB_SPEED = 0, SB_SPEED_OLD = 0;
 int16_t SB_HEADING = 0;
 uint16_t tx_interval = 0, igate_tx_interval, digi_tx_interval; // How often we transmit, in seconds
@@ -4918,6 +4975,7 @@ void setup()
         if (!loadConfiguration("/default.cfg", config))
             defaultConfig();
     }
+    lu6SosLoad(); // LU6JMF 1.4
 
     //setCpuFrequencyMhz(config.cpuFreq);
 
@@ -6022,11 +6080,32 @@ String trk_gps_postion(String comment)
         aprs_table = config.trk_symbol[0];
         aprs_symbol = config.trk_symbol[1];
     }
+    if (lu6SosActive)
+    { // LU6JMF 1.4: official APRS emergency symbol
+        aprs_table = '\\';
+        aprs_symbol = '!';
+    }
 
-    if (gps.location.isValid()) // && (gps.hdop.hdop() < 10.0))
+    // LU6JMF 1.4: during an SOS without a GPS fix, use the last known position (or the fixed one)
+    bool lu6SosNoFix = lu6SosActive && !gps.location.isValid() &&
+                       ((LastLat != 0 && LastLng != 0) || (config.trk_lat != 0 && config.trk_lon != 0));
+    if (gps.location.isValid() || lu6SosNoFix) // && (gps.hdop.hdop() < 10.0))
     {
-        nowLat = gps.location.lat();
-        nowLng = gps.location.lng();
+        if (gps.location.isValid())
+        {
+            nowLat = gps.location.lat();
+            nowLng = gps.location.lng();
+        }
+        else if (LastLat != 0 && LastLng != 0)
+        {
+            nowLat = LastLat;
+            nowLng = LastLng;
+        }
+        else
+        {
+            nowLat = config.trk_lat;
+            nowLng = config.trk_lon;
+        }
 
         uint16_t spdKnot;
         if (LastLng == 0 || LastLat == 0)
@@ -6057,12 +6136,12 @@ String trk_gps_postion(String comment)
         LastLng = nowLng;
         lastTimeStamp = nowTime;
 
-        if (config.trk_compress)
+        if (config.trk_compress || lu6SosActive) // LU6JMF 1.4: SOS always goes as Mic-E Emergency
         { // Compress DATA
 
             // String compPosition = compress_position(nowLat, nowLng, gps.altitude.feet(), course, spdKnot, aprs_table, aprs_symbol, (gps.satellites.value() > 3));
             //  ESP_LOGE("GPS", "Compress=%s", aprs_position);
-            if ((strlen(config.trk_item) >= 3) || (config.trk_timestamp) || (config.trk_mice_type == 8))
+            if (!lu6SosActive && ((strlen(config.trk_item) >= 3) || (config.trk_timestamp) || (config.trk_mice_type == 8)))
             {
                 String compPosition = compress_position(nowLat, nowLng, gps.altitude.feet(), course, spdKnot, aprs_table, aprs_symbol, (gps.satellites.value() > 3));
                 char object[10];
@@ -6085,7 +6164,7 @@ String trk_gps_postion(String comment)
             else
             {
                 char destCallsign[8];
-                String compPosition = compressMicE(destCallsign, nowLat, nowLng, (uint16_t)course, spdKnot, config.trk_mice_type, NULL, 0, NULL, NULL, (int32_t)gps.altitude.meters(), aprs_table, aprs_symbol);
+                String compPosition = compressMicE(destCallsign, nowLat, nowLng, (uint16_t)course, spdKnot, lu6SosActive ? 0 : config.trk_mice_type, NULL, 0, NULL, NULL, (int32_t)gps.altitude.meters(), aprs_table, aprs_symbol);
                 String tnc2Raw = "";
                 char *strtmp = (char *)calloc(300, sizeof(char));
                 if (strtmp)
@@ -6110,7 +6189,7 @@ String trk_gps_postion(String comment)
                 }
                 tnc2Raw += ":";
                 tnc2Raw += String(compPosition);
-                tnc2Raw += comment + String(config.trk_comment);
+                tnc2Raw += lu6SosComment(comment + String(config.trk_comment));
                 return tnc2Raw;
             }
         }
@@ -6198,7 +6277,7 @@ String trk_gps_postion(String comment)
     }
     tnc2Raw += ":";
     tnc2Raw += String(rawTNC);
-    tnc2Raw += comment + String(config.trk_comment);
+    tnc2Raw += lu6SosComment(comment + String(config.trk_comment));
     return tnc2Raw;
 }
 
@@ -6207,12 +6286,12 @@ String trk_fix_position(String comment)
     char loc[100];
     String tnc2Raw = "";
     memset(loc, 0, sizeof(loc));
-    if (config.trk_compress)
+    if (config.trk_compress || lu6SosActive) // LU6JMF 1.4: SOS always goes as Mic-E Emergency
     { // Compress DATA
 
         //String compPosition = compress_position(config.trk_lat, config.trk_lon, (int)(config.trk_alt * 3.28F), 0, 0, config.trk_symbol[0], config.trk_symbol[1], true);
         // ESP_LOGE("GPS", "Compress=%s", aprs_position);
-        if ((strlen(config.trk_item) >= 3) || (config.trk_timestamp) || (config.trk_mice_type == 8))
+        if (!lu6SosActive && ((strlen(config.trk_item) >= 3) || (config.trk_timestamp) || (config.trk_mice_type == 8)))
             {
                 String compPosition = compress_position(config.trk_lat, config.trk_lon, (int)(config.trk_alt * 3.28F), 0, 0, config.trk_symbol[0], config.trk_symbol[1], true);
                 char object[10];
@@ -6235,7 +6314,7 @@ String trk_fix_position(String comment)
             else
             {
                 char destCallsign[8];
-                String compPosition = compressMicE(destCallsign, config.trk_lat, config.trk_lon, 0, 0, config.trk_mice_type, NULL, 0, NULL, NULL, (int32_t)gps.altitude.meters(), config.trk_symbol[0], config.trk_symbol[1]);
+                String compPosition = compressMicE(destCallsign, config.trk_lat, config.trk_lon, 0, 0, lu6SosActive ? 0 : config.trk_mice_type, NULL, 0, NULL, NULL, (int32_t)gps.altitude.meters(), lu6SosActive ? '\\' : config.trk_symbol[0], lu6SosActive ? '!' : config.trk_symbol[1]);
                 String tnc2Raw = "";
                 char *strtmp = (char *)calloc(300, sizeof(char));
                 if (strtmp)
@@ -6260,7 +6339,7 @@ String trk_fix_position(String comment)
                 }
                 tnc2Raw += ":";
                 tnc2Raw += String(compPosition);
-                tnc2Raw += comment + String(config.trk_comment);
+                tnc2Raw += lu6SosComment(comment + String(config.trk_comment));
                 return tnc2Raw;
             }
     }
@@ -6339,7 +6418,7 @@ String trk_fix_position(String comment)
     }
     tnc2Raw += ":";
     tnc2Raw += String(loc);
-    tnc2Raw += comment + String(config.trk_comment);
+    tnc2Raw += lu6SosComment(comment + String(config.trk_comment));
     return tnc2Raw;
 }
 
@@ -6798,6 +6877,7 @@ static uint32_t lu6ClickMs = 0;
 enum
 {
     LU6_SEND_BEACON,
+    LU6_SOS,
     LU6_SCREEN_OFF,
     LU6_BLE_OFF,
     LU6_BLE_ON,
@@ -6807,7 +6887,7 @@ enum
     LU6_FACTORY,
     LU6_EXIT
 };
-static uint8_t lu6Items[8];
+static uint8_t lu6Items[10];
 static uint8_t lu6ItemCount = 0;
 #define LU6_DBLCLICK_MS 400
 #define LU6_MENU_TIMEOUT_MS 15000
@@ -6818,6 +6898,8 @@ static const char *lu6ItemName(uint8_t id)
     {
     case LU6_SEND_BEACON:
         return "Send Beacon";
+    case LU6_SOS:
+        return lu6SosActive ? "Cancel SOS" : "SOS Emergency";
     case LU6_SCREEN_OFF:
         return "Screen OFF";
     case LU6_BLE_OFF:
@@ -6840,6 +6922,7 @@ static const char *lu6ItemName(uint8_t id)
 static void lu6BuildItems()
 {
     lu6ItemCount = 0;
+    lu6Items[lu6ItemCount++] = LU6_SOS; // LU6JMF 1.4: first item (most important), always visible
     lu6Items[lu6ItemCount++] = LU6_SEND_BEACON;
     lu6Items[lu6ItemCount++] = LU6_SCREEN_OFF;
 #ifdef BLUETOOTH
@@ -6908,7 +6991,10 @@ static void lu6DrawMenu()
 static void lu6DrawConfirm(uint8_t id)
 {
     const char *lines[] = {"Hold 2s = YES", "Press   = NO"};
-    lu6ScreenLines(id == LU6_FACTORY ? "Factory Reset?" : (id == LU6_POWER_OFF ? "Power OFF?" : "Reboot?"), lines, 2, -1);
+    const char *title = id == LU6_FACTORY ? "Factory Reset?" : (id == LU6_POWER_OFF ? "Power OFF?" : "Reboot?");
+    if (id == LU6_SOS)
+        title = lu6SosActive ? "Cancel SOS?" : "SEND SOS EMERGENCY?";
+    lu6ScreenLines(title, lines, 2, -1);
 }
 
 static void lu6ResumePages()
@@ -6968,6 +7054,20 @@ static void lu6Exec(uint8_t id)
         Serial.printf("[MENU] Send Beacon: %s\n", any ? "requested" : "no beacon enabled");
         if (any)
             lu6BeaconReq = true;
+        delay(1500);
+        lu6CloseMenu();
+        break;
+    }
+    case LU6_SOS:
+    {
+        lu6SosActive = !lu6SosActive;
+        lu6SosSave(lu6SosActive);
+        if (!lu6SosActive)
+            lu6SosCancelBcn = true;
+        lu6SosEvent = lu6SosActive ? 1 : 2;
+        const char *lines[] = {lu6SosActive ? "Beacon every 1 min" : "Back to normal"};
+        lu6ScreenLines(lu6SosActive ? "SOS ACTIVE" : "SOS cancelled", lines, 1, -1);
+        Serial.printf("[MENU] SOS %s\n", lu6SosActive ? "ACTIVATED" : "cancelled");
         delay(1500);
         lu6CloseMenu();
         break;
@@ -7045,7 +7145,16 @@ static void lu6MenuLong()
         return;
     }
     uint8_t id = lu6Items[lu6MenuSel];
-    if (id == LU6_REBOOT || id == LU6_FACTORY || id == LU6_POWER_OFF)
+    if (id == LU6_SOS && !lu6SosActive && !config.trk_en)
+    { // the SOS goes in the tracker beacon: without the Tracker there is nothing to send
+        const char *lines[] = {"Enable TRACKER", "(web page) first"};
+        lu6ScreenLines("SOS needs Tracker", lines, 2, -1);
+        Serial.println("[MENU] SOS: tracker is disabled");
+        delay(2500);
+        lu6CloseMenu();
+        return;
+    }
+    if (id == LU6_REBOOT || id == LU6_FACTORY || id == LU6_POWER_OFF || id == LU6_SOS)
     {
         lu6Confirm = id;
         lu6DrawConfirm(id);
@@ -7278,6 +7387,15 @@ void loop()
         btn_count = 0;
     }
     lu6MenuTick();
+#if defined OLED || defined ST7735_160x80
+    if (lu6SosShow && !lu6MenuActive && !lu6ScreenOff) // LU6JMF 1.4: SOS beacon sent
+    {
+        lu6SosShow = false;
+        showDisp = true;
+        timeSec = timeHalfSec = millis();
+        msgBox("SOS SENT");
+    }
+#endif
 
     // Popup Display
     if (config.oled_enable == true && !lu6MenuActive && !lu6ScreenOff)
@@ -8987,6 +9105,28 @@ void taskAPRS(void *pvParameters)
         // Ax25TransmitBuffer(); // transmit buffer (will return if nothing to be transmitted)
         // Ax25TransmitCheck();  // check for pending transmission request
 
+        // LU6JMF 1.4: SOS - beacon right away on activate/cancel, then every minute while active
+        if (lu6SosEvent)
+        {
+            uint8_t ev = lu6SosEvent;
+            lu6SosEvent = 0;
+            lu6SosNextMs = millis() + LU6_SOS_INTERVAL_MS;
+            if (config.trk_en)
+            {
+                EVENT_TX_POSITION = 6;
+                tx_interval = config.trk_interval;
+            }
+            String to = lu6SosTo();
+            if (to.length() >= 3)
+                sendAPRSMessage(to, ev == 1 ? String("EMERGENCY - SOS at my position. See my beacon on aprs.fi") : String("SOS cancelled - all OK"), false);
+        }
+        else if (lu6SosActive && config.trk_en && millis() > lu6SosNextMs)
+        {
+            lu6SosNextMs = millis() + LU6_SOS_INTERVAL_MS;
+            EVENT_TX_POSITION = 6;
+            lu6SosShow = true; // shown by the main loop (the display belongs to it)
+        }
+
         // LU6JMF (11/out/2026): "Send Beacon" do menu do PRG -> baliza agora dos modos ligados
         if (lu6BeaconReq)
         {
@@ -9309,6 +9449,10 @@ void taskAPRS(void *pvParameters)
                     SendMode |= RF_CHANNEL;
                 if (config.trk_loc2inet)
                     SendMode |= INET_CHANNEL;
+                // LU6JMF 1.4: the SOS (and its cancel beacon) always goes on RF and to APRS-IS, whatever the
+                // Tracker TX Channel says - in an emergency every path counts (INET only when connected).
+                if (lu6SosActive || rawData.indexOf("SOS cancelled") >= 0)
+                    SendMode |= RF_CHANNEL | INET_CHANNEL;
                 pkgTxPushJob(rawData.c_str(), rawData.length(), 0, SendMode, LU6JMF_TXJOB_TRACKER, LU6JMF_TXPRIO_NORMAL);
 
                 //                 if (config.trk_loc2rf)
@@ -11144,6 +11288,7 @@ void PPPOS_Start()
 }
 #endif
 
+void lu6jmfPendingUpdate(); // webservice.cpp (2.1.8)
 void taskNetwork(void *pvParameters)
 {
     int c = 0;
@@ -11193,6 +11338,7 @@ void taskNetwork(void *pvParameters)
         //     NTP_Timeout = millis() + 2000;
         // }
         wifiConnection();
+        lu6jmfPendingUpdate(); // 2.1.8: install a requested update now, while memory is still free
 
         wifiMulti.setStrictMode(true); // Default is true.  Library will disconnect and forget currently connected AP if it's not in the AP list.
         wifiMulti.setAllowOpenAP(false); // Default is false.  True adds open APs to the AP list.
@@ -11497,18 +11643,10 @@ void taskNetwork(void *pvParameters)
                                     {
                                         handleIncomingAPRS(String(line_buf));
                                     }
-                                    char *dashPtr = (lineLen > 1) ? (char *)memchr(line_buf + 1, '-', lineLen - 1) : NULL;
-                                    int start_dstssid = dashPtr ? (int)(dashPtr - line_buf) : -1;
-                                    if (start_dstssid < 0)
-                                    {
-                                        char *spacePtr = (lineLen > 1) ? (char *)memchr(line_buf + 1, ' ', lineLen - 1) : NULL;
-                                        start_dstssid = spacePtr ? (int)(spacePtr - line_buf) : -1;
-                                    }
-                                    char ssid = 0;
-                                    if (start_dstssid > 0 && (size_t)(start_dstssid + 1) < lineLen)
-                                        ssid = line_buf[start_dstssid + 1];
-
-                                    if (ssid > 47 && ssid < 58)
+                                    // LU6JMF 2.1.8: the old test only accepted lines where the first '-' was followed by
+                                    // a digit, so stations without SSID (e.g. LU1ABC>...) were often never listed/gated.
+                                    // Only APRS-IS server comment lines ('#') are skipped now.
+                                    if (line_buf[0] != '#')
                                     {
                                         memcpy(raw, line_buf, lineLen);
                                         raw[rawSize] = 0;
@@ -11548,19 +11686,34 @@ void taskNetwork(void *pvParameters)
                                         {
                                             if (type & config.inet2rfFilter)
                                             {
+                                                // LU6JMF 2.1.8: third-party format per the aprs-is.net IGate rules:
+                                                //   IGATECALL>TOCALL,RFONLY:}FROMCALL>TOCALL,TCPIP,IGATECALL*:data
+                                                // the APRS-IS path (TCPIP*,qAC,server...) is removed - q constructs must never go on RF.
                                                 static char tnc2_buf[900];
-                                                int prefixLen;
+                                                char myCall[16];
                                                 if (config.aprs_ssid == 0)
-                                                    prefixLen = snprintf(tnc2_buf, sizeof(tnc2_buf), "%s>APJMF2,RFONLY:}", config.aprs_mycall);
+                                                    snprintf(myCall, sizeof(myCall), "%s", config.aprs_mycall);
                                                 else
-                                                    prefixLen = snprintf(tnc2_buf, sizeof(tnc2_buf), "%s-%d>APJMF2,RFONLY:}", config.aprs_mycall, config.aprs_ssid);
+                                                    snprintf(myCall, sizeof(myCall), "%s-%d", config.aprs_mycall, config.aprs_ssid);
+                                                const char *hdrEnd = line_buf + start_val; // ':' that ends the header
+                                                const char *dstStart = gtPtr ? gtPtr + 1 : hdrEnd;
+                                                if (dstStart > hdrEnd)
+                                                    dstStart = hdrEnd;
+                                                const char *dstEnd = (const char *)memchr(dstStart, ',', (size_t)(hdrEnd - dstStart));
+                                                if (!dstEnd)
+                                                    dstEnd = hdrEnd;
+                                                int prefixLen = snprintf(tnc2_buf, sizeof(tnc2_buf), "%s>APJMF2,RFONLY:}%s>%.*s,TCPIP,%s*:",
+                                                                         myCall, src_call, (int)(dstEnd - dstStart), dstStart, myCall);
                                                 if (prefixLen < 0)
                                                     prefixLen = 0;
                                                 if ((size_t)prefixLen >= sizeof(tnc2_buf))
                                                     prefixLen = sizeof(tnc2_buf) - 1;
                                                 size_t remain = sizeof(tnc2_buf) - (size_t)prefixLen - 1;
-                                                size_t copyLen = (lineLen < remain) ? lineLen : remain;
-                                                memcpy(tnc2_buf + prefixLen, line_buf, copyLen);
+                                                size_t dataLen = infoLen;
+                                                while (dataLen > 0 && (info_ptr[dataLen - 1] == '\r' || info_ptr[dataLen - 1] == '\n'))
+                                                    dataLen--;
+                                                size_t copyLen = (dataLen < remain) ? dataLen : remain;
+                                                memcpy(tnc2_buf + prefixLen, info_ptr, copyLen);
                                                 size_t totalLen = (size_t)prefixLen + copyLen;
                                                 tnc2_buf[totalLen] = 0;
                                                 pkgTxPushJob(tnc2_buf, totalLen, 0, RF_CHANNEL, LU6JMF_TXJOB_INET2RF, LU6JMF_TXPRIO_NORMAL);
