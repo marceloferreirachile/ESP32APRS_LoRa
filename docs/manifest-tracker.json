@@ -1,6 +1,6 @@
 {
-  "name": "AR-LORA (LU6JMF) v1.4-lu6jmf - Heltec Wireless Tracker V1.1",
-  "version": "1.4-lu6jmf",
+  "name": "AR-LORA (LU6JMF) v1.3-lu6jmf - Heltec Wireless Tracker V1.1",
+  "version": "1.3-lu6jmf",
   "new_install_prompt_erase": true,
   "builds": [
     {
