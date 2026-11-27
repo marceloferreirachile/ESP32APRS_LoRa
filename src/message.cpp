@@ -2,7 +2,6 @@
 
 #include <Preferences.h> // LU6JMF 1.4: SOS contact
 #include <Arduino.h>
-#include <handleATCommand.h>
 #include "message.h"
 #include <parse_aprs.h>
 #include "webservice.h"
@@ -1098,12 +1097,6 @@ void handleIncomingAPRS(const String &line)
                         // msg_interval) so a reply lost after the ACK is re-sent until the
                         // asker ACKs it. Before 2.1.4 it was noRetry=true (sent once only).
                         lu6jmfQueryReply(fromCall, queryResponse);
-                    }
-                    else if (config.at_cmd_msg)
-                    {
-                        String response = handleATCommand(decrypted);
-                        if (response != "")
-                            sendAPRSMessage(fromCall, response, config.msg_encrypt);
                     }
                 }
                 event_chatMessage(false);

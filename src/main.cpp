@@ -57,7 +57,6 @@
 
 #include <ModbusMaster.h>
 
-#include "handleATCommand.h"
 
 #include "sensor.h"
 
@@ -5840,13 +5839,7 @@ void mqtt_callback(char *topic, byte *payload, unsigned int length)
     log_d("MQTT Message arrived on topic [%s] with length %d", topic, length);
     if (payload_ptr[0] == 'A' && payload_ptr[1] == 'T')
     {
-        if (config.at_cmd_mqtt)
-        {
-            log_d("AT-Command received: %s", payload_ptr);
-            String ret = handleATCommand(String((char *)payload_ptr));
-            log_d("AT-Command response: %s", ret.c_str());
-            clientMQTT.publish(config.mqtt_topic, ret.c_str());
-        }
+        // 1.4.2: AT commands removed - an "AT..." payload is ignored (never sent on RF)
     }
     else
     {
@@ -8632,59 +8625,6 @@ void taskSerial(void *pvParameters)
             //}
         }
 
-        if (config.at_cmd_uart > 0)
-        {
-            if (config.at_cmd_uart == 1)
-            { // UART0
-                if (Serial0.available())
-                {
-                    String cmd = Serial0.readStringUntil('\n');
-                    cmd.trim();
-                    String ret = handleATCommand(String((char *)cmd.c_str()));
-                    if (ret != "")
-                        Serial0.println(ret);
-                    log_d("AT-Command response: %s", ret.c_str());
-                }
-            }
-            else if (config.at_cmd_uart == 2)
-            { // UART1
-                if (Serial1.available())
-                {
-                    String cmd = Serial1.readStringUntil('\n');
-                    cmd.trim();
-                    String ret = handleATCommand(String((char *)cmd.c_str()));
-                    if (ret != "")
-                        Serial1.println(ret);
-                    log_d("AT-Command response: %s", ret.c_str());
-                }
-            }
-#if SOC_UART_NUM > 2
-            else if (config.at_cmd_uart == 3)
-            { // UART2
-                if (Serial2.available())
-                {
-                    String cmd = Serial2.readStringUntil('\n');
-                    cmd.trim();
-                    String ret = handleATCommand(String((char *)cmd.c_str()));
-                    if (ret != "")
-                        Serial2.println(ret);
-                    log_d("AT-Command response: %s", ret.c_str());
-                }
-            }
-#endif
-            else if (config.at_cmd_uart == 4)
-            { // USB-CDC
-                if (Serial.available())
-                {
-                    String cmd = Serial.readStringUntil('\n');
-                    cmd.trim();
-                    String ret = handleATCommand(String((char *)cmd.c_str()));
-                    if (ret != "")
-                        Serial.println(ret);
-                    log_d("AT-Command response: %s", ret.c_str());
-                }
-            }
-        }
     }
 }
 
@@ -9053,15 +8993,6 @@ void taskAPRS(void *pvParameters)
                         kiss_serial((uint8_t)NuSerial.read());
                     }
                 }
-                else if (config.bt_mode == 3)
-                { // AT COMMAND
-                    String cmd = NuSerial.readStringUntil('\n');
-                    cmd.trim();
-                    String ret = handleATCommand(String((char *)cmd.c_str()));
-                    if (ret != "")
-                        NuSerial.println(ret);
-                    log_d("AT-Command response: %s", ret.c_str());
-                }
             }
         }
 #else
@@ -9086,15 +9017,6 @@ void taskAPRS(void *pvParameters)
                 {
                     kiss_serial((uint8_t)SerialBT.read());
                 }
-            }
-            else if (config.bt_mode == 3)
-            { // AT COMMAND
-                String cmd = SerialBT.readStringUntil('\n');
-                cmd.trim();
-                String ret = handleATCommand(String((char *)cmd.c_str()));
-                if (ret != "")
-                    SerialBT.println(ret);
-                log_d("AT-Command response: %s", ret.c_str());
             }
         }
 #endif
